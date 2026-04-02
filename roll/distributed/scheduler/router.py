@@ -7,7 +7,7 @@ import httpx
 import weakref
 from abc import abstractmethod
 from collections import defaultdict
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote
 
 import ray
@@ -15,6 +15,7 @@ import ray
 from roll.distributed.executor.cluster import Cluster
 from roll.distributed.executor.worker import Worker
 from roll.distributed.scheduler.protocol import DataProto
+from roll.distributed.scheduler.resume_priority import ResumeScoreWeights, compute_resume_score
 from roll.configs.base_config import RouterArguments
 from roll.models.model_providers import default_tokenizer_provider
 from roll.utils.functionals import gather_unpadded_input_ids
@@ -23,6 +24,11 @@ from roll.utils.logging import get_logger
 
 
 logger = get_logger()
+
+def extract_roll_route_meta(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Pop and return route metadata injected by runtime."""
+    route_meta = payload.pop("_roll_route_meta", None)
+    return route_meta if isinstance(route_meta, dict) else {}
 
 def is_report_data_finished(data: DataProto) -> bool:
     finish_reasons = data.meta_info.get("finish_reasons", [])
@@ -208,6 +214,9 @@ class RouterManager:
     async def expand_workers(self, target_gpus: List[int], skip_load: bool = False) -> Dict[str, Any]:
         logger.info(f"RouterManager expand_workers {target_gpus=}")
         return await self.partial_gpu_manager.expand_workers(target_gpus, skip_load)
+
+    def collect_metrics(self) -> Dict[str, float]:
+        return self.router.collect_metrics()
 
 class PartialGPUManager:
     def __init__(self, actor_cluster, router, num_gpus_per_node: int):
@@ -579,6 +588,26 @@ class RouterClient:
             input_ids = gather_unpadded_input_ids(input_ids=input_ids, attention_mask=attention_mask)
             payload["input_ids"] = input_ids[0]
 
+        route_meta = {}
+        for key in (
+            "trajectory_id",
+            "request_type",
+            "resume_generation",
+            "pause_ts",
+            "pause_age_s",
+            "history_len_tokens",
+            "last_backend_id",
+            "tool_type",
+            "fairness_bucket",
+        ):
+            if key in req.meta_info:
+                route_meta[key] = req.meta_info[key]
+        if route_meta and "history_len_tokens" not in route_meta and "input_ids" in payload:
+            route_meta["history_len_tokens"] = len(payload["input_ids"])
+        # Keep runtime-only metadata inside ROLL routers, avoid sending unsupported fields to sglang HTTP API.
+        if route_meta and self.strategy_name != "sglang":
+            payload["_roll_route_meta"] = route_meta
+
         match self.strategy_name:
             case "sglang":
                 from roll.distributed.strategy.sglang_strategy import create_sampling_params_for_sglang
@@ -601,6 +630,8 @@ class RouterClient:
         output_data.meta_info["output_logprobs"] = response.get("output_logprobs", None)
         output_data.meta_info["eos_token_id"] = [self.eos_token_id, self.pad_token_id]
         output_data.meta_info["pad_token_id"] = self.pad_token_id
+        if "selected_backend_id" in response:
+            output_data.meta_info["selected_backend_id"] = response["selected_backend_id"]
         return output_data
 
     async def generate_request(self, req: DataProto, request_id, uid):
@@ -663,6 +694,9 @@ class Router:
 
     async def rebalance_on_expand(self, expand_dp_ranks: List[int]) -> Dict[str, int]:
         raise NotImplementedError
+
+    def collect_metrics(self) -> Dict[str, float]:
+        return {}
 
 class SglangRouter(Router):
     """
@@ -813,6 +847,9 @@ class SglangRouter(Router):
 
         return {"aborted": 0, "remapped": 0} # for compatibility
 
+    def collect_metrics(self) -> Dict[str, float]:
+        return {}
+
 class PromptAffinityRouter(Router):
     """
     Schedule requests of the same prompt to the same worker. Choose worker using best fit
@@ -840,6 +877,7 @@ class PromptAffinityRouter(Router):
         return f"worker loads: {self.worker_loads}"
 
     async def generate_request(self, payload, request_id, uid):
+        _ = extract_roll_route_meta(payload)
         credit = payload["sampling_params"]["n"]
         dp_rank = None
         if uid not in self.id_to_dp_rank:
@@ -861,7 +899,10 @@ class PromptAffinityRouter(Router):
             self.dp_inflight_requests[dp_rank].add(request_id)
             # InferWorker.generate_request only return data with finish_reason=="abort" on abort
             # but not raise asyncio.CancelledError. This try finally block may be not necessary.
-            return await self.workers[dp_rank].generate_request.remote(payload)
+            response = await self.workers[dp_rank].generate_request.remote(payload)
+            if isinstance(response, dict):
+                response["selected_backend_id"] = dp_rank
+            return response
             # TODO ray.cancel(ref) on asyncio.CancelledError
         finally:
             self.dp_inflight_requests[dp_rank].remove(request_id)
@@ -921,6 +962,9 @@ class PromptAffinityRouter(Router):
     def full(self) -> bool:
         return all(running_requests >= self.max_running_requests for running_requests in self.worker_loads.values())
 
+    def collect_metrics(self) -> Dict[str, float]:
+        return {}
+
 class EnvAffinityRouter(Router):
     """
     Schedule requests of the same (env) uid, to the same dp_rank.
@@ -940,22 +984,115 @@ class EnvAffinityRouter(Router):
         # Active DP ranks for request routing
         self.active_dp_ranks: Set[int] = set(range(len(self.workers)))  # All ranks initially active
         self.routing_lock = asyncio.Lock()  # Protect routing updates
+        router_config = self.router_args.router_config or {}
+        self.enable_resume_aware_routing = bool(router_config.get("enable_resume_aware_routing", False))
+        self.resume_score_weights = ResumeScoreWeights.from_config(router_config.get("resume_score_weights", {}))
+        self.force_migrate_age_s = float(router_config.get("force_migrate_age_s", 30.0))
+        self.fairness_enable = bool(router_config.get("fairness_enable", False))
+        self.fairness_boost_max = float(router_config.get("fairness_boost_max", 1.0))
+        self._reset_resume_metrics()
+        logger.info(
+            "EnvAffinityRouter resume-aware config: "
+            f"enabled={self.enable_resume_aware_routing}, "
+            f"weights={self.resume_score_weights}, force_migrate_age_s={self.force_migrate_age_s}"
+        )
+
+    def _reset_resume_metrics(self):
+        self.resume_total_requests = 0
+        self.resume_affinity_hits = 0
+        self.resume_migrations = 0
+        self.resume_forced_migrations = 0
+        self.resume_score_sum = 0.0
+        self.resume_selected_worker_load_sum = 0.0
+        self.resume_pause_age_sum = 0.0
+        self.resume_wait_bucket_served: Dict[str, int] = defaultdict(int)
+
+    def _fairness_bonus(self, route_meta: Dict[str, Any]) -> float:
+        if not self.fairness_enable:
+            return 0.0
+        bucket = route_meta.get("fairness_bucket")
+        if not bucket:
+            return 0.0
+        served = self.resume_wait_bucket_served.get(bucket, 0)
+        tracked_buckets = max(1, len(self.resume_wait_bucket_served))
+        avg_served = max(1.0, self.resume_total_requests / tracked_buckets)
+        deficit_ratio = max(0.0, (avg_served - served) / avg_served)
+        return min(deficit_ratio * self.fairness_boost_max, self.fairness_boost_max)
+
+    def _compute_resume_score(
+        self,
+        dp_rank: int,
+        route_meta: Dict[str, Any],
+        fallback_last_backend: Optional[int] = None,
+    ) -> float:
+        pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
+        history_len = float(route_meta.get("history_len_tokens", 0.0) or 0.0)
+        last_backend_id = route_meta.get("last_backend_id", fallback_last_backend)
+        if pause_age >= self.force_migrate_age_s:
+            last_backend_id = None
+        is_last_backend = 1.0 if last_backend_id == dp_rank else 0.0
+        worker_load = float(len(self.running_requests[dp_rank]))
+        fairness_bonus = self._fairness_bonus(route_meta=route_meta)
+        return compute_resume_score(
+            pause_age_s=pause_age,
+            history_len_tokens=history_len,
+            is_last_backend=is_last_backend,
+            worker_load=worker_load,
+            fairness_bonus=fairness_bonus,
+            weights=self.resume_score_weights,
+        )
+
+    def _select_resume_dp_rank(self, src_rank: int, route_meta: Dict[str, Any]) -> int:
+        candidate_ranks = list(self.active_dp_ranks)
+        if not candidate_ranks:
+            raise RuntimeError("No active DP ranks")
+        fallback_last_backend = self.src_rank2_dp_rank.get(src_rank)
+        return max(
+            candidate_ranks,
+            key=lambda r: self._compute_resume_score(r, route_meta, fallback_last_backend=fallback_last_backend),
+        )
 
     async def generate_request(self, payload, request_id, uid):
+        route_meta = extract_roll_route_meta(payload)
+        request_type = route_meta.get("request_type", "normal")
         src_rank = uid
         # Atomic routing assignment under lock to prevent TOCTOU race with shrink/expand
         async with self.routing_lock:
-            # Least-loaded dispatch
-            if src_rank not in self.src_rank2_dp_rank:
-                dp_rank = self._get_least_active_dp_rank()
+            if self.enable_resume_aware_routing and request_type == "resume":
+                previous_rank = self.src_rank2_dp_rank.get(src_rank)
+                dp_rank = self._select_resume_dp_rank(src_rank=src_rank, route_meta=route_meta)
+                # Soft-affinity: still keep sticky mapping, but allow score-driven migration.
                 self.src_rank2_dp_rank[src_rank] = dp_rank
-            dp_rank = self.src_rank2_dp_rank[src_rank]
+                pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
+                self.resume_total_requests += 1
+                self.resume_pause_age_sum += pause_age
+                self.resume_selected_worker_load_sum += float(len(self.running_requests[dp_rank]))
+                score = self._compute_resume_score(dp_rank=dp_rank, route_meta=route_meta, fallback_last_backend=previous_rank)
+                self.resume_score_sum += score
+                if previous_rank is not None and previous_rank == dp_rank:
+                    self.resume_affinity_hits += 1
+                elif previous_rank is not None and previous_rank != dp_rank:
+                    self.resume_migrations += 1
+                    if pause_age >= self.force_migrate_age_s:
+                        self.resume_forced_migrations += 1
+                bucket = route_meta.get("fairness_bucket")
+                if bucket:
+                    self.resume_wait_bucket_served[bucket] += 1
+            else:
+                # Least-loaded dispatch
+                if src_rank not in self.src_rank2_dp_rank:
+                    dp_rank = self._get_least_active_dp_rank()
+                    self.src_rank2_dp_rank[src_rank] = dp_rank
+                dp_rank = self.src_rank2_dp_rank[src_rank]
 
         self.request_id_2_src_rank[request_id] = src_rank
         self.running_requests[dp_rank].add(request_id)
 
         try:
-            return await self.workers[dp_rank].generate_request.remote(payload)
+            response = await self.workers[dp_rank].generate_request.remote(payload)
+            if isinstance(response, dict):
+                response["selected_backend_id"] = dp_rank
+            return response
         finally:
             self.running_requests[dp_rank].remove(request_id)
             # Cleanup tracking (on both success and abort paths)
@@ -996,6 +1133,24 @@ class EnvAffinityRouter(Router):
 
         # Return dp_rank with minimum src_rank count
         return min(candidate_ranks, key=lambda r: src_rank_count[r])
+
+    def collect_metrics(self) -> Dict[str, float]:
+        if self.resume_total_requests == 0:
+            return {}
+        total = float(self.resume_total_requests)
+        metrics: Dict[str, float] = {
+            "scheduler/router/resume_total_requests": total,
+            "scheduler/router/resume_affinity_hit_rate": self.resume_affinity_hits / total,
+            "scheduler/router/resume_migration_rate": self.resume_migrations / total,
+            "scheduler/router/resume_forced_migration_rate": self.resume_forced_migrations / total,
+            "scheduler/router/resume_pause_age_mean_s": self.resume_pause_age_sum / total,
+            "scheduler/router/resume_selected_worker_load_mean": self.resume_selected_worker_load_sum / total,
+            "scheduler/router/resume_score_mean": self.resume_score_sum / total,
+        }
+        for bucket, served in self.resume_wait_bucket_served.items():
+            metrics[f"scheduler/router/resume_bucket_served/{bucket}"] = float(served)
+        self._reset_resume_metrics()
+        return metrics
 
     def _clear_src_rank_mappings(self, src_ranks: Set[int]) -> None:
         """Clear sticky mappings to allow re-routing on retry."""

@@ -1,4 +1,5 @@
 import copy
+import time
 from contextlib import nullcontext
 from threading import Lock
 from typing import Optional
@@ -54,7 +55,12 @@ class TrajEnvManager(BaseEnvManager):
         self.rollout_cache: Optional[RolloutCache] = None
         self.group_seed = None
         self.episode_id = None
+        self.trajectory_id = None
         self.running = False
+        self._next_request_type = "normal"
+        self._resume_generation = 0
+        self._pause_ts = None
+        self._last_backend_id = None
         self.use_thread_lock = self.env_config.get("use_thread_lock", False) # 避免同时执行大量cpu操作, 可以通过env_config配置
         self.thread_lock = thread_lock if self.use_thread_lock else nullcontext()
         # Set environment step concurrency limit
@@ -150,6 +156,14 @@ class TrajEnvManager(BaseEnvManager):
             assert not self.running
             return None
         seed = self.group_seed + self.episode_id
+        self.trajectory_id = (
+            f"{self.env_config['tag']}_{self.env_config['group_id']}_"
+            f"{self.episode_id}_{self.group_seed}_{self.env_config['env_id']}"
+        )
+        self._next_request_type = "normal"
+        self._resume_generation = 0
+        self._pause_ts = None
+        self._last_backend_id = None
 
         with self.thread_lock, self.env_step_limiter:
             # `observation` describes the current game-state prompt;
@@ -192,6 +206,9 @@ class TrajEnvManager(BaseEnvManager):
         if suffix is not None:
             self.rollout_cache.history[-1]["suffix"] = suffix
 
+        # Next inference is a resume request that crosses the external waiting boundary.
+        self._pause_ts = time.time()
+        self._next_request_type = "resume"
         return self.rollout_cache
 
     def make_decision(self, rollout_cache: RolloutCache):
@@ -209,6 +226,21 @@ class TrajEnvManager(BaseEnvManager):
         generation_config = self.worker_config.generating_args.to_dict()
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
+        request_type = self._next_request_type
+        pause_age_s = 0.0
+        if request_type == "resume" and self._pause_ts is not None:
+            pause_age_s = max(0.0, time.time() - self._pause_ts)
+            self._resume_generation += 1
+        lm_input.meta_info.update({
+            "trajectory_id": self.trajectory_id,
+            "request_type": request_type,
+            "resume_generation": self._resume_generation,
+            "pause_ts": self._pause_ts,
+            "pause_age_s": pause_age_s,
+            "history_len_tokens": int(input_ids.shape[1]),
+            "last_backend_id": self._last_backend_id,
+        })
+        self._next_request_type = "normal"
 
         input_messages = [item for items in self.rollout_cache.history for item in items["messages"]]
 
@@ -218,6 +250,9 @@ class TrajEnvManager(BaseEnvManager):
 
         if lm_output is None:
             return DataProto(meta_info={"stop_reason": GenerateStopReason.ABORT})
+        selected_backend_id = lm_output.meta_info.get("selected_backend_id")
+        if selected_backend_id is not None:
+            self._last_backend_id = selected_backend_id
 
         response_ids = lm_output.batch['responses'][0]
         response_ids = response_ids.tolist()

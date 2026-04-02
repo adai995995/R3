@@ -666,6 +666,7 @@ class RolloutScheduler(RolloutMockMixin):
         if get_batch_return_start_time is not None:
             metrics["time/get_batch_cost_gqm"] = time.time() - get_batch_return_start_time
         metrics.update(await self.env_output_queue.collect_metrics.remote())
+        metrics.update(await self.router_manager.collect_metrics.remote())
         batch = DataProto.concat(data_batch)
         batch.meta_info["metrics"] = metrics
         batch.meta_info["get_batch_return_start_time"] = time.time()
