@@ -5,6 +5,7 @@ import time
 import uuid
 import httpx
 import weakref
+from dataclasses import dataclass
 from abc import abstractmethod
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set
@@ -15,7 +16,12 @@ import ray
 from roll.distributed.executor.cluster import Cluster
 from roll.distributed.executor.worker import Worker
 from roll.distributed.scheduler.protocol import DataProto
-from roll.distributed.scheduler.resume_priority import ResumeScoreWeights, compute_resume_score
+from roll.distributed.scheduler.resume_priority import (
+    RequestPriorityWeights,
+    ResumeScoreWeights,
+    compute_request_priority,
+    compute_resume_score,
+)
 from roll.configs.base_config import RouterArguments
 from roll.models.model_providers import default_tokenizer_provider
 from roll.utils.functionals import gather_unpadded_input_ids
@@ -24,6 +30,18 @@ from roll.utils.logging import get_logger
 
 
 logger = get_logger()
+
+
+@dataclass
+class PendingTrajectoryRequest:
+    request_id: str
+    uid: int
+    request_type: str
+    route_meta: Dict[str, Any]
+    enqueue_ts: float
+    enqueue_seq: int
+    base_priority: float
+
 
 def extract_roll_route_meta(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Pop and return route metadata injected by runtime."""
@@ -986,15 +1004,30 @@ class EnvAffinityRouter(Router):
         self.routing_lock = asyncio.Lock()  # Protect routing updates
         router_config = self.router_args.router_config or {}
         self.enable_resume_aware_routing = bool(router_config.get("enable_resume_aware_routing", False))
+        self.enable_request_priority_queue = bool(router_config.get("enable_request_priority_queue", False))
+        self.request_wait_aging_weight = float(router_config.get("request_wait_aging_weight", 0.1))
+        self.normal_request_base_score = float(router_config.get("normal_request_base_score", 0.0))
+        self.max_running_requests_per_worker = int(router_config.get("max_running_requests_per_worker", 0))
+        self.request_score_weights = RequestPriorityWeights.from_config(
+            router_config.get("request_score_weights", {})
+        )
         self.resume_score_weights = ResumeScoreWeights.from_config(router_config.get("resume_score_weights", {}))
         self.force_migrate_age_s = float(router_config.get("force_migrate_age_s", 30.0))
         self.fairness_enable = bool(router_config.get("fairness_enable", False))
         self.fairness_boost_max = float(router_config.get("fairness_boost_max", 1.0))
+        self.pending_requests: Dict[str, PendingTrajectoryRequest] = {}
+        self.cancelled_pending_requests: Set[str] = set()
+        self.request_seq_counter = itertools.count()
+        self.dispatch_condition = asyncio.Condition()
         self._reset_resume_metrics()
         logger.info(
             "EnvAffinityRouter resume-aware config: "
             f"enabled={self.enable_resume_aware_routing}, "
-            f"weights={self.resume_score_weights}, force_migrate_age_s={self.force_migrate_age_s}"
+            f"queue_enabled={self.enable_request_priority_queue}, "
+            f"request_score_weights={self.request_score_weights}, "
+            f"worker_score_weights={self.resume_score_weights}, "
+            f"force_migrate_age_s={self.force_migrate_age_s}, "
+            f"max_running_requests_per_worker={self.max_running_requests_per_worker}"
         )
 
     def _reset_resume_metrics(self):
@@ -1005,6 +1038,7 @@ class EnvAffinityRouter(Router):
         self.resume_score_sum = 0.0
         self.resume_selected_worker_load_sum = 0.0
         self.resume_pause_age_sum = 0.0
+        self.resume_queue_wait_sum = 0.0
         self.resume_wait_bucket_served: Dict[str, int] = defaultdict(int)
 
     def _fairness_bonus(self, route_meta: Dict[str, Any]) -> float:
@@ -1018,6 +1052,123 @@ class EnvAffinityRouter(Router):
         avg_served = max(1.0, self.resume_total_requests / tracked_buckets)
         deficit_ratio = max(0.0, (avg_served - served) / avg_served)
         return min(deficit_ratio * self.fairness_boost_max, self.fairness_boost_max)
+
+    def _compute_request_base_priority(self, request_type: str, route_meta: Dict[str, Any]) -> float:
+        if request_type != "resume":
+            return self.normal_request_base_score
+        pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
+        history_len = float(route_meta.get("history_len_tokens", 0.0) or 0.0)
+        hit_prob = 1.0 if route_meta.get("last_backend_id") is not None else 0.0
+        rebuild_cost = history_len
+        fairness_bonus = self._fairness_bonus(route_meta=route_meta)
+        return compute_request_priority(
+            pause_age_s=pause_age,
+            history_len_tokens=history_len,
+            hit_prob=hit_prob,
+            rebuild_cost=rebuild_cost,
+            fairness_bonus=fairness_bonus,
+            weights=self.request_score_weights,
+        )
+
+    def _effective_request_priority(self, pending: PendingTrajectoryRequest) -> float:
+        queue_wait = max(0.0, time.time() - pending.enqueue_ts)
+        return pending.base_priority + self.request_wait_aging_weight * queue_wait
+
+    def _pick_next_pending_request(self) -> Optional[PendingTrajectoryRequest]:
+        if not self.pending_requests:
+            return None
+        # Max request priority first, FIFO for same priority.
+        return max(
+            self.pending_requests.values(),
+            key=lambda req: (self._effective_request_priority(req), -req.enqueue_seq),
+        )
+
+    def _pick_next_dispatchable_request(self) -> tuple[Optional[PendingTrajectoryRequest], Optional[int]]:
+        if not self.pending_requests:
+            return None, None
+        # Highest effective priority first, FIFO for tie-breaking.
+        sorted_requests = sorted(
+            self.pending_requests.values(),
+            key=lambda req: (self._effective_request_priority(req), -req.enqueue_seq),
+            reverse=True,
+        )
+        for pending in sorted_requests:
+            dp_rank = self._select_worker_for_request(pending)
+            if dp_rank is not None:
+                return pending, dp_rank
+        return None, None
+
+    @staticmethod
+    def _build_abort_response() -> Dict[str, Any]:
+        return {
+            "finish_reasons": ["abort"],
+            "output_token_ids": [[]],
+            "output_logprobs": [[]],
+        }
+
+    def _has_worker_capacity(self, dp_rank: int) -> bool:
+        if self.max_running_requests_per_worker <= 0:
+            return True
+        return len(self.running_requests[dp_rank]) < self.max_running_requests_per_worker
+
+    def _select_worker_for_request(self, pending: PendingTrajectoryRequest) -> Optional[int]:
+        src_rank = pending.uid
+        request_type = pending.request_type
+        route_meta = pending.route_meta
+        if self.enable_resume_aware_routing and request_type == "resume":
+            candidate_ranks = [r for r in self.active_dp_ranks if self._has_worker_capacity(r)]
+            if not candidate_ranks:
+                return None
+            fallback_last_backend = self.src_rank2_dp_rank.get(src_rank)
+            return max(
+                candidate_ranks,
+                key=lambda r: self._compute_resume_score(
+                    r,
+                    route_meta,
+                    fallback_last_backend=fallback_last_backend,
+                ),
+            )
+
+        # Baseline sticky routing for non-resume requests.
+        mapped_rank = self.src_rank2_dp_rank.get(src_rank)
+        if mapped_rank is None:
+            candidate_ranks = [r for r in self.active_dp_ranks if self._has_worker_capacity(r)]
+            if not candidate_ranks:
+                return None
+            mapped_rank = min(candidate_ranks, key=lambda r: len(self.running_requests[r]))
+            self.src_rank2_dp_rank[src_rank] = mapped_rank
+        elif not self._has_worker_capacity(mapped_rank):
+            return None
+        return mapped_rank
+
+    def _record_resume_dispatch(
+        self,
+        *,
+        src_rank: int,
+        dp_rank: int,
+        route_meta: Dict[str, Any],
+        enqueue_ts: float,
+        base_priority: float,
+        previous_rank: Optional[int] = None,
+    ):
+        if previous_rank is None:
+            previous_rank = self.src_rank2_dp_rank.get(src_rank)
+        pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
+        queue_wait_s = max(0.0, time.time() - enqueue_ts)
+        self.resume_total_requests += 1
+        self.resume_pause_age_sum += pause_age
+        self.resume_selected_worker_load_sum += float(len(self.running_requests[dp_rank]))
+        self.resume_queue_wait_sum += queue_wait_s
+        self.resume_score_sum += base_priority + self.request_wait_aging_weight * queue_wait_s
+        if previous_rank is not None and previous_rank == dp_rank:
+            self.resume_affinity_hits += 1
+        elif previous_rank is not None and previous_rank != dp_rank:
+            self.resume_migrations += 1
+            if pause_age >= self.force_migrate_age_s:
+                self.resume_forced_migrations += 1
+        bucket = route_meta.get("fairness_bucket")
+        if bucket:
+            self.resume_wait_bucket_served[bucket] += 1
 
     def _compute_resume_score(
         self,
@@ -1043,9 +1194,9 @@ class EnvAffinityRouter(Router):
         )
 
     def _select_resume_dp_rank(self, src_rank: int, route_meta: Dict[str, Any]) -> int:
-        candidate_ranks = list(self.active_dp_ranks)
+        candidate_ranks = [r for r in self.active_dp_ranks if self._has_worker_capacity(r)]
         if not candidate_ranks:
-            raise RuntimeError("No active DP ranks")
+            raise RuntimeError("No active DP ranks with capacity")
         fallback_last_backend = self.src_rank2_dp_rank.get(src_rank)
         return max(
             candidate_ranks,
@@ -1056,37 +1207,76 @@ class EnvAffinityRouter(Router):
         route_meta = extract_roll_route_meta(payload)
         request_type = route_meta.get("request_type", "normal")
         src_rank = uid
-        # Atomic routing assignment under lock to prevent TOCTOU race with shrink/expand
-        async with self.routing_lock:
-            if self.enable_resume_aware_routing and request_type == "resume":
-                previous_rank = self.src_rank2_dp_rank.get(src_rank)
-                dp_rank = self._select_resume_dp_rank(src_rank=src_rank, route_meta=route_meta)
-                # Soft-affinity: still keep sticky mapping, but allow score-driven migration.
-                self.src_rank2_dp_rank[src_rank] = dp_rank
-                pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
-                self.resume_total_requests += 1
-                self.resume_pause_age_sum += pause_age
-                self.resume_selected_worker_load_sum += float(len(self.running_requests[dp_rank]))
-                score = self._compute_resume_score(dp_rank=dp_rank, route_meta=route_meta, fallback_last_backend=previous_rank)
-                self.resume_score_sum += score
-                if previous_rank is not None and previous_rank == dp_rank:
-                    self.resume_affinity_hits += 1
-                elif previous_rank is not None and previous_rank != dp_rank:
-                    self.resume_migrations += 1
-                    if pause_age >= self.force_migrate_age_s:
-                        self.resume_forced_migrations += 1
-                bucket = route_meta.get("fairness_bucket")
-                if bucket:
-                    self.resume_wait_bucket_served[bucket] += 1
-            else:
-                # Least-loaded dispatch
-                if src_rank not in self.src_rank2_dp_rank:
-                    dp_rank = self._get_least_active_dp_rank()
-                    self.src_rank2_dp_rank[src_rank] = dp_rank
-                dp_rank = self.src_rank2_dp_rank[src_rank]
+        base_priority = self._compute_request_base_priority(request_type=request_type, route_meta=route_meta)
 
-        self.request_id_2_src_rank[request_id] = src_rank
-        self.running_requests[dp_rank].add(request_id)
+        if self.enable_request_priority_queue:
+            pending = PendingTrajectoryRequest(
+                request_id=request_id,
+                uid=src_rank,
+                request_type=request_type,
+                route_meta=route_meta,
+                enqueue_ts=time.time(),
+                enqueue_seq=next(self.request_seq_counter),
+                base_priority=base_priority,
+            )
+            async with self.dispatch_condition:
+                self.pending_requests[request_id] = pending
+                self.dispatch_condition.notify_all()
+                try:
+                    while True:
+                        if request_id in self.cancelled_pending_requests:
+                            self.cancelled_pending_requests.discard(request_id)
+                            self.pending_requests.pop(request_id, None)
+                            return self._build_abort_response()
+                        selected, selected_dp_rank = self._pick_next_dispatchable_request()
+                        if selected and selected.request_id == request_id and selected_dp_rank is not None:
+                            dp_rank = selected_dp_rank
+                            previous_rank = self.src_rank2_dp_rank.get(src_rank)
+                            self.pending_requests.pop(request_id, None)
+                            self.src_rank2_dp_rank[src_rank] = dp_rank
+                            self.request_id_2_src_rank[request_id] = src_rank
+                            self.running_requests[dp_rank].add(request_id)
+                            if request_type == "resume":
+                                self._record_resume_dispatch(
+                                    src_rank=src_rank,
+                                    dp_rank=dp_rank,
+                                    route_meta=route_meta,
+                                    enqueue_ts=pending.enqueue_ts,
+                                    base_priority=base_priority,
+                                    previous_rank=previous_rank,
+                                )
+                            self.dispatch_condition.notify_all()
+                            break
+                        await self.dispatch_condition.wait()
+                except asyncio.CancelledError:
+                    self.pending_requests.pop(request_id, None)
+                    self.cancelled_pending_requests.discard(request_id)
+                    self.dispatch_condition.notify_all()
+                    raise
+        else:
+            # Atomic routing assignment under lock to prevent TOCTOU race with shrink/expand
+            async with self.routing_lock:
+                if self.enable_resume_aware_routing and request_type == "resume":
+                    previous_rank = self.src_rank2_dp_rank.get(src_rank)
+                    dp_rank = self._select_resume_dp_rank(src_rank=src_rank, route_meta=route_meta)
+                    self.src_rank2_dp_rank[src_rank] = dp_rank
+                    self.request_id_2_src_rank[request_id] = src_rank
+                    self.running_requests[dp_rank].add(request_id)
+                    self._record_resume_dispatch(
+                        src_rank=src_rank,
+                        dp_rank=dp_rank,
+                        route_meta=route_meta,
+                        enqueue_ts=time.time(),
+                        base_priority=base_priority,
+                        previous_rank=previous_rank,
+                    )
+                else:
+                    if src_rank not in self.src_rank2_dp_rank:
+                        dp_rank = self._get_least_active_dp_rank()
+                        self.src_rank2_dp_rank[src_rank] = dp_rank
+                    dp_rank = self.src_rank2_dp_rank[src_rank]
+                    self.request_id_2_src_rank[request_id] = src_rank
+                    self.running_requests[dp_rank].add(request_id)
 
         try:
             response = await self.workers[dp_rank].generate_request.remote(payload)
@@ -1094,9 +1284,15 @@ class EnvAffinityRouter(Router):
                 response["selected_backend_id"] = dp_rank
             return response
         finally:
-            self.running_requests[dp_rank].remove(request_id)
-            # Cleanup tracking (on both success and abort paths)
-            self.request_id_2_src_rank.pop(request_id, None)
+            if self.enable_request_priority_queue:
+                async with self.dispatch_condition:
+                    self.running_requests[dp_rank].discard(request_id)
+                    # Cleanup tracking (on both success and abort paths)
+                    self.request_id_2_src_rank.pop(request_id, None)
+                    self.dispatch_condition.notify_all()
+            else:
+                self.running_requests[dp_rank].discard(request_id)
+                self.request_id_2_src_rank.pop(request_id, None)
 
     async def abort_requests(self, request_ids, uid):
         raise NotImplementedError
@@ -1107,6 +1303,12 @@ class EnvAffinityRouter(Router):
             for dp_rank in range(len(self.workers))
             if self.running_requests[dp_rank]
         ))
+        if self.enable_request_priority_queue:
+            async with self.dispatch_condition:
+                for pending_request_id in self.pending_requests.keys():
+                    self.cancelled_pending_requests.add(pending_request_id)
+                self.pending_requests.clear()
+                self.dispatch_condition.notify_all()
 
     def _get_least_active_dp_rank(self) -> int:
         """Find DP rank with fewest assigned src_ranks (environments).
@@ -1135,18 +1337,22 @@ class EnvAffinityRouter(Router):
         return min(candidate_ranks, key=lambda r: src_rank_count[r])
 
     def collect_metrics(self) -> Dict[str, float]:
-        if self.resume_total_requests == 0:
-            return {}
-        total = float(self.resume_total_requests)
         metrics: Dict[str, float] = {
+            "scheduler/router/pending_request_count": float(len(self.pending_requests)),
+        }
+        if self.resume_total_requests == 0:
+            return metrics
+        total = float(self.resume_total_requests)
+        metrics.update({
             "scheduler/router/resume_total_requests": total,
             "scheduler/router/resume_affinity_hit_rate": self.resume_affinity_hits / total,
             "scheduler/router/resume_migration_rate": self.resume_migrations / total,
             "scheduler/router/resume_forced_migration_rate": self.resume_forced_migrations / total,
             "scheduler/router/resume_pause_age_mean_s": self.resume_pause_age_sum / total,
+            "scheduler/router/resume_queue_wait_mean_s": self.resume_queue_wait_sum / total,
             "scheduler/router/resume_selected_worker_load_mean": self.resume_selected_worker_load_sum / total,
             "scheduler/router/resume_score_mean": self.resume_score_sum / total,
-        }
+        })
         for bucket, served in self.resume_wait_bucket_served.items():
             metrics[f"scheduler/router/resume_bucket_served/{bucket}"] = float(served)
         self._reset_resume_metrics()
@@ -1343,7 +1549,7 @@ class EnvAffinityRouter(Router):
         old_dp_count = len(self.active_dp_ranks)
         old_active_dp_ranks = self.active_dp_ranks.copy()
 
-        self.active_dp_ranks.update(expand_dp_ranks)
+        self.active_dp_ranks = self.active_dp_ranks | set(expand_dp_ranks)
         new_dp_count = len(self.active_dp_ranks)
 
         total_src_ranks = len(self.src_rank2_dp_rank)
