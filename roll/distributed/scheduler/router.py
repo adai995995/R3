@@ -622,8 +622,9 @@ class RouterClient:
                 route_meta[key] = req.meta_info[key]
         if route_meta and "history_len_tokens" not in route_meta and "input_ids" in payload:
             route_meta["history_len_tokens"] = len(payload["input_ids"])
-        # Keep runtime-only metadata inside ROLL routers, avoid sending unsupported fields to sglang HTTP API.
-        if route_meta and self.strategy_name != "sglang":
+        # Runtime-only: EnvAffinityRouter / PromptAffinityRouter pop this before calling workers.
+        # SGLang never sees it if routers run first; sglang_strategy also strips as a safeguard.
+        if route_meta:
             payload["_roll_route_meta"] = route_meta
 
         match self.strategy_name:

@@ -184,6 +184,8 @@ class SgLangStrategy(InferenceStrategy):
             self.model.engine.tokenizer_manager.abort_request(rid)
 
     async def generate_request(self, payload: dict):
+        # Router may forward payload before popping (defensive); SGLang APIs must not see this key.
+        payload.pop("_roll_route_meta", None)
         # assert isinstance(self.model, SglangEngine)
         from sglang import __version__ as version
         if version < '0.5' and payload["sampling_params"]["n"] > 1: # fixed in https://github.com/sgl-project/sglang/pull/7508
