@@ -539,11 +539,31 @@ class SglangProxy(RouterProxy):
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(None))
         self.client_sync = httpx.Client(timeout=httpx.Timeout(None))
 
+    def _build_router_headers(self, payload: Dict[str, Any]) -> Dict[str, str]:
+        route_meta = payload.pop("_roll_route_meta", None)
+        if not isinstance(route_meta, dict):
+            return {}
+
+        headers: Dict[str, str] = {}
+        request_type = route_meta.get("request_type")
+        if isinstance(request_type, str) and request_type:
+            headers["X-ROLL-Request-Type"] = request_type
+
+        # Strong affinity for resume requests: hint sglang-router to route to the previous backend.
+        # We encode the preferred worker by URL to avoid index/order dependency.
+        if request_type == "resume":
+            last_backend_id = route_meta.get("last_backend_id")
+            if isinstance(last_backend_id, int) and 0 <= last_backend_id < len(self.worker_urls):
+                headers["X-ROLL-Preferred-Worker-Url"] = self.worker_urls[last_backend_id]
+
+        return headers
+
     async def generate_request(self, payload, request_id, uid):
         from roll.distributed.strategy.sglang_strategy import postprocess_generate
         assert "multi_modal_data" not in payload
         url = f"http://{self.router_ip}:{self.router_port}/generate"
-        response = await self.client.post(url, json=payload)
+        headers = self._build_router_headers(payload)
+        response = await self.client.post(url, json=payload, headers=headers)
         raise_for_status(response)
         response = response.json()
         response = response if isinstance(response, list) else [response]
@@ -559,7 +579,8 @@ class SglangProxy(RouterProxy):
         from roll.distributed.strategy.sglang_strategy import postprocess_generate
         assert "multi_modal_data" not in payload
         url = f"http://{self.router_ip}:{self.router_port}/generate"
-        response = self.client_sync.post(url, json=payload)
+        headers = self._build_router_headers(payload)
+        response = self.client_sync.post(url, json=payload, headers=headers)
         raise_for_status(response)
         response = response.json()
         response = response if isinstance(response, list) else [response]
@@ -1009,6 +1030,13 @@ class EnvAffinityRouter(Router):
         self.request_wait_aging_weight = float(router_config.get("request_wait_aging_weight", 0.1))
         self.normal_request_base_score = float(router_config.get("normal_request_base_score", 0.0))
         self.max_running_requests_per_worker = int(router_config.get("max_running_requests_per_worker", 0))
+        self.resume_normal_quota = str(router_config.get("resume_normal_quota", "3:1"))
+        self.normal_max_queue_wait_s = float(router_config.get("normal_max_queue_wait_s", 0.0))
+        self.resume_max_queue_wait_s = float(router_config.get("resume_max_queue_wait_s", 0.0))
+        self.enable_adaptive_quota = bool(router_config.get("enable_adaptive_quota", False))
+        self.adaptive_quota_min_ratio = str(router_config.get("adaptive_quota_min_ratio", "1:1"))
+        self.adaptive_quota_max_ratio = str(router_config.get("adaptive_quota_max_ratio", "10:1"))
+        self.adaptive_quota_update_interval_s = float(router_config.get("adaptive_quota_update_interval_s", 1.0))
         self.request_score_weights = RequestPriorityWeights.from_config(
             router_config.get("request_score_weights", {})
         )
@@ -1016,10 +1044,15 @@ class EnvAffinityRouter(Router):
         self.force_migrate_age_s = float(router_config.get("force_migrate_age_s", 30.0))
         self.fairness_enable = bool(router_config.get("fairness_enable", False))
         self.fairness_boost_max = float(router_config.get("fairness_boost_max", 1.0))
-        self.pending_requests: Dict[str, PendingTrajectoryRequest] = {}
+        # Pending requests split by request_type for soft-quota dispatch.
+        self.pending_resume_requests: Dict[str, PendingTrajectoryRequest] = {}
+        self.pending_normal_requests: Dict[str, PendingTrajectoryRequest] = {}
         self.cancelled_pending_requests: Set[str] = set()
         self.request_seq_counter = itertools.count()
         self.dispatch_condition = asyncio.Condition()
+        self._quota_resume_target, self._quota_normal_target = self._parse_ratio(self.resume_normal_quota)
+        self._quota_cursor = 0
+        self._last_adaptive_quota_ts = 0.0
         self._reset_resume_metrics()
         logger.info(
             "EnvAffinityRouter resume-aware config: "
@@ -1028,7 +1061,11 @@ class EnvAffinityRouter(Router):
             f"request_score_weights={self.request_score_weights}, "
             f"worker_score_weights={self.resume_score_weights}, "
             f"force_migrate_age_s={self.force_migrate_age_s}, "
-            f"max_running_requests_per_worker={self.max_running_requests_per_worker}"
+            f"max_running_requests_per_worker={self.max_running_requests_per_worker}, "
+            f"resume_normal_quota={self.resume_normal_quota}, "
+            f"normal_max_queue_wait_s={self.normal_max_queue_wait_s}, "
+            f"resume_max_queue_wait_s={self.resume_max_queue_wait_s}, "
+            f"enable_adaptive_quota={self.enable_adaptive_quota}"
         )
 
     def _reset_resume_metrics(self):
@@ -1075,21 +1112,57 @@ class EnvAffinityRouter(Router):
         queue_wait = max(0.0, time.time() - pending.enqueue_ts)
         return pending.base_priority + self.request_wait_aging_weight * queue_wait
 
-    def _pick_next_pending_request(self) -> Optional[PendingTrajectoryRequest]:
-        if not self.pending_requests:
-            return None
-        # Max request priority first, FIFO for same priority.
-        return max(
-            self.pending_requests.values(),
-            key=lambda req: (self._effective_request_priority(req), -req.enqueue_seq),
-        )
+    @staticmethod
+    def _parse_ratio(value: str) -> tuple[int, int]:
+        """Parse a quota ratio string like '3:1' -> (3, 1)."""
+        raw = (value or "").strip()
+        if not raw:
+            return 1, 1
+        parts = raw.split(":")
+        if len(parts) != 2:
+            return 1, 1
+        try:
+            a = max(0, int(parts[0]))
+            b = max(0, int(parts[1]))
+        except ValueError:
+            return 1, 1
+        if a == 0 and b == 0:
+            return 1, 1
+        return a, b
 
-    def _pick_next_dispatchable_request(self) -> tuple[Optional[PendingTrajectoryRequest], Optional[int]]:
-        if not self.pending_requests:
+    def _oldest_queue_wait_s(self, pending: Dict[str, PendingTrajectoryRequest]) -> float:
+        if not pending:
+            return 0.0
+        oldest_ts = min(req.enqueue_ts for req in pending.values())
+        return max(0.0, time.time() - oldest_ts)
+
+    def _maybe_update_adaptive_quota(self) -> None:
+        if not self.enable_adaptive_quota:
+            return
+        now = time.time()
+        if now - self._last_adaptive_quota_ts < self.adaptive_quota_update_interval_s:
+            return
+        self._last_adaptive_quota_ts = now
+        min_r, min_n = self._parse_ratio(self.adaptive_quota_min_ratio)
+        max_r, max_n = self._parse_ratio(self.adaptive_quota_max_ratio)
+        resume_backlog = len(self.pending_resume_requests)
+        normal_backlog = len(self.pending_normal_requests)
+        if resume_backlog <= 0 and normal_backlog <= 0:
+            return
+        # Simple backlog-driven ratio: push quota toward the more backlogged queue, within bounds.
+        if normal_backlog > resume_backlog:
+            self._quota_resume_target, self._quota_normal_target = min_r, max_n
+        elif resume_backlog > normal_backlog:
+            self._quota_resume_target, self._quota_normal_target = max_r, min_n
+        else:
+            self._quota_resume_target, self._quota_normal_target = self._parse_ratio(self.resume_normal_quota)
+        self._quota_cursor = 0
+
+    def _pick_from_resume_queue(self) -> tuple[Optional[PendingTrajectoryRequest], Optional[int]]:
+        if not self.pending_resume_requests:
             return None, None
-        # Highest effective priority first, FIFO for tie-breaking.
         sorted_requests = sorted(
-            self.pending_requests.values(),
+            self.pending_resume_requests.values(),
             key=lambda req: (self._effective_request_priority(req), -req.enqueue_seq),
             reverse=True,
         )
@@ -1098,6 +1171,61 @@ class EnvAffinityRouter(Router):
             if dp_rank is not None:
                 return pending, dp_rank
         return None, None
+
+    def _pick_from_normal_queue(self) -> tuple[Optional[PendingTrajectoryRequest], Optional[int]]:
+        if not self.pending_normal_requests:
+            return None, None
+        sorted_requests = sorted(
+            self.pending_normal_requests.values(),
+            key=lambda req: req.enqueue_seq,
+        )
+        for pending in sorted_requests:
+            dp_rank = self._select_worker_for_request(pending)
+            if dp_rank is not None:
+                return pending, dp_rank
+        return None, None
+
+    def _pick_next_dispatchable_request(self) -> tuple[Optional[PendingTrajectoryRequest], Optional[int]]:
+        if not self.pending_resume_requests and not self.pending_normal_requests:
+            return None, None
+
+        self._maybe_update_adaptive_quota()
+
+        # Soft quota escape hatches (timeout): prevent starvation.
+        if self.normal_max_queue_wait_s > 0 and self._oldest_queue_wait_s(self.pending_normal_requests) >= self.normal_max_queue_wait_s:
+            selected, dp_rank = self._pick_from_normal_queue()
+            if selected is not None:
+                self._quota_cursor = (self._quota_cursor + 1) % max(1, self._quota_resume_target + self._quota_normal_target)
+                return selected, dp_rank
+        if self.resume_max_queue_wait_s > 0 and self._oldest_queue_wait_s(self.pending_resume_requests) >= self.resume_max_queue_wait_s:
+            selected, dp_rank = self._pick_from_resume_queue()
+            if selected is not None:
+                self._quota_cursor = (self._quota_cursor + 1) % max(1, self._quota_resume_target + self._quota_normal_target)
+                return selected, dp_rank
+
+        # Skip-on-empty: never idle because of quota.
+        if not self.pending_normal_requests:
+            return self._pick_from_resume_queue()
+        if not self.pending_resume_requests:
+            return self._pick_from_normal_queue()
+
+        # Quota cycle: [resume...][normal...]
+        cycle_len = max(1, self._quota_resume_target + self._quota_normal_target)
+        cursor = self._quota_cursor % cycle_len
+        prefer_resume = cursor < max(0, self._quota_resume_target)
+
+        if prefer_resume:
+            selected, dp_rank = self._pick_from_resume_queue()
+            if selected is None:
+                selected, dp_rank = self._pick_from_normal_queue()
+        else:
+            selected, dp_rank = self._pick_from_normal_queue()
+            if selected is None:
+                selected, dp_rank = self._pick_from_resume_queue()
+
+        if selected is not None:
+            self._quota_cursor = (self._quota_cursor + 1) % cycle_len
+        return selected, dp_rank
 
     @staticmethod
     def _build_abort_response() -> Dict[str, Any]:
@@ -1221,19 +1349,24 @@ class EnvAffinityRouter(Router):
                 base_priority=base_priority,
             )
             async with self.dispatch_condition:
-                self.pending_requests[request_id] = pending
+                if request_type == "resume":
+                    self.pending_resume_requests[request_id] = pending
+                else:
+                    self.pending_normal_requests[request_id] = pending
                 self.dispatch_condition.notify_all()
                 try:
                     while True:
                         if request_id in self.cancelled_pending_requests:
                             self.cancelled_pending_requests.discard(request_id)
-                            self.pending_requests.pop(request_id, None)
+                            self.pending_resume_requests.pop(request_id, None)
+                            self.pending_normal_requests.pop(request_id, None)
                             return self._build_abort_response()
                         selected, selected_dp_rank = self._pick_next_dispatchable_request()
                         if selected and selected.request_id == request_id and selected_dp_rank is not None:
                             dp_rank = selected_dp_rank
                             previous_rank = self.src_rank2_dp_rank.get(src_rank)
-                            self.pending_requests.pop(request_id, None)
+                            self.pending_resume_requests.pop(request_id, None)
+                            self.pending_normal_requests.pop(request_id, None)
                             self.src_rank2_dp_rank[src_rank] = dp_rank
                             self.request_id_2_src_rank[request_id] = src_rank
                             self.running_requests[dp_rank].add(request_id)
@@ -1250,7 +1383,8 @@ class EnvAffinityRouter(Router):
                             break
                         await self.dispatch_condition.wait()
                 except asyncio.CancelledError:
-                    self.pending_requests.pop(request_id, None)
+                    self.pending_resume_requests.pop(request_id, None)
+                    self.pending_normal_requests.pop(request_id, None)
                     self.cancelled_pending_requests.discard(request_id)
                     self.dispatch_condition.notify_all()
                     raise
@@ -1306,9 +1440,12 @@ class EnvAffinityRouter(Router):
         ))
         if self.enable_request_priority_queue:
             async with self.dispatch_condition:
-                for pending_request_id in self.pending_requests.keys():
+                for pending_request_id in itertools.chain(
+                    self.pending_resume_requests.keys(), self.pending_normal_requests.keys()
+                ):
                     self.cancelled_pending_requests.add(pending_request_id)
-                self.pending_requests.clear()
+                self.pending_resume_requests.clear()
+                self.pending_normal_requests.clear()
                 self.dispatch_condition.notify_all()
 
     def _get_least_active_dp_rank(self) -> int:
@@ -1339,7 +1476,11 @@ class EnvAffinityRouter(Router):
 
     def collect_metrics(self) -> Dict[str, float]:
         metrics: Dict[str, float] = {
-            "scheduler/router/pending_request_count": float(len(self.pending_requests)),
+            "scheduler/router/pending_request_count": float(
+                len(self.pending_resume_requests) + len(self.pending_normal_requests)
+            ),
+            "scheduler/router/pending_resume_request_count": float(len(self.pending_resume_requests)),
+            "scheduler/router/pending_normal_request_count": float(len(self.pending_normal_requests)),
         }
         if self.resume_total_requests == 0:
             return metrics

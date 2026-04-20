@@ -111,6 +111,16 @@ class AgentNativeStepEnvManager(TrajEnvManager):
 
         seed = self.group_seed + self.episode_id
         self.traj_start_time = time.time()
+
+        # Resume-aware runtime state (align with TrajEnvManager).
+        self._next_request_type = "normal"
+        self._resume_generation = 0
+        self._pause_ts = None
+        self._last_backend_id = None
+        self._prev_tool_use_counter = None
+        self._resume_request_count = 0
+        self._resume_mismatch_count = 0
+
         observation, info = self.env.reset(seed=seed)
         if observation is None:
             return None
@@ -138,6 +148,8 @@ class AgentNativeStepEnvManager(TrajEnvManager):
             response = self.stop_reason
         observation, reward, terminated, truncated, info = self.env.step(action=response)
 
+        is_tool_return = self._is_tool_return_resume_boundary(info)
+
         self.rollout_cache.step += 1
 
         # terminated 完全由swe|tb env决定
@@ -149,12 +161,23 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         self.rollout_cache.history[-1]['llm_response'] = response
         if info is not None:
             self.rollout_cache.history[-1].update(info)
+        self.rollout_cache.history[-1]["use_tool"] = is_tool_return
+
+        self._update_tool_use_counter_baseline(info)
 
         self.rollout_cache.history.append({
             "observation": copy.deepcopy(observation),
             "actions_left": self.env_config.max_steps - self.rollout_cache.step,
             "messages": None
         })
+
+        # Resume only after external tool wait + tool-return observation (G1).
+        if is_tool_return:
+            self._pause_ts = time.time()
+            self._next_request_type = "resume"
+        else:
+            self._pause_ts = None
+            self._next_request_type = "normal"
         return self.rollout_cache
 
     def make_decision(self, rollout_cache: RolloutCache):
@@ -173,6 +196,40 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
 
+        request_type = self._next_request_type
+        pause_age_s = 0.0
+        if request_type == "resume" and self._pause_ts is not None:
+            pause_age_s = max(0.0, time.time() - self._pause_ts)
+            self._resume_generation += 1
+
+        expected_tool_return = bool(
+            len(self.rollout_cache.history) > 1 and self.rollout_cache.history[-2].get("use_tool", False)
+        )
+        if request_type == "resume":
+            self._resume_request_count += 1
+            if not expected_tool_return:
+                self._resume_mismatch_count += 1
+                self.logger.warning(
+                    "G1 invariant violated: request_type=resume but previous step is not tool-return. "
+                    "trajectory_id=%s env_id=%s step=%s",
+                    getattr(self, "trajectory_id", None),
+                    self.env_config.get("env_id"),
+                    self.rollout_cache.step,
+                )
+        lm_input.meta_info.update({
+            "trajectory_id": self.trajectory_id,
+            "request_type": request_type,
+            "resume_generation": self._resume_generation,
+            "pause_ts": self._pause_ts,
+            "pause_age_s": pause_age_s,
+            "history_len_tokens": int(input_ids.shape[1]),
+            "last_backend_id": self._last_backend_id,
+            "resume_expected_tool_return": expected_tool_return,
+            "resume_request_count": self._resume_request_count,
+            "resume_mismatch_count": self._resume_mismatch_count,
+        })
+        self._next_request_type = "normal"
+
         content = self.rollout_cache.history[-1]
         input_messages = content['observation']
 
@@ -182,6 +239,10 @@ class AgentNativeStepEnvManager(TrajEnvManager):
 
         if lm_output is None:
             return DataProto(meta_info={"stop_reason": GenerateStopReason.ABORT})
+
+        selected_backend_id = lm_output.meta_info.get("selected_backend_id")
+        if selected_backend_id is not None:
+            self._last_backend_id = selected_backend_id
 
         response_ids = lm_output.batch['responses'][0]
         response_ids = response_ids.tolist()

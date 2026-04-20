@@ -2,7 +2,7 @@ import copy
 import time
 from contextlib import nullcontext
 from threading import Lock
-from typing import Optional
+from typing import Any, Optional
 
 import gem
 import numpy as np
@@ -61,6 +61,11 @@ class TrajEnvManager(BaseEnvManager):
         self._resume_generation = 0
         self._pause_ts = None
         self._last_backend_id = None
+        # Baseline for GEM tool_wrapper metrics; used to detect tool-return boundaries (G1).
+        self._prev_tool_use_counter: Optional[int] = None
+        # Minimal verification counters for G1 runtime invariant.
+        self._resume_request_count = 0
+        self._resume_mismatch_count = 0
         self.use_thread_lock = self.env_config.get("use_thread_lock", False) # 避免同时执行大量cpu操作, 可以通过env_config配置
         self.thread_lock = thread_lock if self.use_thread_lock else nullcontext()
         # Set environment step concurrency limit
@@ -164,6 +169,9 @@ class TrajEnvManager(BaseEnvManager):
         self._resume_generation = 0
         self._pause_ts = None
         self._last_backend_id = None
+        self._prev_tool_use_counter = None
+        self._resume_request_count = 0
+        self._resume_mismatch_count = 0
 
         with self.thread_lock, self.env_step_limiter:
             # `observation` describes the current game-state prompt;
@@ -179,12 +187,47 @@ class TrajEnvManager(BaseEnvManager):
         })
         return self.rollout_cache
 
+    def _is_tool_return_resume_boundary(self, info: Optional[dict[str, Any]]) -> bool:
+        """True only when this env step crossed an external tool-wait and returns tool observation (G1)."""
+        if not info:
+            return False
+        if info.get("use_tool") is True:
+            return True
+        metrics = info.get("metrics")
+        if not isinstance(metrics, dict):
+            return False
+        raw = metrics.get("tool_use_counter")
+        if raw is None:
+            return False
+        try:
+            cur = int(raw)
+        except (TypeError, ValueError):
+            return False
+        prev = self._prev_tool_use_counter if self._prev_tool_use_counter is not None else 0
+        return cur > prev
+
+    def _update_tool_use_counter_baseline(self, info: Optional[dict[str, Any]]) -> None:
+        if not info:
+            return
+        metrics = info.get("metrics")
+        if not isinstance(metrics, dict):
+            return
+        raw = metrics.get("tool_use_counter")
+        if raw is None:
+            return
+        try:
+            self._prev_tool_use_counter = int(raw)
+        except (TypeError, ValueError):
+            pass
+
     def step(self, llm_output: DataProto):
         responses = self.tokenizer.batch_decode(llm_output.batch['responses'], skip_special_tokens=False)
 
         with self.thread_lock, self.env_step_limiter:
             observation, reward, terminated, truncated, info = self.env.step(action=responses[0])
         suffix = info.pop("suffix", None)
+
+        is_tool_return = self._is_tool_return_resume_boundary(info)
 
         self.rollout_cache.step += 1
         self.rollout_cache.terminated = terminated
@@ -197,6 +240,9 @@ class TrajEnvManager(BaseEnvManager):
         self.rollout_cache.history[-1]['llm_response'] = responses[0]
         if info is not None:
             self.rollout_cache.history[-1].update(info)
+        self.rollout_cache.history[-1]["use_tool"] = is_tool_return
+
+        self._update_tool_use_counter_baseline(info)
 
         self.rollout_cache.history.append({
             "observation": observation,
@@ -206,9 +252,13 @@ class TrajEnvManager(BaseEnvManager):
         if suffix is not None:
             self.rollout_cache.history[-1]["suffix"] = suffix
 
-        # Next inference is a resume request that crosses the external waiting boundary.
-        self._pause_ts = time.time()
-        self._next_request_type = "resume"
+        # Resume only after external tool wait + tool-return observation (aligns with format_messages tool branch).
+        if is_tool_return:
+            self._pause_ts = time.time()
+            self._next_request_type = "resume"
+        else:
+            self._pause_ts = None
+            self._next_request_type = "normal"
         return self.rollout_cache
 
     def make_decision(self, rollout_cache: RolloutCache):
@@ -231,6 +281,22 @@ class TrajEnvManager(BaseEnvManager):
         if request_type == "resume" and self._pause_ts is not None:
             pause_age_s = max(0.0, time.time() - self._pause_ts)
             self._resume_generation += 1
+
+        expected_tool_return = bool(
+            len(self.rollout_cache.history) > 1 and self.rollout_cache.history[-2].get("use_tool", False)
+        )
+        if request_type == "resume":
+            self._resume_request_count += 1
+            if not expected_tool_return:
+                self._resume_mismatch_count += 1
+                self.logger.warning(
+                    "G1 invariant violated: request_type=resume but previous step is not tool-return. "
+                    "trajectory_id=%s env_id=%s step=%s",
+                    self.trajectory_id,
+                    self.env_config.get("env_id"),
+                    self.rollout_cache.step,
+                )
+
         lm_input.meta_info.update({
             "trajectory_id": self.trajectory_id,
             "request_type": request_type,
@@ -239,6 +305,10 @@ class TrajEnvManager(BaseEnvManager):
             "pause_age_s": pause_age_s,
             "history_len_tokens": int(input_ids.shape[1]),
             "last_backend_id": self._last_backend_id,
+            # Minimal verification signals for G1.
+            "resume_expected_tool_return": expected_tool_return,
+            "resume_request_count": self._resume_request_count,
+            "resume_mismatch_count": self._resume_mismatch_count,
         })
         self._next_request_type = "normal"
 
