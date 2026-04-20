@@ -7,8 +7,8 @@ import httpx
 import weakref
 from dataclasses import dataclass
 from abc import abstractmethod
-from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set
+from collections import defaultdict, deque
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
 
 import ray
@@ -1025,6 +1025,7 @@ class EnvAffinityRouter(Router):
         self.active_dp_ranks: Set[int] = set(range(len(self.workers)))  # All ranks initially active
         self.routing_lock = asyncio.Lock()  # Protect routing updates
         router_config = self.router_args.router_config or {}
+        self.enable_resume_priority = bool(router_config.get("enable_resume_priority", True))
         self.enable_resume_aware_routing = bool(router_config.get("enable_resume_aware_routing", False))
         self.enable_request_priority_queue = bool(router_config.get("enable_request_priority_queue", False))
         self.request_wait_aging_weight = float(router_config.get("request_wait_aging_weight", 0.1))
@@ -1037,6 +1038,10 @@ class EnvAffinityRouter(Router):
         self.adaptive_quota_min_ratio = str(router_config.get("adaptive_quota_min_ratio", "1:1"))
         self.adaptive_quota_max_ratio = str(router_config.get("adaptive_quota_max_ratio", "10:1"))
         self.adaptive_quota_update_interval_s = float(router_config.get("adaptive_quota_update_interval_s", 1.0))
+        self.adaptive_quota_use_affinity_signal = bool(router_config.get("adaptive_quota_use_affinity_signal", True))
+        self.adaptive_quota_affinity_window = int(router_config.get("adaptive_quota_affinity_window", 128))
+        self.adaptive_quota_min_feasible_rate = float(router_config.get("adaptive_quota_min_feasible_rate", 0.5))
+        self.adaptive_quota_min_hit_rate = float(router_config.get("adaptive_quota_min_hit_rate", 0.5))
         self.request_score_weights = RequestPriorityWeights.from_config(
             router_config.get("request_score_weights", {})
         )
@@ -1044,6 +1049,14 @@ class EnvAffinityRouter(Router):
         self.force_migrate_age_s = float(router_config.get("force_migrate_age_s", 30.0))
         self.fairness_enable = bool(router_config.get("fairness_enable", False))
         self.fairness_boost_max = float(router_config.get("fairness_boost_max", 1.0))
+
+        # Unified rollback switch: disable all resume-priority behaviors.
+        if not self.enable_resume_priority:
+            self.enable_resume_aware_routing = False
+            self.enable_request_priority_queue = False
+            self.enable_adaptive_quota = False
+            self.normal_max_queue_wait_s = 0.0
+            self.resume_max_queue_wait_s = 0.0
         # Pending requests split by request_type for soft-quota dispatch.
         self.pending_resume_requests: Dict[str, PendingTrajectoryRequest] = {}
         self.pending_normal_requests: Dict[str, PendingTrajectoryRequest] = {}
@@ -1053,9 +1066,14 @@ class EnvAffinityRouter(Router):
         self._quota_resume_target, self._quota_normal_target = self._parse_ratio(self.resume_normal_quota)
         self._quota_cursor = 0
         self._last_adaptive_quota_ts = 0.0
+        window_size = max(1, self.adaptive_quota_affinity_window)
+        self._resume_affinity_hit_window: Deque[int] = deque(maxlen=window_size)
+        self._resume_affinity_feasible_window: Deque[int] = deque(maxlen=window_size)
+        self._last_quota_decision_reason = "init"
         self._reset_resume_metrics()
         logger.info(
             "EnvAffinityRouter resume-aware config: "
+            f"enable_resume_priority={self.enable_resume_priority}, "
             f"enabled={self.enable_resume_aware_routing}, "
             f"queue_enabled={self.enable_request_priority_queue}, "
             f"request_score_weights={self.request_score_weights}, "
@@ -1065,7 +1083,11 @@ class EnvAffinityRouter(Router):
             f"resume_normal_quota={self.resume_normal_quota}, "
             f"normal_max_queue_wait_s={self.normal_max_queue_wait_s}, "
             f"resume_max_queue_wait_s={self.resume_max_queue_wait_s}, "
-            f"enable_adaptive_quota={self.enable_adaptive_quota}"
+            f"enable_adaptive_quota={self.enable_adaptive_quota}, "
+            f"adaptive_quota_use_affinity_signal={self.adaptive_quota_use_affinity_signal}, "
+            f"adaptive_quota_affinity_window={self.adaptive_quota_affinity_window}, "
+            f"adaptive_quota_min_feasible_rate={self.adaptive_quota_min_feasible_rate}, "
+            f"adaptive_quota_min_hit_rate={self.adaptive_quota_min_hit_rate}"
         )
 
     def _reset_resume_metrics(self):
@@ -1078,6 +1100,85 @@ class EnvAffinityRouter(Router):
         self.resume_pause_age_sum = 0.0
         self.resume_queue_wait_sum = 0.0
         self.resume_wait_bucket_served: Dict[str, int] = defaultdict(int)
+        self.normal_total_requests = 0
+        self.normal_queue_wait_sum = 0.0
+        self.queue_wait_bucket_served: Dict[str, int] = defaultdict(int)
+        self.score_bucket_served: Dict[str, int] = defaultdict(int)
+        self.resume_fallback_reason_count: Dict[str, int] = defaultdict(int)
+
+    @staticmethod
+    def _bucketize_queue_wait_s(queue_wait_s: float) -> str:
+        s = max(0.0, float(queue_wait_s))
+        if s < 0.01:
+            return "lt_10ms"
+        if s < 0.1:
+            return "lt_100ms"
+        if s < 0.5:
+            return "lt_500ms"
+        if s < 1.0:
+            return "lt_1s"
+        if s < 3.0:
+            return "lt_3s"
+        if s < 10.0:
+            return "lt_10s"
+        return "ge_10s"
+
+    @staticmethod
+    def _bucketize_score(score: float) -> str:
+        v = float(score)
+        if v < -5.0:
+            return "lt_-5"
+        if v < -1.0:
+            return "lt_-1"
+        if v < 0.0:
+            return "lt_0"
+        if v < 1.0:
+            return "lt_1"
+        if v < 5.0:
+            return "lt_5"
+        return "ge_5"
+
+    def _affinity_feasible_proxy(self, pending: PendingTrajectoryRequest) -> int:
+        """Proxy signal used for resume tie-break / metrics, not a guarantee of hit."""
+        if pending.request_type != "resume":
+            return 0
+        route_meta = pending.route_meta
+        pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
+        if pause_age >= self.force_migrate_age_s:
+            return 0
+        last_backend_id = route_meta.get("last_backend_id")
+        if not isinstance(last_backend_id, int):
+            return 0
+        if last_backend_id not in self.active_dp_ranks:
+            return 0
+        if not self._has_worker_capacity(last_backend_id):
+            return 0
+        return 1
+
+    def _resume_fallback_reason(
+        self,
+        *,
+        route_meta: Dict[str, Any],
+        selected_dp_rank: int,
+        previous_rank: Optional[int],
+    ) -> str:
+        """Best-effort reason for not sticking to previous backend for resume."""
+        pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
+        if pause_age >= self.force_migrate_age_s:
+            return "forced_migrate"
+        last_backend_id = route_meta.get("last_backend_id")
+        if last_backend_id is None:
+            return "no_hint"
+        if not isinstance(last_backend_id, int) or last_backend_id not in self.active_dp_ranks:
+            return "hint_inactive"
+        if not self._has_worker_capacity(last_backend_id):
+            return "hint_no_capacity"
+        if previous_rank is not None and selected_dp_rank == previous_rank:
+            return "hit"
+        if selected_dp_rank != last_backend_id:
+            # Hint existed and had capacity, but selection chose another rank (e.g., load/score).
+            return "selected_other"
+        return "hit"
 
     def _fairness_bonus(self, route_meta: Dict[str, Any]) -> float:
         if not self.fairness_enable:
@@ -1113,7 +1214,7 @@ class EnvAffinityRouter(Router):
         return pending.base_priority + self.request_wait_aging_weight * queue_wait
 
     @staticmethod
-    def _parse_ratio(value: str) -> tuple[int, int]:
+    def _parse_ratio(value: str) -> Tuple[int, int]:
         """Parse a quota ratio string like '3:1' -> (3, 1)."""
         raw = (value or "").strip()
         if not raw:
@@ -1136,6 +1237,20 @@ class EnvAffinityRouter(Router):
         oldest_ts = min(req.enqueue_ts for req in pending.values())
         return max(0.0, time.time() - oldest_ts)
 
+    @staticmethod
+    def _safe_rate(window: Deque[int]) -> float:
+        if not window:
+            return 0.0
+        return float(sum(window)) / float(len(window))
+
+    def _affinity_window_rates(self) -> Tuple[float, float, int]:
+        size = len(self._resume_affinity_hit_window)
+        if size <= 0:
+            return 0.0, 0.0, 0
+        hit_rate = self._safe_rate(self._resume_affinity_hit_window)
+        feasible_rate = self._safe_rate(self._resume_affinity_feasible_window)
+        return hit_rate, feasible_rate, size
+
     def _maybe_update_adaptive_quota(self) -> None:
         if not self.enable_adaptive_quota:
             return
@@ -1149,13 +1264,30 @@ class EnvAffinityRouter(Router):
         normal_backlog = len(self.pending_normal_requests)
         if resume_backlog <= 0 and normal_backlog <= 0:
             return
-        # Simple backlog-driven ratio: push quota toward the more backlogged queue, within bounds.
+        base_r, base_n = self._parse_ratio(self.resume_normal_quota)
+        hit_rate, feasible_rate, win_size = self._affinity_window_rates()
+        affinity_good = (
+            (not self.adaptive_quota_use_affinity_signal)
+            or (
+                win_size > 0
+                and feasible_rate >= self.adaptive_quota_min_feasible_rate
+                and hit_rate >= self.adaptive_quota_min_hit_rate
+            )
+        )
+
+        # Backlog-driven + affinity-gated ratio: only aggressively boost resume when affinity is effective.
         if normal_backlog > resume_backlog:
             self._quota_resume_target, self._quota_normal_target = min_r, max_n
-        elif resume_backlog > normal_backlog:
+            self._last_quota_decision_reason = "normal_backlog_dominant"
+        elif resume_backlog > normal_backlog and affinity_good:
             self._quota_resume_target, self._quota_normal_target = max_r, min_n
+            self._last_quota_decision_reason = "resume_backlog_and_affinity_good"
+        elif resume_backlog > normal_backlog and not affinity_good:
+            self._quota_resume_target, self._quota_normal_target = base_r, base_n
+            self._last_quota_decision_reason = "resume_backlog_but_affinity_poor"
         else:
-            self._quota_resume_target, self._quota_normal_target = self._parse_ratio(self.resume_normal_quota)
+            self._quota_resume_target, self._quota_normal_target = base_r, base_n
+            self._last_quota_decision_reason = "balanced_backlog"
         self._quota_cursor = 0
 
     def _pick_from_resume_queue(self) -> tuple[Optional[PendingTrajectoryRequest], Optional[int]]:
@@ -1163,7 +1295,8 @@ class EnvAffinityRouter(Router):
             return None, None
         sorted_requests = sorted(
             self.pending_resume_requests.values(),
-            key=lambda req: (self._effective_request_priority(req), -req.enqueue_seq),
+            # Tie-breaker: prefer affinity-feasible resumes (proxy), then older FIFO.
+            key=lambda req: (self._effective_request_priority(req), self._affinity_feasible_proxy(req), -req.enqueue_seq),
             reverse=True,
         )
         for pending in sorted_requests:
@@ -1299,6 +1432,31 @@ class EnvAffinityRouter(Router):
         if bucket:
             self.resume_wait_bucket_served[bucket] += 1
 
+        # Adaptive quota signal: rolling window of affinity feasibility & hit rate.
+        # Feasible: we had a last_backend_id hint and we are not in forced-migrate window.
+        last_backend_id = route_meta.get("last_backend_id")
+        affinity_feasible = 1 if (pause_age < self.force_migrate_age_s and last_backend_id is not None) else 0
+        affinity_hit = 1 if (previous_rank is not None and previous_rank == dp_rank) else 0
+        self._resume_affinity_feasible_window.append(affinity_feasible)
+        self._resume_affinity_hit_window.append(affinity_hit)
+
+        # Request-level observability for both resume & normal.
+        self.queue_wait_bucket_served[f"resume/{self._bucketize_queue_wait_s(queue_wait_s)}"] += 1
+        eff_score = base_priority + self.request_wait_aging_weight * queue_wait_s
+        self.score_bucket_served[f"resume/{self._bucketize_score(eff_score)}"] += 1
+
+        reason = self._resume_fallback_reason(route_meta=route_meta, selected_dp_rank=dp_rank, previous_rank=previous_rank)
+        if reason != "hit":
+            self.resume_fallback_reason_count[reason] += 1
+
+    def _record_normal_dispatch(self, *, enqueue_ts: float, base_priority: float) -> None:
+        queue_wait_s = max(0.0, time.time() - enqueue_ts)
+        self.normal_total_requests += 1
+        self.normal_queue_wait_sum += queue_wait_s
+        self.queue_wait_bucket_served[f"normal/{self._bucketize_queue_wait_s(queue_wait_s)}"] += 1
+        eff_score = base_priority + self.request_wait_aging_weight * queue_wait_s
+        self.score_bucket_served[f"normal/{self._bucketize_score(eff_score)}"] += 1
+
     def _compute_resume_score(
         self,
         dp_rank: int,
@@ -1378,6 +1536,11 @@ class EnvAffinityRouter(Router):
                                     enqueue_ts=pending.enqueue_ts,
                                     base_priority=base_priority,
                                     previous_rank=previous_rank,
+                                )
+                            else:
+                                self._record_normal_dispatch(
+                                    enqueue_ts=pending.enqueue_ts,
+                                    base_priority=base_priority,
                                 )
                             self.dispatch_condition.notify_all()
                             break
@@ -1481,7 +1644,27 @@ class EnvAffinityRouter(Router):
             ),
             "scheduler/router/pending_resume_request_count": float(len(self.pending_resume_requests)),
             "scheduler/router/pending_normal_request_count": float(len(self.pending_normal_requests)),
+            "scheduler/router/quota_resume_target": float(self._quota_resume_target),
+            "scheduler/router/quota_normal_target": float(self._quota_normal_target),
         }
+        hit_rate, feasible_rate, win_size = self._affinity_window_rates()
+        if win_size:
+            metrics.update({
+                "scheduler/router/resume_affinity_hit_rate_window": hit_rate,
+                "scheduler/router/resume_affinity_feasible_rate_window": feasible_rate,
+                "scheduler/router/resume_affinity_window_size": float(win_size),
+            })
+        for bucket, served in self.queue_wait_bucket_served.items():
+            metrics[f"scheduler/router/queue_wait_bucket_served/{bucket}"] = float(served)
+        for bucket, served in self.score_bucket_served.items():
+            metrics[f"scheduler/router/score_bucket_served/{bucket}"] = float(served)
+        for reason, cnt in self.resume_fallback_reason_count.items():
+            metrics[f"scheduler/router/resume_fallback_reason/{reason}"] = float(cnt)
+
+        if self.normal_total_requests:
+            total = float(self.normal_total_requests)
+            metrics["scheduler/router/normal_total_requests"] = total
+            metrics["scheduler/router/normal_queue_wait_mean_s"] = self.normal_queue_wait_sum / total
         if self.resume_total_requests == 0:
             return metrics
         total = float(self.resume_total_requests)

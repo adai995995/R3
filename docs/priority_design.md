@@ -20,19 +20,24 @@
 
 ### 1.1 请求与轨迹
 
-系统真正排队的是一次次 **GenerateRequest**，但优先级定义在 **Trajectory（轨迹）** 维度。
+系统真正排队的是一次次 **GenerateRequest**。本设计首版将“等待/aging/公平性”主要落实在 **请求级（request-level）**，即以“入队到出队的排队时间”作为 WaitingTime 的核心信号；轨迹级状态（TrajectoryState）作为可选增强，用于处理“单轨迹霸占”等极端情况。
 
 - **TrajectoryId**：来自 `meta_info["trajectory_id"]`
 - **RequestType**：来自 `meta_info["request_type"]`，取值 `normal|resume`
 
 实现要点：
 
-- scheduler 维护一张 `traj_state` 表：`trajectory_id -> TrajectoryState`
-- 每个请求入队时，用该轨迹状态计算 `Score(τ)`，并把 score 绑定到请求用于排序/调度
+- 调度的基础对象是请求：每个请求入队时记录 `enqueue_ts`，出队时用 `queue_wait_s = now - enqueue_ts` 做 aging/防饿死
+- `trajectory_id` 主要用于 placement（resume affinity）与可观测；轨迹级状态仅在需要时启用（见 1.2）
 
-### 1.2 TrajectoryState（调度侧轨迹状态）
+### 1.2 TrajectoryState（可选：调度侧轨迹状态）
 
-首版建议维护这些字段（都能从现有链路拿到或在 scheduler 侧生成）：
+只有在出现以下问题时，才建议引入轨迹级状态：
+
+- 单条轨迹在短时间内产生/重试大量 resume 请求导致“刷屏”
+- 需要“轨迹公平”而不仅是“请求公平”（例如每条轨迹都要推进）
+
+可选字段示例（按需启用）：
 
 - `last_enqueue_ts`：最近一次入队时间（用于 queue_wait / waiting）
 - `last_dequeue_ts`：最近一次出队服务时间（用于 waiting/aging）
@@ -42,24 +47,29 @@
 
 ---
 
-## 2. 优先级公式
+## 2. 优先级公式（概念形式 vs 当前实现）
 
-设定轨迹优先级的公式可以是：
+设定优先级的概念公式可以是：
 
-Score(\tau) = \alpha \cdot \text{ResumeGain}(\tau) - \beta \cdot \text{ResumeCost}(\tau) + \gamma \cdot \text{WaitingTime}(\tau)
+Score(\tau) = \alpha \cdot \text{ResumeGain}(\tau) - \beta \cdot \text{ResumeCost}(\tau) + \gamma \cdot \text{WaitingTime}(\text{request})
 
 其中：
 
 * \tau 代表某个轨迹。
 * ResumeGain 是恢复该轨迹的潜在价值，衡量恢复该轨迹后能够提升的系统性能。
 * ResumeCost 是恢复轨迹的代价，衡量恢复这个轨迹所需的额外开销，包括上下文重建、缓存恢复等。
-* WaitingTime 是该轨迹自上次恢复请求以来等待的时间，防止长时间没有恢复的轨迹被饿死。
+* WaitingTime 在首版实现中采用 **请求级 queue waiting**（`queue_wait_s`），用于防止队列饥饿。
 * \alpha、\beta、\gamma 是超参数，分别控制 恢复价值、恢复代价和 等待时间 的权重。
 
 实现约束：
 
 - **只对 `request_type=resume` 的请求启用该打分**；normal 请求保持现有策略（FIFO / fair-share）
 - 公式中的每一项必须能用可观测/可计算的 proxy 落地，并输出指标用于校准权重
+
+当前代码实现说明：
+
+- scheduler 当前使用的是 `compute_request_priority(...)` + `request_wait_aging_weight * queue_wait_s` 作为实际 priority。
+- 文档中的 \(\alpha,\beta,\gamma,\lambda_1,\lambda_2\) 仍保留为“概念/可扩展形式”，若要完全对齐，需要在代码中显式实现该套权重与归一化（见第 6/8 节的增强项）。
 
 ---
 
@@ -69,7 +79,7 @@ Score(\tau) = \alpha \cdot \text{ResumeGain}(\tau) - \beta \cdot \text{ResumeCos
 
 1. ResumeGain（恢复价值）
 
-恢复价值表示恢复某条轨迹后，推理任务能够带来的增益。首版推荐使用 **affinity 可行性** 作为 gain 的工程 proxy（可观测、与收益强相关）：
+恢复价值表示恢复某条轨迹后，推理任务能够带来的增益。首版推荐使用 **affinity 可行性（proxy）** 作为 gain 的工程近似（可观测、与收益强相关）：
 
 - 如果能命中上次 backend / preferred worker，则更可能：
   - KV 命中、TTFT 更低
@@ -78,14 +88,19 @@ Score(\tau) = \alpha \cdot \text{ResumeGain}(\tau) - \beta \cdot \text{ResumeCos
 
 定义：
 
-- `AffinityFeasible(τ) ∈ {0,1}`：
-  - `1`：`last_backend_id` 存在且健康，或 `X-ROLL-Preferred-Worker-Url` 命中健康 worker
+- `AffinityFeasible`（proxy，不保证命中）：
+  - `1`：请求携带 affinity hint（例如 `last_backend_id`，或 gateway 能识别的 preferred worker url）
   - `0`：否则
 
-首版 ResumeGain：
+说明：
+
+- 调度器在出队前通常无法“确认一定命中 KV/worker”，因此 `AffinityFeasible` 只能作为近似条件。
+- 真正的命中需要在 dispatch 后观测 `AffinityHit`（见第 4/7 节的指标与动态配额反馈）。
+
+首版 ResumeGain（proxy）：
 
 \[
-\text{ResumeGain}(\tau) = \text{AffinityFeasible}(\tau)
+\text{ResumeGain}(\tau) = \text{AffinityFeasible}
 \]
 
 后续增强（非首版必须）：
@@ -126,18 +141,21 @@ Score(\tau) = \alpha \cdot \text{ResumeGain}(\tau) - \beta \cdot \text{ResumeCos
 
 3. WaitingTime（等待时间）
 
-等待时间防止某些轨迹因长时间等待而被过度忽视。注意这里的 WaitingTime 推荐定义为 **调度侧的 aging**，而不是 runtime 的 `pause_age_s`：
+等待时间用于防止队列饥饿。首版按当前实现采用 **请求级（request-level）的调度侧 queue waiting**，而不是轨迹级 waiting，也不是 runtime 的 `pause_age_s`：
 
 - `pause_age_s`：外部 tool wait 的时间（runtime 侧）
-- `waiting_time_s`：resume 请求在全局调度系统里“多久没有被服务”（scheduler 侧）
+- `queue_wait_s`：该请求在 scheduler 队列里“入队到出队”的排队时间（scheduler 侧）
 
-定义（推荐）：
+定义（首版）：
 
 \[
-\text{WaitingTime}(\tau) = now - \text{LastDequeueTime}(\tau)
+\text{WaitingTime}(\text{request}) = now - \text{enqueue\_ts}
 \]
 
-没有 `LastDequeueTime` 时使用 `LastEnqueueTime` 退化。
+说明：
+
+- 该定义天然与调度器的 pending 队列一致，易实现、易观测。
+- 若后续需要“轨迹公平”（而非请求公平），再引入可选的 `TrajectoryState` 与 `now - last_dequeue_ts(trajectory)`。
 
 * WaitingTime 是恢复请求发出后，实际等待的时间，反映了轨迹被延迟恢复的情况。
 
@@ -151,7 +169,7 @@ Score(\tau) = \alpha \cdot \text{ResumeGain}(\tau) - \beta \cdot \text{ResumeCos
 
 ### 4.1 Score(τ) 计算时机
 
-- **入队时计算**：每个 resume 请求到达 scheduler 时，基于当前 `traj_state` 与 backend 健康/负载视图，计算 score 并赋给请求
+- **入队时计算**：每个 resume 请求到达 scheduler 时，基于请求的 `route_meta` 与 backend 健康/负载视图，计算 score 并赋给请求
 - **可选重算**：若队列很长，可在出队前按最新负载重算（首版可不做）
 
 ### 4.2 队列结构（建议首版采用）
@@ -190,9 +208,13 @@ Score(\tau) = \alpha \cdot \text{ResumeGain}(\tau) - \beta \cdot \text{ResumeCos
 推荐在 `resume_queue` 内部再做一层吞吐友好排序：
 
 - **一级：队列级公平**：通过软配额保证 normal 不被饿死。
-- **二级：resume 内排序**：在 `Score(τ)` 之外，可给 `affinity_feasible`（或 `affinity_score`）一个“tie-breaker”加成：
-  - 优先出队 affinity 可行的 resume（更可能命中 KV/locality，端到端更快）
-  - 同分时按 `waiting_time_s` 更大者优先（继续保证 aging）
+- **二级：resume 内排序（基于 proxy 的吞吐友好偏好）**：
+  - 由于无法在出队前确定“必定命中”，这里的 `affinity_feasible` 仅作为 **hint 是否存在/是否可分配** 的 proxy，用于“偏好”而非硬保证。
+  - 典型实现：
+    - tie-breaker：优先出队 `affinity_feasible=1` 的 resume（更可能命中 locality）
+    - 同分再按 `queue_wait_s` 更大者优先（继续保证 aging）
+  - 当前实现（`EnvAffinityRouter`）：
+    - resume 队列排序 key 形如：`(effective_priority, affinity_feasible_proxy, enqueue_seq)`（affinity 仅作为 tie-breaker）
 
 ### 4.3 Placement 联动（恢复到哪）
 
@@ -202,11 +224,16 @@ Score(\tau) = \alpha \cdot \text{ResumeGain}(\tau) - \beta \cdot \text{ResumeCos
    - `last_backend_id`（ROLL 内 meta）或 gateway 的 `preferred worker url` 命中且健康
 2. 失败则 fallback 到原有 load-balance 策略
 
-并将结果写回可观测字段：
+并将结果写回可观测字段（区分 proxy 与事后观测）：
 
-- `affinity_feasible`（bool）
-- `affinity_hit`（bool）
+- `affinity_feasible`（bool，proxy：hint/可分配性）
+- `affinity_hit`（bool，observed：dispatch 后是否命中）
 - `fallback_reason`（枚举：not_found/unhealthy/overloaded/disabled）
+
+当前实现说明（调度侧 best-effort）：
+
+- `fallback_reason` 为 best-effort 近似（用于解释“为何没粘住 previous backend”），不会强依赖后端健康探测。
+- 已实现的 reason 示例：`no_hint / forced_migrate / hint_inactive / hint_no_capacity / selected_other`（以及 `hit` 作为对照）。
 
 ---
 
@@ -232,7 +259,6 @@ G1 已保证：只有“跨 tool wait 边界 + tool-return observation 触发”
 - `lambda_1, lambda_2`
 - `history_len_clip_min/max`（归一化用）
 - `worker_load_clip_min/max`
-- `waiting_time_clip_max`
 - `resume_normal_quota`（如 `3:1`）
 - `normal_max_queue_wait_s`（soft quota：normal 超时放行阈值）
 - `resume_max_queue_wait_s`（soft quota：resume 超时放行阈值）
@@ -250,11 +276,17 @@ G1 已保证：只有“跨 tool wait 边界 + tool-return observation 触发”
 - `queue_wait_s`：scheduler 入队到出队的时间
 - `queue_backlog`：队列长度/积压（用于动态配额与诊断）
 - `score`：每个 resume 请求的 score 分布
-- `waiting_time_s`：轨迹级 aging
 - `history_len_tokens`
 - `worker_load`（若可得）
 - `affinity_feasible/affinity_hit/fallback_reason`
 - `resume_request_count/resume_mismatch_count`（G1 invariant）
+
+当前实现补充（`EnvAffinityRouter.collect_metrics()`）：
+
+- `scheduler/router/queue_wait_bucket_served/{normal|resume}/...`：queue_wait 分桶计数
+- `scheduler/router/score_bucket_served/{normal|resume}/...`：effective score 分桶计数
+- `scheduler/router/resume_fallback_reason/{reason}`：resume fallback reason 计数
+- `scheduler/router/normal_queue_wait_mean_s`：normal 平均 queue_wait
 
 ---
 
@@ -279,7 +311,7 @@ G1 已保证：只有“跨 tool wait 边界 + tool-return observation 触发”
 
 首版验证建议：
 
-- 单测：给定一组 resume/normal 请求与不同 waiting/history_len，确认出队顺序符合 score 与配额
+- 单测：给定一组 resume/normal 请求与不同 waiting/history_len，验证出队顺序符合 score 与配额
 - 观测：线上/离线对比 `queue_wait_s`、`affinity_hit`、TTFT（若可得）
 - 回滚：`enable_resume_priority=false` 应退化为现有调度路径
 
