@@ -97,12 +97,10 @@ actor_infer:
   data_args:
     template: qwen2_5
   strategy_args:
-    strategy_name: vllm
+    strategy_name: sglang
     strategy_config:
-      gpu_memory_utilization: 0.8
-      block_size: 16
-      load_format: auto
-      enable_prefix_caching: true
+      mem_fraction_static: 0.8
+      load_format: dummy
   device_mapping: list(range(0,8))
   infer_batch_size: 1
 
