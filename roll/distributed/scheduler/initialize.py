@@ -37,11 +37,23 @@ def start_ray_cluster():
         return False
 
     if rank == 0:
-        cmd = f"ray start --head --port={master_port} --node-name={node_name} --dashboard-port={dashboard_port}"
+        cmd = (
+            "ray start --head "
+            f"--port={master_port} "
+            f"--node-name={node_name} "
+            f"--dashboard-port={dashboard_port} "
+            "--disable-usage-stats"
+        )
     else:
         # fix: 处理大规模下可能会出现的head/worker node创建顺序不一致问题
         time.sleep(5)
-        cmd = f"ray start --address={master_addr}:{master_port} --node-name={node_name} --dashboard-port={dashboard_port}"
+        cmd = (
+            "ray start "
+            f"--address={master_addr}:{master_port} "
+            f"--node-name={node_name} "
+            f"--dashboard-port={dashboard_port} "
+            "--disable-usage-stats"
+        )
 
     logger.info(f"Starting ray cluster: {cmd}")
     ret = subprocess.run(cmd, shell=True, capture_output=True)

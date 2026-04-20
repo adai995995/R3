@@ -16,13 +16,21 @@ class ResourceManager:
             facilitating Ray to deploy Actors on specified GPU devices.
         """
         available_resources = ray.available_resources()
-        available_gpu = available_resources.get(current_platform.ray_device_key, 0)
+        # `current_platform` is derived from torch.cuda.is_available(). When CUDA driver/runtime is misconfigured,
+        # it may fall back to CpuPlatform even though Ray still reports GPUs. For scheduling/placement we should
+        # prefer Ray's view of resources.
+        ray_device_key = (
+            "GPU"
+            if num_gpus_per_node and available_resources.get("GPU", 0) > 0
+            else current_platform.ray_device_key
+        )
+        available_gpu = available_resources.get(ray_device_key, 0)
 
         nodes_maybe_used = []
         ray_nodes = ray.nodes()
         for node in ray_nodes:
             resource = node["Resources"]
-            node_gpu_num = int(resource.get(current_platform.ray_device_key, 0))
+            node_gpu_num = int(resource.get(ray_device_key, 0))
             if node_gpu_num >= num_gpus_per_node:
                 nodes_maybe_used.append(node)
         nodes_maybe_used = sorted(nodes_maybe_used, key=lambda n: n["Resources"]["CPU"])
@@ -43,19 +51,28 @@ class ResourceManager:
             for i in range(self.num_nodes):
                 node = nodes_maybe_used[i]
                 node_cpu = int(node["Resources"]["CPU"])
-                bundles.append({current_platform.ray_device_key: self.gpu_per_node, "CPU": max(node_cpu / 2, 1)})
+                bundles.append({ray_device_key: self.gpu_per_node, "CPU": max(node_cpu / 2, 1)})
 
             self.placement_groups = [ray.util.placement_group([bundle]) for bundle in bundles]
             ray.get([pg.ready() for pg in self.placement_groups])
+            device_control_env_var = getattr(current_platform, "device_control_env_var", None)
+            if device_control_env_var is None:
+                # Fall back to common defaults when platform detection falls back to CPU but Ray still schedules GPUs.
+                if ray_device_key == "GPU":
+                    device_control_env_var = "CUDA_VISIBLE_DEVICES"
+                elif ray_device_key == "NPU":
+                    device_control_env_var = "ASCEND_VISIBLE_DEVICES"
+                else:
+                    device_control_env_var = ""
             gpu_ranks = ray.get([
                 get_visible_gpus.options(
                     placement_group=pg,
                     **(
                         {"num_gpus": self.gpu_per_node}
-                        if current_platform.ray_device_key == "GPU"
-                        else {"resources": {current_platform.ray_device_key: self.gpu_per_node}}
+                        if ray_device_key == "GPU"
+                        else {"resources": {ray_device_key: self.gpu_per_node}}
                     )
-                ).remote(current_platform.device_control_env_var)
+                ).remote(device_control_env_var)
                 for pg in self.placement_groups
             ])
             print(f"gpu ranks: {gpu_ranks}")

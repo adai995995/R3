@@ -319,8 +319,12 @@ class BaseConfig(ScheduleConfig):
             os.environ["REPORT_LENGTH_AND_REWARDS"] = "1"
         os.environ.update(self.system_envs)
 
+        # IMPORTANT: do not blindly override user-configured `num_gpus_per_node`.
+        # In some environments (e.g., CUDA driver mismatch), auto-detection may return an incorrect value
+        # and break downstream derived fields like `num_nodes`.
         from ..platforms import current_platform
-        self.num_gpus_per_node = current_platform.device_count()
+        if self.num_gpus_per_node is None:
+            self.num_gpus_per_node = current_platform.device_count()
 
         if hasattr(self, 'actor_train') and isinstance(self.actor_train, WorkerConfig):
             self.actor_train.system_envs.update({k: v for k, v in self.system_envs.items() if k not in self.actor_train.system_envs})

@@ -139,11 +139,16 @@ class Platform:
             - Sets the platform-specific visibility environment variable.
             - Sets the corresponding Ray experimental flag if needed.
         """
-        visible_devices_env_vars = {
-            cls.device_control_env_var: ",".join(map(str, gpu_ranks)),
-            cls.ray_experimental_noset: "1",
-        }
-        env_vars.update(visible_devices_env_vars)
+        device_control_env_var = getattr(cls, "device_control_env_var", None)
+        ray_experimental_noset = getattr(cls, "ray_experimental_noset", None)
+
+        # When platform detection falls back (e.g., torch.cuda.is_available() == False),
+        # some subclasses (like CpuPlatform) may not define device visibility controls.
+        # In that case, we should not crash; we simply skip injecting these env vars.
+        if device_control_env_var:
+            env_vars[device_control_env_var] = ",".join(map(str, gpu_ranks))
+        if ray_experimental_noset:
+            env_vars[ray_experimental_noset] = "1"
 
     @classmethod
     def get_visible_gpus(cls) -> list:
