@@ -66,7 +66,9 @@ reward_pretrain: Qwen/Qwen2.5-0.5B-Instruct
 
 actor_train:
   model_args:
-    attn_implementation: fa2
+    # NOTE: disable FlashAttention2 for easier bring-up.
+    # Set to null to fall back to torch SDPA / default attention implementation.
+    attn_implementation: ~
     disable_gradient_checkpointing: false
     dtype: bf16
     model_type: ~
@@ -106,7 +108,8 @@ actor_infer:
 
 reference:
   model_args:
-    attn_implementation: fa2
+    # Keep consistent with actor_train: avoid requiring flash-attn during bring-up.
+    attn_implementation: ~
     disable_gradient_checkpointing: true
     dtype: bf16
     model_type: ~

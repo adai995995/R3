@@ -280,7 +280,10 @@ class DeepSpeedInferStrategy(InferenceStrategy):
             include = ds_include
 
         self.model.offload_states(include=include, non_blocking=non_blocking)
-        current_platform.empty_cache()
+        # Some platforms (e.g. CPU-only) may not implement empty_cache.
+        empty_cache = getattr(current_platform, "empty_cache", None)
+        if callable(empty_cache):
+            empty_cache()
 
     def op_compute_log_probs(self, logits: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor):
         """

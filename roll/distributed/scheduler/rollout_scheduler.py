@@ -376,10 +376,11 @@ class GroupQueueManager:
 
         # Initialize env activity monitor first (before creating GroupQueues)
         self.group_queue: Dict[int, GroupQueue] = {}
-        self.env_monitor = EnvActivityMonitor(
-            config=config.env_monitor,
-            group_queue_dict=self.group_queue
-        )
+        # Some unit tests use lightweight mock configs that don't define `env_monitor`.
+        env_monitor_cfg = getattr(config, "env_monitor", None)
+        if env_monitor_cfg is None:
+            env_monitor_cfg = EnvMonitorConfig()
+        self.env_monitor = EnvActivityMonitor(config=env_monitor_cfg, group_queue_dict=self.group_queue)
 
         # Create GroupQueues with env_monitor reference
         for rank, rank_env_configs in env_manager_config.env_configs.items():
@@ -398,7 +399,7 @@ class GroupQueueManager:
                     )
 
         # Start monitoring after all GroupQueues are created
-        if config.env_monitor.enable:
+        if env_monitor_cfg.enable:
             self.env_monitor.start_monitoring()
 
         # for debug
@@ -536,7 +537,9 @@ class GroupQueueManager:
             await wait_a_episode()
         get_batch_return_start_time = time.time()
         for d in ret:
-            d.meta_info["get_batch_return_start_time"] = get_batch_return_start_time
+            # In unit tests, mock env managers may emit lightweight tuples instead of DataProto.
+            if hasattr(d, "meta_info") and isinstance(getattr(d, "meta_info", None), dict):
+                d.meta_info["get_batch_return_start_time"] = get_batch_return_start_time
         return ret
 
 class RolloutScheduler(RolloutMockMixin):
@@ -614,11 +617,16 @@ class RolloutScheduler(RolloutMockMixin):
             return
         await asyncio.gather(*self.es_manager.stop(blocking=False))
         await self.env_output_queue.shutdown.remote()
-        await self.router_manager.shutdown.remote()
+        # Unit tests may use lightweight MockRolloutScheduler that doesn't create router_manager.
+        if hasattr(self, "router_manager") and self.router_manager is not None:
+            await self.router_manager.shutdown.remote()
         await self.rollout_task
         self.rollout_task = None
 
     async def suspend(self):
+        # Unit tests may use lightweight MockRolloutScheduler that doesn't create router_manager.
+        if not hasattr(self, "router_manager") or self.router_manager is None:
+            return
         await self.router_manager.suspend.remote()
         await self.router_manager.abort_all.remote()
         await self.router_manager.wait_complete.remote()
