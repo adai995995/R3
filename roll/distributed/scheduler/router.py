@@ -22,6 +22,23 @@ from roll.distributed.scheduler.resume_priority import (
     compute_request_priority,
     compute_resume_score,
 )
+from roll.distributed.scheduler.soft_quota_utils import (
+    ResumeFallbackContext,
+    bucketize_queue_wait_s,
+    bucketize_score,
+    parse_ratio,
+    resume_fallback_reason,
+)
+
+
+@dataclass
+class BackendState:
+    present: bool = False
+    ready: Optional[bool] = None
+    not_ready_reason: Optional[str] = None
+    inflight: Optional[int] = None
+    queue_depth: Optional[int] = None
+    last_update_ts: float = 0.0
 from roll.configs.base_config import RouterArguments
 from roll.models.model_providers import default_tokenizer_provider
 from roll.utils.functionals import gather_unpadded_input_ids
@@ -1042,6 +1059,11 @@ class EnvAffinityRouter(Router):
         self.adaptive_quota_affinity_window = int(router_config.get("adaptive_quota_affinity_window", 128))
         self.adaptive_quota_min_feasible_rate = float(router_config.get("adaptive_quota_min_feasible_rate", 0.5))
         self.adaptive_quota_min_hit_rate = float(router_config.get("adaptive_quota_min_hit_rate", 0.5))
+        self.gateway_status_url = str(router_config.get("gateway_status_url", "")).rstrip("/")
+        self.gateway_status_poll_interval_s = float(router_config.get("gateway_status_poll_interval_s", 2.0))
+        self.gateway_status_headers = dict(router_config.get("gateway_status_headers", {}) or {})
+        self.overloaded_inflight_threshold = int(router_config.get("overloaded_inflight_threshold", 0))
+        self.overloaded_queue_depth_threshold = int(router_config.get("overloaded_queue_depth_threshold", 0))
         self.request_score_weights = RequestPriorityWeights.from_config(
             router_config.get("request_score_weights", {})
         )
@@ -1063,13 +1085,18 @@ class EnvAffinityRouter(Router):
         self.cancelled_pending_requests: Set[str] = set()
         self.request_seq_counter = itertools.count()
         self.dispatch_condition = asyncio.Condition()
-        self._quota_resume_target, self._quota_normal_target = self._parse_ratio(self.resume_normal_quota)
+        self._quota_resume_target, self._quota_normal_target = parse_ratio(self.resume_normal_quota)
         self._quota_cursor = 0
         self._last_adaptive_quota_ts = 0.0
         window_size = max(1, self.adaptive_quota_affinity_window)
         self._resume_affinity_hit_window: Deque[int] = deque(maxlen=window_size)
         self._resume_affinity_feasible_window: Deque[int] = deque(maxlen=window_size)
         self._last_quota_decision_reason = "init"
+        self.worker_urls = await asyncio.gather(*[worker.get_url.remote() for worker in self.workers])
+        self.backend_state: Dict[int, BackendState] = {dp_rank: BackendState() for dp_rank in range(len(self.workers))}
+        self._backend_state_poll_task: Optional[asyncio.Task] = None
+        if self.gateway_status_url and self.gateway_status_poll_interval_s > 0:
+            self._backend_state_poll_task = asyncio.create_task(self._poll_gateway_backend_state_loop())
         self._reset_resume_metrics()
         logger.info(
             "EnvAffinityRouter resume-aware config: "
@@ -1090,6 +1117,71 @@ class EnvAffinityRouter(Router):
             f"adaptive_quota_min_hit_rate={self.adaptive_quota_min_hit_rate}"
         )
 
+    async def _poll_gateway_backend_state_loop(self) -> None:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(2.0)) as client:
+            while True:
+                try:
+                    await self._poll_gateway_backend_state_once(client)
+                except Exception as e:
+                    logger.debug(f"gateway status poll failed: {e}")
+                await asyncio.sleep(self.gateway_status_poll_interval_s)
+
+    async def _poll_gateway_backend_state_once(self, client: httpx.AsyncClient) -> None:
+        # Path A: poll gateway/router /workers JSON.
+        headers = None
+        if self.gateway_status_headers:
+            headers = {str(k): str(v) for k, v in self.gateway_status_headers.items()}
+        resp = await client.get(f"{self.gateway_status_url}/workers", headers=headers)
+        raise_for_status(resp)
+        data = resp.json()
+        workers = []
+        if isinstance(data, dict) and isinstance(data.get("workers"), list):
+            workers = data["workers"]
+        elif isinstance(data, list):
+            workers = data
+        url2rank = {url: i for i, url in enumerate(self.worker_urls)}
+        now = time.time()
+        present_ranks: Set[int] = set()
+        for w in workers:
+            if not isinstance(w, dict):
+                continue
+            url = w.get("url") or w.get("worker_url")
+            if not isinstance(url, str):
+                continue
+            dp_rank = url2rank.get(url)
+            if dp_rank is None:
+                continue
+            present_ranks.add(dp_rank)
+            st = self.backend_state.setdefault(dp_rank, BackendState())
+            st.present = True
+            st.last_update_ts = now
+            # sgl-model-gateway /workers returns WorkerInfo: `is_healthy` + `load`.
+            ready = w.get("ready")
+            if ready is None:
+                ready = w.get("is_healthy")
+            if isinstance(ready, bool):
+                st.ready = ready
+            elif isinstance(ready, (int, float)):
+                st.ready = bool(int(ready))
+            st.not_ready_reason = w.get("not_ready_reason") if isinstance(w.get("not_ready_reason"), str) else None
+            inflight = w.get("inflight") or w.get("in_flight") or w.get("num_inflight") or w.get("load")
+            if isinstance(inflight, (int, float)):
+                st.inflight = int(inflight)
+            queue_depth = w.get("queue_depth") or w.get("queue") or w.get("pending")
+            if isinstance(queue_depth, (int, float)):
+                st.queue_depth = int(queue_depth)
+        # Mark absent workers as not present.
+        for dp_rank in range(len(self.workers)):
+            if dp_rank in present_ranks:
+                continue
+            st = self.backend_state.setdefault(dp_rank, BackendState())
+            st.present = False
+            st.ready = None
+            st.not_ready_reason = None
+            st.inflight = None
+            st.queue_depth = None
+            st.last_update_ts = now
+
     def _reset_resume_metrics(self):
         self.resume_total_requests = 0
         self.resume_affinity_hits = 0
@@ -1106,38 +1198,6 @@ class EnvAffinityRouter(Router):
         self.score_bucket_served: Dict[str, int] = defaultdict(int)
         self.resume_fallback_reason_count: Dict[str, int] = defaultdict(int)
 
-    @staticmethod
-    def _bucketize_queue_wait_s(queue_wait_s: float) -> str:
-        s = max(0.0, float(queue_wait_s))
-        if s < 0.01:
-            return "lt_10ms"
-        if s < 0.1:
-            return "lt_100ms"
-        if s < 0.5:
-            return "lt_500ms"
-        if s < 1.0:
-            return "lt_1s"
-        if s < 3.0:
-            return "lt_3s"
-        if s < 10.0:
-            return "lt_10s"
-        return "ge_10s"
-
-    @staticmethod
-    def _bucketize_score(score: float) -> str:
-        v = float(score)
-        if v < -5.0:
-            return "lt_-5"
-        if v < -1.0:
-            return "lt_-1"
-        if v < 0.0:
-            return "lt_0"
-        if v < 1.0:
-            return "lt_1"
-        if v < 5.0:
-            return "lt_5"
-        return "ge_5"
-
     def _affinity_feasible_proxy(self, pending: PendingTrajectoryRequest) -> int:
         """Proxy signal used for resume tie-break / metrics, not a guarantee of hit."""
         if pending.request_type != "resume":
@@ -1151,6 +1211,16 @@ class EnvAffinityRouter(Router):
             return 0
         if last_backend_id not in self.active_dp_ranks:
             return 0
+        st = self.backend_state.get(last_backend_id)
+        if st is not None:
+            if not st.present:
+                return 0
+            if st.ready is False:
+                return 0
+            if self.overloaded_inflight_threshold > 0 and st.inflight is not None and st.inflight >= self.overloaded_inflight_threshold:
+                return 0
+            if self.overloaded_queue_depth_threshold > 0 and st.queue_depth is not None and st.queue_depth >= self.overloaded_queue_depth_threshold:
+                return 0
         if not self._has_worker_capacity(last_backend_id):
             return 0
         return 1
@@ -1162,23 +1232,31 @@ class EnvAffinityRouter(Router):
         selected_dp_rank: int,
         previous_rank: Optional[int],
     ) -> str:
-        """Best-effort reason for not sticking to previous backend for resume."""
-        pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
-        if pause_age >= self.force_migrate_age_s:
-            return "forced_migrate"
+        hint_worker_load = 0
         last_backend_id = route_meta.get("last_backend_id")
-        if last_backend_id is None:
-            return "no_hint"
-        if not isinstance(last_backend_id, int) or last_backend_id not in self.active_dp_ranks:
-            return "hint_inactive"
-        if not self._has_worker_capacity(last_backend_id):
-            return "hint_no_capacity"
-        if previous_rank is not None and selected_dp_rank == previous_rank:
-            return "hit"
-        if selected_dp_rank != last_backend_id:
-            # Hint existed and had capacity, but selection chose another rank (e.g., load/score).
-            return "selected_other"
-        return "hit"
+        if isinstance(last_backend_id, int) and 0 <= last_backend_id < len(self.running_requests):
+            hint_worker_load = len(self.running_requests[last_backend_id])
+        st = self.backend_state.get(last_backend_id) if isinstance(last_backend_id, int) else None
+        ctx = ResumeFallbackContext(
+            enable_resume_priority=self.enable_resume_priority,
+            enable_resume_aware_routing=self.enable_resume_aware_routing,
+            active_dp_ranks=self.active_dp_ranks,
+            hint_present=bool(st.present) if st is not None else False,
+            hint_ready=st.ready if st is not None else None,
+            hint_inflight=st.inflight if st is not None else None,
+            hint_queue_depth=st.queue_depth if st is not None else None,
+            overloaded_inflight_threshold=self.overloaded_inflight_threshold,
+            overloaded_queue_depth_threshold=self.overloaded_queue_depth_threshold,
+            max_running_requests_per_worker=self.max_running_requests_per_worker,
+            hint_worker_load=hint_worker_load,
+        )
+        return resume_fallback_reason(
+            route_meta=route_meta,
+            selected_dp_rank=selected_dp_rank,
+            previous_rank=previous_rank,
+            ctx=ctx,
+            force_migrate_age_s=self.force_migrate_age_s,
+        )
 
     def _fairness_bonus(self, route_meta: Dict[str, Any]) -> float:
         if not self.fairness_enable:
@@ -1214,23 +1292,6 @@ class EnvAffinityRouter(Router):
         return pending.base_priority + self.request_wait_aging_weight * queue_wait
 
     @staticmethod
-    def _parse_ratio(value: str) -> Tuple[int, int]:
-        """Parse a quota ratio string like '3:1' -> (3, 1)."""
-        raw = (value or "").strip()
-        if not raw:
-            return 1, 1
-        parts = raw.split(":")
-        if len(parts) != 2:
-            return 1, 1
-        try:
-            a = max(0, int(parts[0]))
-            b = max(0, int(parts[1]))
-        except ValueError:
-            return 1, 1
-        if a == 0 and b == 0:
-            return 1, 1
-        return a, b
-
     def _oldest_queue_wait_s(self, pending: Dict[str, PendingTrajectoryRequest]) -> float:
         if not pending:
             return 0.0
@@ -1258,13 +1319,13 @@ class EnvAffinityRouter(Router):
         if now - self._last_adaptive_quota_ts < self.adaptive_quota_update_interval_s:
             return
         self._last_adaptive_quota_ts = now
-        min_r, min_n = self._parse_ratio(self.adaptive_quota_min_ratio)
-        max_r, max_n = self._parse_ratio(self.adaptive_quota_max_ratio)
+        min_r, min_n = parse_ratio(self.adaptive_quota_min_ratio)
+        max_r, max_n = parse_ratio(self.adaptive_quota_max_ratio)
         resume_backlog = len(self.pending_resume_requests)
         normal_backlog = len(self.pending_normal_requests)
         if resume_backlog <= 0 and normal_backlog <= 0:
             return
-        base_r, base_n = self._parse_ratio(self.resume_normal_quota)
+        base_r, base_n = parse_ratio(self.resume_normal_quota)
         hit_rate, feasible_rate, win_size = self._affinity_window_rates()
         affinity_good = (
             (not self.adaptive_quota_use_affinity_signal)
@@ -1441,9 +1502,9 @@ class EnvAffinityRouter(Router):
         self._resume_affinity_hit_window.append(affinity_hit)
 
         # Request-level observability for both resume & normal.
-        self.queue_wait_bucket_served[f"resume/{self._bucketize_queue_wait_s(queue_wait_s)}"] += 1
+        self.queue_wait_bucket_served[f"resume/{bucketize_queue_wait_s(queue_wait_s)}"] += 1
         eff_score = base_priority + self.request_wait_aging_weight * queue_wait_s
-        self.score_bucket_served[f"resume/{self._bucketize_score(eff_score)}"] += 1
+        self.score_bucket_served[f"resume/{bucketize_score(eff_score)}"] += 1
 
         reason = self._resume_fallback_reason(route_meta=route_meta, selected_dp_rank=dp_rank, previous_rank=previous_rank)
         if reason != "hit":
@@ -1453,9 +1514,9 @@ class EnvAffinityRouter(Router):
         queue_wait_s = max(0.0, time.time() - enqueue_ts)
         self.normal_total_requests += 1
         self.normal_queue_wait_sum += queue_wait_s
-        self.queue_wait_bucket_served[f"normal/{self._bucketize_queue_wait_s(queue_wait_s)}"] += 1
+        self.queue_wait_bucket_served[f"normal/{bucketize_queue_wait_s(queue_wait_s)}"] += 1
         eff_score = base_priority + self.request_wait_aging_weight * queue_wait_s
-        self.score_bucket_served[f"normal/{self._bucketize_score(eff_score)}"] += 1
+        self.score_bucket_served[f"normal/{bucketize_score(eff_score)}"] += 1
 
     def _compute_resume_score(
         self,
@@ -1642,6 +1703,12 @@ class EnvAffinityRouter(Router):
             "scheduler/router/pending_request_count": float(
                 len(self.pending_resume_requests) + len(self.pending_normal_requests)
             ),
+            # Alias for doc/observability consistency.
+            "scheduler/router/queue_backlog": float(
+                len(self.pending_resume_requests) + len(self.pending_normal_requests)
+            ),
+            "scheduler/router/queue_backlog_resume": float(len(self.pending_resume_requests)),
+            "scheduler/router/queue_backlog_normal": float(len(self.pending_normal_requests)),
             "scheduler/router/pending_resume_request_count": float(len(self.pending_resume_requests)),
             "scheduler/router/pending_normal_request_count": float(len(self.pending_normal_requests)),
             "scheduler/router/quota_resume_target": float(self._quota_resume_target),

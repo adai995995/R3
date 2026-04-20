@@ -157,12 +157,6 @@ Score(\tau) = \alpha \cdot \text{ResumeGain}(\tau) - \beta \cdot \text{ResumeCos
 - 该定义天然与调度器的 pending 队列一致，易实现、易观测。
 - 若后续需要“轨迹公平”（而非请求公平），再引入可选的 `TrajectoryState` 与 `now - last_dequeue_ts(trajectory)`。
 
-* WaitingTime 是恢复请求发出后，实际等待的时间，反映了轨迹被延迟恢复的情况。
-
-例如：
-
-\text{WaitingTime}(\tau) = \text{CurrentTime} - \text{LastResumeTime}(\tau)
-
 ---
 
 ## 4. 从公式到可执行：Score 计算与队列结构
@@ -228,12 +222,15 @@ Score(\tau) = \alpha \cdot \text{ResumeGain}(\tau) - \beta \cdot \text{ResumeCos
 
 - `affinity_feasible`（bool，proxy：hint/可分配性）
 - `affinity_hit`（bool，observed：dispatch 后是否命中）
-- `fallback_reason`（枚举：not_found/unhealthy/overloaded/disabled）
+- `fallback_reason`（枚举：not_found/inactive/not_ready/overloaded/disabled）
 
 当前实现说明（调度侧 best-effort）：
 
-- `fallback_reason` 为 best-effort 近似（用于解释“为何没粘住 previous backend”），不会强依赖后端健康探测。
-- 已实现的 reason 示例：`no_hint / forced_migrate / hint_inactive / hint_no_capacity / selected_other`（以及 `hit` 作为对照）。
+- `fallback_reason` 为 best-effort 近似（用于解释“为何没粘住 previous backend”）。
+- 路径 A（pull）已实现：scheduler 可定期从 gateway/router 的 `/workers` 拉取 worker 状态（ready/inflight/queue_depth），用于更精细的 reason 判定与 overloaded 判断。
+- 已实现的 reason（与设计枚举对齐 + 扩展）：
+  - 设计枚举（更细分）：`not_found / inactive / not_ready / overloaded / disabled`
+  - 额外扩展：`no_hint / forced_migrate / selected_other`（以及 `hit` 作为对照）
 
 ---
 
@@ -266,6 +263,12 @@ G1 已保证：只有“跨 tool wait 边界 + tool-return observation 触发”
 - `adaptive_quota_min_ratio / adaptive_quota_max_ratio`（动态配额上下界）
 - `adaptive_quota_update_interval_s`（动态配额更新周期）
 - `enable_resume_priority`（总开关，便于回滚）
+- 路径 A（pull gateway 状态）：
+  - `gateway_status_url`：gateway/router 基础 URL（会访问 `{gateway_status_url}/workers`）
+  - `gateway_status_poll_interval_s`：轮询周期
+  - `gateway_status_headers`：轮询时附带的 HTTP headers（例如 API key）
+  - `overloaded_inflight_threshold`：inflight 过载阈值（0 表示关闭）
+  - `overloaded_queue_depth_threshold`：queue_depth 过载阈值（0 表示关闭）
 
 ---
 
@@ -314,6 +317,13 @@ G1 已保证：只有“跨 tool wait 边界 + tool-return observation 触发”
 - 单测：给定一组 resume/normal 请求与不同 waiting/history_len，验证出队顺序符合 score 与配额
 - 观测：线上/离线对比 `queue_wait_s`、`affinity_hit`、TTFT（若可得）
 - 回滚：`enable_resume_priority=false` 应退化为现有调度路径
+
+当前实现补充（默认可跑的纯逻辑单测，不依赖 ray）：
+
+- `tests/distributed/scheduler/test_soft_quota_utils_default.py`
+  - 覆盖：ratio 解析、queue_wait/score 分桶、`fallback_reason` 粒度判定（not_found/inactive/not_ready/overloaded/disabled 等）
+- `tests/distributed/scheduler/test_soft_quota_choose_queue_default.py`
+  - 覆盖：软配额出队选择（空队跳过、超时放行、配额轮询），不依赖 ray
 
 ⸻
 
