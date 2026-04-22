@@ -68,9 +68,15 @@ class ResourceManager:
                 get_visible_gpus.options(
                     placement_group=pg,
                     **(
+                        # Ray reserves built-in resources "CPU"/"GPU" for num_cpus/num_gpus.
+                        # Only "resources={...}" should be used for custom resources (e.g. NPU).
                         {"num_gpus": self.gpu_per_node}
                         if ray_device_key == "GPU"
-                        else {"resources": {ray_device_key: self.gpu_per_node}}
+                        else (
+                            {"num_cpus": 1}
+                            if ray_device_key == "CPU"
+                            else {"resources": {ray_device_key: self.gpu_per_node}}
+                        )
                     )
                 ).remote(device_control_env_var)
                 for pg in self.placement_groups

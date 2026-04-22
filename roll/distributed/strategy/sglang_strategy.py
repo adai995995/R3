@@ -7,9 +7,9 @@ import os
 import pathlib
 import random
 import setproctitle
+import inspect
 
 import ray
-import grpc
 import httpx
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -44,6 +44,25 @@ except:
 
 
 logger = get_logger()
+
+def _filter_kwargs_for_callable(fn, kwargs: dict) -> dict:
+    """Filter kwargs by callable signature.
+
+    SGLang's ServerArgs / entrypoints change across versions. We defensively drop
+    unknown keys to avoid hard failures like:
+      TypeError: ServerArgs.__init__() got an unexpected keyword argument '...'
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        # Fallback: if signature is not introspectable, pass through.
+        return dict(kwargs)
+    params = sig.parameters
+    # If accepts **kwargs, keep everything.
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs)
+    allowed = set(params.keys())
+    return {k: v for k, v in kwargs.items() if k in allowed}
 
 
 class SglangSlaveActor:
@@ -379,7 +398,8 @@ class SglangHttpEngine:
         setproctitle.setproctitle("sglang::server")
         from sglang.srt.server_args import ServerArgs
         from sglang.srt.entrypoints.http_server import launch_server, app, health_generate
-        server_args = ServerArgs(**sglang_config)
+        filtered = _filter_kwargs_for_callable(ServerArgs, sglang_config)
+        server_args = ServerArgs(**filtered)
         SglangHttpEngine.remove_route(app.routes, "/health")
         SglangHttpEngine.remove_route(app.routes, "/health_generate")
         app.get("/health")(SglangHttpEngine.dummy_health_generate)
@@ -468,7 +488,8 @@ class SglangGrpcEngine:
         setproctitle.setproctitle("sglang::server")
         from sglang.srt.server_args import ServerArgs
         from sglang.srt.entrypoints.grpc_server import serve_grpc
-        server_args = ServerArgs(**sglang_config)
+        filtered = _filter_kwargs_for_callable(ServerArgs, sglang_config)
+        server_args = ServerArgs(**filtered)
         asyncio.run(serve_grpc(server_args))
 
     @staticmethod
@@ -490,6 +511,7 @@ class SglangGrpcEngine:
         os.environ["FLASHINFER_WORKSPACE_BASE"] = os.path.join(
             pathlib.Path.home().as_posix(), ".cache", os.environ.get("WORKER_NAME", ""))
         import multiprocessing
+        import grpc
         from sglang.srt.grpc import sglang_scheduler_pb2_grpc
 
         multiprocessing.set_start_method("spawn")

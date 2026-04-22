@@ -6,14 +6,17 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.quantization.fp8 import (
-    Fp8Config,
-    _is_fp8_fnuz,
-    _is_cpu,
-    _is_hip,
-    _use_hip_int4,
-    _use_aiter,
-)
+# NOTE: SGLang's fp8 module is not stable across versions.
+# Some symbols (e.g. `_is_cpu`, `_use_hip_int4`) were renamed/removed, but ROLL's patches rely on them.
+# We treat missing symbols as "feature disabled / not that backend" to keep import-time compatibility.
+import sglang.srt.layers.quantization.fp8 as _sg_fp8
+
+Fp8Config = _sg_fp8.Fp8Config
+_is_fp8_fnuz = getattr(_sg_fp8, "_is_fp8_fnuz", False)
+_is_cpu = getattr(_sg_fp8, "_is_cpu", False)
+_is_hip = getattr(_sg_fp8, "_is_hip", False)
+_use_hip_int4 = getattr(_sg_fp8, "_use_hip_int4", False)
+_use_aiter = getattr(_sg_fp8, "_use_aiter", False)
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,

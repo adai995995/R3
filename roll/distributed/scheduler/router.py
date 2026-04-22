@@ -123,7 +123,13 @@ class RouterManager:
         else:
             self.router_cls = SglangRouter
         assert self.router_cls is not SglangRouter or self.strategy_name == "sglang"
-        assert (self.router_cls is SglangRouter) == (actor_cluster.worker_config.strategy_args.strategy_config.get("grpc_mode", None) is not None) # xnor
+        # NOTE: historically we used the presence of `grpc_mode` key as a proxy for
+        # whether a separate (http/grpc) sglang server is spawned (needed by SglangRouter).
+        # For custom routers (EnvAffinityRouter / PromptAffinityRouter), we may still choose
+        # to run the http server mode for compatibility (e.g. to provide worker URLs),
+        # so we only enforce the requirement in one direction.
+        if self.router_cls is SglangRouter:
+            assert actor_cluster.worker_config.strategy_args.strategy_config.get("grpc_mode", None) is not None
         logger.info(f"RouterManager use router {self.router_cls.__name__}")
         self.router: Router = self.router_cls(router_manager=self, workers=self.workers, model_path=self.model_path, router_args=router_args)
 
@@ -1204,7 +1210,10 @@ class EnvAffinityRouter(Router):
             return 0
         route_meta = pending.route_meta
         pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
-        if pause_age >= self.force_migrate_age_s:
+        # Unit tests may construct EnvAffinityRouter via __new__ without running __init__.
+        # Fall back to "never force migrate" in that case.
+        force_migrate_age_s = float(getattr(self, "force_migrate_age_s", float("inf")))
+        if pause_age >= force_migrate_age_s:
             return 0
         last_backend_id = route_meta.get("last_backend_id")
         if not isinstance(last_backend_id, int):
@@ -1255,7 +1264,7 @@ class EnvAffinityRouter(Router):
             selected_dp_rank=selected_dp_rank,
             previous_rank=previous_rank,
             ctx=ctx,
-            force_migrate_age_s=self.force_migrate_age_s,
+            force_migrate_age_s=float(getattr(self, "force_migrate_age_s", float("inf"))),
         )
 
     def _fairness_bonus(self, route_meta: Dict[str, Any]) -> float:
@@ -1292,7 +1301,7 @@ class EnvAffinityRouter(Router):
         return pending.base_priority + self.request_wait_aging_weight * queue_wait
 
     @staticmethod
-    def _oldest_queue_wait_s(self, pending: Dict[str, PendingTrajectoryRequest]) -> float:
+    def _oldest_queue_wait_s(pending: Dict[str, PendingTrajectoryRequest]) -> float:
         if not pending:
             return 0.0
         oldest_ts = min(req.enqueue_ts for req in pending.values())

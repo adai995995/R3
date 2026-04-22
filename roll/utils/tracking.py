@@ -72,10 +72,25 @@ class TensorBoardTracker(BaseTracker):
         kwargs["flush_secs"] = 10
         self.writer = tensorboard.SummaryWriter(log_dir=log_dir, **kwargs)
         self.config = config
-        for k in list(self.config.keys())[:]:
-            if not isinstance(self.config[k], (int, float, str, bool, torch.Tensor)):
-                self.config[k] = str(self.config[k])
-        self.writer.add_hparams(hparam_dict=self.config, metric_dict={})
+        # TensorBoard's hparams proto implementation is fragile across
+        # (torch,tensorboard,protobuf) versions and also expects flat scalar dicts.
+        # We log a best-effort hparams view and fall back to plain text on failure.
+        hparams: Dict[str, Any] = {}
+        try:
+            for k, v in dict(self.config).items():
+                if not isinstance(k, str):
+                    k = str(k)
+                if isinstance(v, (int, float, str, bool, torch.Tensor)):
+                    hparams[k] = v
+                else:
+                    hparams[k] = str(v)
+            self.writer.add_hparams(hparam_dict=hparams, metric_dict={})
+        except Exception as e:
+            logger.warning(f"TensorBoard add_hparams failed, falling back to text: {e}")
+            try:
+                self.writer.add_text("hparams", json.dumps(hparams, ensure_ascii=False, default=str), global_step=0)
+            except Exception as e2:
+                logger.warning(f"TensorBoard add_text(hparams) failed: {e2}")
         self.writer.flush()
 
     @strip_at_tag_in_log

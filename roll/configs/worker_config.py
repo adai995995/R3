@@ -245,7 +245,16 @@ class WorkerConfig:
                 )
 
         if self.device_mapping is not None:
-            self.device_mapping = eval(self.device_mapping)
+            # Support both legacy string form (e.g. "list(range(8))", "[0,1]") and
+            # structured config form (OmegaConf list -> Python list).
+            if isinstance(self.device_mapping, str):
+                self.device_mapping = eval(self.device_mapping)
+            elif isinstance(self.device_mapping, (list, tuple)):
+                self.device_mapping = list(self.device_mapping)
+            else:
+                raise TypeError(
+                    f"device_mapping must be a str or List[int], got {type(self.device_mapping)}"
+                )
             assert (
                 len(self.device_mapping) % self.num_gpus_per_worker == 0
             ), f"len(device_mapping)={len(self.device_mapping)} must be divisible by num_gpus_per_worker={self.num_gpus_per_worker}."
