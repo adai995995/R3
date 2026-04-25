@@ -188,6 +188,11 @@ class SgLangStrategy(InferenceStrategy):
         await self.model.initialize(sglang_args_list[0])
 
     def get_url(self):
+        # RouterManager / EnvAffinityRouter expects every InferWorker to have a URL string.
+        # In local-engine mode there is no actual server endpoint, so we provide a stable
+        # synthetic URL keyed by dp_rank for affinity bookkeeping / observability.
+        if isinstance(self.model, SglangEngine):
+            return f"inproc://sglang-engine/dp{self.worker.rank}"
         return self.model.get_url()
 
     def op_compute_log_probs(self, logits: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor):
@@ -355,7 +360,28 @@ class SglangEngine:
         os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
         os.environ["FLASHINFER_WORKSPACE_BASE"] = os.path.join(
             pathlib.Path.home().as_posix(), ".cache", os.environ.get("WORKER_NAME", ""))
-        self.engine = sglang_patch.engine.engine_module.Engine(**sglang_config)
+        # Ray typically constrains each worker to a single visible GPU (CUDA_VISIBLE_DEVICES has length 1).
+        # Some SGLang versions initialize NCCL process groups using a helper that may implicitly treat
+        # global rank as a CUDA device ordinal (e.g., barrier(device_ids=[rank])), which breaks under
+        # single-visible-GPU workers (rank>0 => invalid device ordinal).
+        #
+        # We patch SGLang's helper to use ROLL's compatibility implementation that avoids binding CUDA
+        # device ids to rank. This only affects SGLang internals such as init_weights_update_group.
+        try:
+            import sglang.srt.utils as srt_utils
+            from roll.utils.collective.pg_utils import init_custom_process_group as roll_init_pg
+
+            if hasattr(srt_utils, "init_custom_process_group"):
+                srt_utils.init_custom_process_group = roll_init_pg
+        except Exception:
+            # Best-effort patching; if the import path changes across versions we just proceed.
+            pass
+        # Local Engine path also constructs ServerArgs(**kwargs) internally.
+        # Filter unsupported keys (e.g. vLLM-style gpu_memory_utilization) for compatibility
+        # across different SGLang versions.
+        from sglang.srt.server_args import ServerArgs
+        filtered = _filter_kwargs_for_callable(ServerArgs, sglang_config)
+        self.engine = sglang_patch.engine.engine_module.Engine(**filtered)
         self.engine.tokenizer_manager.auto_create_handle_loop() # some rpc of tokenizer_manager will not create handle_loop automatically
 
         self.tokenizer = get_tokenizer(sglang_config["model_path"], trust_remote_code=True)
@@ -370,7 +396,8 @@ class SglangEngine:
         return await self.engine.tokenizer_manager.update_weights_from_tensor(UpdateWeightsFromTensorReqInput(**payload))
 
     async def resume_memory_occupation(self, payload):
-        await self.engine.tokenizer_manager.resume_memory_occupation(ResumeMemoryOccupationReqInput(**payload))
+        filtered = _filter_kwargs_for_callable(ResumeMemoryOccupationReqInput, payload)
+        await self.engine.tokenizer_manager.resume_memory_occupation(ResumeMemoryOccupationReqInput(**filtered))
 
     async def release_memory_occupation(self):
         await self.engine.tokenizer_manager.release_memory_occupation(ReleaseMemoryOccupationReqInput(), None)

@@ -246,25 +246,34 @@ def named_tensors_from_bucket(bucket: "torch.Tensor", tensors_meta: list[dict]) 
 
 def serialize_named_weights(named_weights: list[tuple[str, torch.Tensor]], infer_strategy: str):
     if infer_strategy == "sglang":
-        from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
-
+        # Prefer sglang's optimized bucket format when available, but keep a
+        # compatibility fallback for sglang versions that do not ship
+        # `sglang.srt.weight_sync`.
         try:
-            from sglang.srt.utils.patch_torch import (
-                monkey_patch_torch_reductions as sglang_monkey_patch_torch_reductions,
-            )  # type: ignore
-        except ImportError:
-            from sglang.srt.patch_torch import (
-                monkey_patch_torch_reductions as sglang_monkey_patch_torch_reductions,
-            )  # type: ignore
+            from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket  # type: ignore
 
-        sglang_monkey_patch_torch_reductions()
-        bucket = FlattenedTensorBucket(named_weights)
-        flattened_tensor_data = {
-            "flattened_tensor": bucket.get_flattened_tensor(),
-            "metadata": bucket.get_metadata(),
-        }
-        serialized_tensors = MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
-        return serialized_tensors
+            try:
+                from sglang.srt.utils.patch_torch import (
+                    monkey_patch_torch_reductions as sglang_monkey_patch_torch_reductions,
+                )  # type: ignore
+            except ImportError:
+                from sglang.srt.patch_torch import (
+                    monkey_patch_torch_reductions as sglang_monkey_patch_torch_reductions,
+                )  # type: ignore
+
+            sglang_monkey_patch_torch_reductions()
+            bucket = FlattenedTensorBucket(named_weights)
+            flattened_tensor_data = {
+                "flattened_tensor": bucket.get_flattened_tensor(),
+                "metadata": bucket.get_metadata(),
+            }
+            serialized_tensors = MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+            return serialized_tensors
+        except ModuleNotFoundError:
+            # Fall back to ROLL's in-tree bucket implementation.
+            # This keeps colocated model-update working even if sglang does not
+            # provide weight_sync utilities.
+            pass
 
     bucket, tensors_meta = _bucket_named_tensors(named_weights)
 
