@@ -29,6 +29,15 @@ class ModelUpdateGroup:
         )
 
     def model_update(self, step=None):
+        # NOTE: step==0 means both clusters are already initialized from the same
+        # checkpoint; syncing at step 0 is redundant and can trigger CUDA IPC paths
+        # in restricted/containerized environments.
+        if self.frequency is None or self.frequency <= 0:
+            return {}
+        if step is None:
+            return {}
+        if step == 0:
+            return {}
         if step % self.frequency != 0:
             return {}
 

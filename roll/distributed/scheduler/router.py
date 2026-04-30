@@ -1197,12 +1197,32 @@ class EnvAffinityRouter(Router):
         self.resume_selected_worker_load_sum = 0.0
         self.resume_pause_age_sum = 0.0
         self.resume_queue_wait_sum = 0.0
+        self.resume_history_len_tokens_sum = 0.0
+        self.resume_pause_age_samples: List[float] = []
+        self.resume_queue_wait_samples: List[float] = []
+        self.resume_history_len_tokens_samples: List[float] = []
         self.resume_wait_bucket_served: Dict[str, int] = defaultdict(int)
         self.normal_total_requests = 0
         self.normal_queue_wait_sum = 0.0
+        self.normal_queue_wait_samples: List[float] = []
         self.queue_wait_bucket_served: Dict[str, int] = defaultdict(int)
         self.score_bucket_served: Dict[str, int] = defaultdict(int)
         self.resume_fallback_reason_count: Dict[str, int] = defaultdict(int)
+
+    @staticmethod
+    def _percentile(values: List[float], q: float) -> float:
+        if not values:
+            return 0.0
+        if len(values) == 1:
+            return float(values[0])
+        sorted_vals = sorted(values)
+        pos = max(0.0, min(1.0, q)) * (len(sorted_vals) - 1)
+        lo = int(math.floor(pos))
+        hi = int(math.ceil(pos))
+        if lo == hi:
+            return float(sorted_vals[lo])
+        w_hi = pos - lo
+        return float(sorted_vals[lo] * (1.0 - w_hi) + sorted_vals[hi] * w_hi)
 
     def _affinity_feasible_proxy(self, pending: PendingTrajectoryRequest) -> int:
         """Proxy signal used for resume tie-break / metrics, not a guarantee of hit."""
@@ -1486,11 +1506,16 @@ class EnvAffinityRouter(Router):
         if previous_rank is None:
             previous_rank = self.src_rank2_dp_rank.get(src_rank)
         pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
+        history_len_tokens = float(route_meta.get("history_len_tokens", 0.0) or 0.0)
         queue_wait_s = max(0.0, time.time() - enqueue_ts)
         self.resume_total_requests += 1
         self.resume_pause_age_sum += pause_age
         self.resume_selected_worker_load_sum += float(len(self.running_requests[dp_rank]))
         self.resume_queue_wait_sum += queue_wait_s
+        self.resume_history_len_tokens_sum += history_len_tokens
+        self.resume_pause_age_samples.append(pause_age)
+        self.resume_queue_wait_samples.append(queue_wait_s)
+        self.resume_history_len_tokens_samples.append(history_len_tokens)
         self.resume_score_sum += base_priority + self.request_wait_aging_weight * queue_wait_s
         if previous_rank is not None and previous_rank == dp_rank:
             self.resume_affinity_hits += 1
@@ -1523,6 +1548,7 @@ class EnvAffinityRouter(Router):
         queue_wait_s = max(0.0, time.time() - enqueue_ts)
         self.normal_total_requests += 1
         self.normal_queue_wait_sum += queue_wait_s
+        self.normal_queue_wait_samples.append(queue_wait_s)
         self.queue_wait_bucket_served[f"normal/{bucketize_queue_wait_s(queue_wait_s)}"] += 1
         eff_score = base_priority + self.request_wait_aging_weight * queue_wait_s
         self.score_bucket_served[f"normal/{bucketize_score(eff_score)}"] += 1
@@ -1741,6 +1767,8 @@ class EnvAffinityRouter(Router):
             total = float(self.normal_total_requests)
             metrics["scheduler/router/normal_total_requests"] = total
             metrics["scheduler/router/normal_queue_wait_mean_s"] = self.normal_queue_wait_sum / total
+            metrics["scheduler/router/normal_queue_wait_p50_s"] = self._percentile(self.normal_queue_wait_samples, 0.50)
+            metrics["scheduler/router/normal_queue_wait_p95_s"] = self._percentile(self.normal_queue_wait_samples, 0.95)
         if self.resume_total_requests == 0:
             return metrics
         total = float(self.resume_total_requests)
@@ -1751,6 +1779,13 @@ class EnvAffinityRouter(Router):
             "scheduler/router/resume_forced_migration_rate": self.resume_forced_migrations / total,
             "scheduler/router/resume_pause_age_mean_s": self.resume_pause_age_sum / total,
             "scheduler/router/resume_queue_wait_mean_s": self.resume_queue_wait_sum / total,
+            "scheduler/router/resume_pause_age_p50_s": self._percentile(self.resume_pause_age_samples, 0.50),
+            "scheduler/router/resume_pause_age_p95_s": self._percentile(self.resume_pause_age_samples, 0.95),
+            "scheduler/router/resume_queue_wait_p50_s": self._percentile(self.resume_queue_wait_samples, 0.50),
+            "scheduler/router/resume_queue_wait_p95_s": self._percentile(self.resume_queue_wait_samples, 0.95),
+            "scheduler/router/resume_prefill_tokens_mean": self.resume_history_len_tokens_sum / total,
+            "scheduler/router/resume_prefill_tokens_p50": self._percentile(self.resume_history_len_tokens_samples, 0.50),
+            "scheduler/router/resume_prefill_tokens_p95": self._percentile(self.resume_history_len_tokens_samples, 0.95),
             "scheduler/router/resume_selected_worker_load_mean": self.resume_selected_worker_load_sum / total,
             "scheduler/router/resume_score_mean": self.resume_score_sum / total,
         })

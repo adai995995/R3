@@ -119,7 +119,7 @@ class SgLangStrategy(InferenceStrategy):
                 "model_path": self.worker_config.model_args.model_name_or_path,
                 "dtype": dtype,
                 "random_seed": self.worker.pipeline_config.seed,
-                "skip_tokenizer_init": True,
+                "skip_tokenizer_init": sglang_config.get("skip_tokenizer_init", True),
                 "mem_fraction_static": sglang_config["mem_fraction_static"],
                 "trust_remote_code": True,
                 "tp_size": tp_size,

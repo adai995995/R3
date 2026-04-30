@@ -1,4 +1,5 @@
 import json
+import inspect
 from functools import wraps
 from typing import Optional, Dict, Any
 
@@ -181,6 +182,40 @@ def create_tracker(tracker_name: str, config: dict, **kwargs) -> BaseTracker:
     if tracker_name not in tracker_registry:
         raise ValueError(f"Unknown tracker name: {tracker_name}, total registered trackers: {tracker_registry.keys()}")
     tracker_cls = tracker_registry[tracker_name]
+    # Some configs reuse W&B-style keys (api_key/project/name/...) even when
+    # switching to tensorboard/stdout. We sanitize kwargs for the chosen backend.
+    if tracker_name == "tensorboard":
+        # TensorBoardTracker forwards extra kwargs to SummaryWriter; drop common
+        # experiment-tracker keys that SummaryWriter does not understand.
+        for k in (
+            "api_key",
+            "project",
+            "workspace",
+            "experiment_name",
+            "name",
+            "notes",
+            "description",
+            "tags",
+            "mode",
+            "settings",
+            "login_kwargs",
+        ):
+            kwargs.pop(k, None)
+
+    # Generic best-effort filtering for trackers that do NOT accept **kwargs.
+    try:
+        sig = inspect.signature(tracker_cls.__init__)
+        params = list(sig.parameters.values())
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        # If the tracker explicitly accepts **kwargs, we must not filter; it may
+        # consume keys like `log_dir` dynamically.
+        if not has_var_kw:
+            allowed = {p.name for p in params}
+            allowed.discard("self")
+            if allowed:
+                kwargs = {k: v for k, v in kwargs.items() if k in allowed}
+    except Exception:
+        pass
     return tracker_cls(config, **kwargs)
 
 tracker_registry["tensorboard"] = TensorBoardTracker

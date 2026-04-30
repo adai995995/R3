@@ -1,0 +1,31 @@
+ninja_required_version = 1.3
+cxx = c++
+
+cflags = -DTORCH_EXTENSION_NAME=deepspeed_shm_comm -DTORCH_API_INCLUDE_EXTENSION_H -I/usr/local/lib/python3.10/dist-packages/deepspeed/ops/csrc/cpu/includes -isystem /usr/local/lib/python3.10/dist-packages/torch/include -isystem /usr/local/lib/python3.10/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/include/python3.10 -fPIC -std=c++17 -O2 -fopenmp
+post_cflags = 
+cuda_dlink_post_cflags = 
+sycl_dlink_post_cflags = 
+ldflags = -shared -L/usr/local/lib/python3.10/dist-packages/torch/lib -lc10 -ltorch_cpu -ltorch -ltorch_python
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+
+
+
+
+rule link
+  command = $cxx $in $ldflags -o $out
+
+build shm_interface.o: compile /usr/local/lib/python3.10/dist-packages/deepspeed/ops/csrc/cpu/comm/shm_interface.cpp
+build shm.o: compile /usr/local/lib/python3.10/dist-packages/deepspeed/ops/csrc/cpu/comm/shm.cpp
+
+
+
+
+
+build deepspeed_shm_comm.so: link shm_interface.o shm.o
+
+default deepspeed_shm_comm.so

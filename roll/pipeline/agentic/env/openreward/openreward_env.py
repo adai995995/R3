@@ -18,6 +18,7 @@ import copy
 import logging
 import os
 import time
+import inspect
 from typing import Any, Dict, List, Optional, SupportsFloat, Tuple, Union
 
 from gem import Env
@@ -85,11 +86,27 @@ class OpenRewardEnv(Env):
         api_key = os.environ.get("OPENREWARD_API_KEY", "")
         self._client = OpenReward(api_key=api_key) if api_key else OpenReward()
         self._or_env = self._client.environments.get(name=environment_name)
-        self._num_tasks: int = self._or_env.num_tasks(split)
-        logger.info(
-            "[OpenRewardEnv] Connected to %s — %d %s tasks",
-            environment_name, self._num_tasks, split,
-        )
+        # NOTE: OpenReward SDK API drift:
+        # - older versions exposed env.num_tasks(split)
+        # - newer versions may only expose env.list_tasks(split) (network-backed)
+        #
+        # We treat task-count as an optional optimization used only to map seed->index
+        # deterministically. If it cannot be fetched, we fall back to using the seed
+        # as the task index and rely on session creation to validate it.
+        self._num_tasks: Optional[int] = self._maybe_get_num_tasks(split)
+        if self._num_tasks is not None:
+            logger.info(
+                "[OpenRewardEnv] Connected to %s — %d %s tasks",
+                environment_name,
+                self._num_tasks,
+                split,
+            )
+        else:
+            logger.info(
+                "[OpenRewardEnv] Connected to %s — task count unavailable for split=%s",
+                environment_name,
+                split,
+            )
 
         # --- Episode state (reset each episode) ---
         self._session: Any = None
@@ -127,7 +144,12 @@ class OpenRewardEnv(Env):
 
         # Derive a deterministic task index from the seed
         if seed is not None:
-            self._task_index = seed % self._num_tasks
+            if self._num_tasks is not None and self._num_tasks > 0:
+                self._task_index = seed % self._num_tasks
+            else:
+                # When task-count is unknown, keep a deterministic mapping without modulo.
+                # Session creation will validate the index; on failure we fallback to 0.
+                self._task_index = int(seed)
         else:
             self._task_index = 0
 
@@ -331,9 +353,28 @@ class OpenRewardEnv(Env):
         backoff = self._retry_backoff_seconds
         for attempt in range(self._retry_max_attempts + 1):
             try:
-                self._session = self._or_env.session(
-                    split=self._split, index=self._task_index,
-                )
+                # OpenReward SDK compatibility:
+                # - newer SDK: env.session(task=Task, secrets=...) and requires env.list_tasks(split)
+                # - older SDK: env.session(split=..., index=...)
+                sig = None
+                try:
+                    sig = inspect.signature(self._or_env.session)
+                except Exception:
+                    sig = None
+
+                if sig is not None and "task" in sig.parameters:
+                    tasks = self._or_env.list_tasks(self._split)
+                    if not tasks:
+                        raise RuntimeError(
+                            f"No tasks returned for environment={self._environment_name} split={self._split}"
+                        )
+                    # Deterministic selection; allow large seeds without requiring task-count.
+                    task = tasks[self._task_index % len(tasks)]
+                    self._session = self._or_env.session(task=task)
+                else:
+                    self._session = self._or_env.session(
+                        split=self._split, index=self._task_index,
+                    )
                 self._session.__enter__()
                 logger.info(
                     "[OpenRewardEnv] Session opened: %s split=%s index=%d (attempt %d)",
@@ -341,6 +382,19 @@ class OpenRewardEnv(Env):
                 )
                 return True
             except Exception as exc:
+                # If task index is invalid (common when task-count is unknown),
+                # fallback to index=0 once before applying backoff.
+                if attempt == 0 and self._task_index != 0:
+                    msg = str(exc).lower()
+                    if any(k in msg for k in ("index", "out of range", "invalid", "bounds", "task")):
+                        logger.warning(
+                            "[OpenRewardEnv] Session creation failed for index=%d; "
+                            "falling back to index=0 once. error=%s",
+                            self._task_index,
+                            exc,
+                        )
+                        self._task_index = 0
+                        continue
                 logger.warning(
                     "[OpenRewardEnv] Session creation failed (attempt %d/%d): %s",
                     attempt + 1, self._retry_max_attempts + 1, exc,
@@ -351,6 +405,32 @@ class OpenRewardEnv(Env):
 
         self.env_reset_failed = True
         return False
+
+    def _maybe_get_num_tasks(self, split: str) -> Optional[int]:
+        """Best-effort task count lookup for deterministic seeding.
+
+        This must never raise: failing to get a count should not prevent
+        pipeline startup.
+        """
+        # Old SDKs.
+        try:
+            num_tasks = getattr(self._or_env, "num_tasks", None)
+            if callable(num_tasks):
+                n = int(num_tasks(split))
+                return n if n > 0 else None
+        except Exception as exc:
+            logger.debug("[OpenRewardEnv] num_tasks() unavailable: %s", exc)
+
+        # Newer SDKs may only expose list_tasks(split), which can be network-backed.
+        try:
+            list_tasks = getattr(self._or_env, "list_tasks", None)
+            if callable(list_tasks):
+                tasks = list_tasks(split=split)
+                return len(tasks)
+        except Exception as exc:
+            logger.debug("[OpenRewardEnv] list_tasks() unavailable: %s", exc)
+
+        return None
 
     def _close_session(self) -> None:
         """Safely close the active session."""

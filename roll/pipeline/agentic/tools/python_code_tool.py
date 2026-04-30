@@ -1,4 +1,5 @@
 import re
+import time
 from typing import Tuple, Optional
 
 from gem.tools.python_code_tool import PythonCodeTool as GEMPythonCodeTool
@@ -14,6 +15,7 @@ class PythonCodeTool(GEMPythonCodeTool):
         keep_error_last_line: bool = False,
         tool_instruction=None,
         patterns=None,
+        sleep_s: float = 0.0,
     ):
         # NOTE: `gem.tools.python_code_tool.PythonCodeTool` is a lightweight dataclass tool
         # whose constructor may not accept these runtime knobs. Keep them here for
@@ -22,6 +24,7 @@ class PythonCodeTool(GEMPythonCodeTool):
         self.timeout = timeout
         self.sandbox_type = sandbox_type
         self.keep_error_last_line = keep_error_last_line
+        self.sleep_s = max(float(sleep_s), 0.0)
         self.tool_instruction = ("Initially, when solving a question, you would need to think step by step, without the ability to use code for calculation. "
             "Now, you have the capability to write code to use the code interpreter for calculation. "
             "The code will be executed by a sandbox, and the result can be returned to enhance your reasoning process. your calculation while still maintaining the reasoning process."
@@ -74,10 +77,12 @@ class PythonCodeTool(GEMPythonCodeTool):
             observation = ""
             has_error = True
         else:
+            if self.sleep_s > 0:
+                time.sleep(self.sleep_s)
             result = run_python(code=parsed_code, timeout_s=float(self.timeout))
             stdout = result.get("stdout", "") or ""
             stderr = result.get("stderr", "") or ""
-            exit_code = int(result.get("exit_code", 1) or 1)
+            exit_code = int(result.get("exit_code", 1))
             has_error = exit_code != 0
             if stderr and self.keep_error_last_line:
                 stderr = stderr.split("\n")[-1]

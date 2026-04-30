@@ -39,7 +39,13 @@ def write_to_json_process(path, data, columns_configs):
     column_names = {item[0] for item in columns_configs}
     data = {k: v.tolist() if isinstance(v, numpy.ndarray) else v for k,v in data.items() if k in column_names}
     with Timer(name="dump", logger=None) as timer:
-        global_step = data.get('global_step', [0])[0]
+        # In failure/placeholder rollouts, some fields can be empty lists.
+        # Do not crash the pipeline's sidecar dumping process in that case.
+        gs = data.get("global_step", None)
+        if isinstance(gs, list) and len(gs) > 0:
+            global_step = gs[0]
+        else:
+            global_step = 0
         with open(os.path.join(path, f"rollout_dump_data.step_{global_step}.jsonl"), "w", encoding="utf-8") as f:
             f.write(json.dumps(data, ensure_ascii=False) + "\n")
     logger.info(f"dump_rollout to {path}: {timer.last}")

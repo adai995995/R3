@@ -69,8 +69,15 @@ def start_ray_cluster():
         return False
 
     if rank == 0:
+        # IMPORTANT: start Ray using the current Python so that raylet/workers
+        # inherit the same venv/site-packages (e.g. openreward) as the driver.
+        #
+        # NOTE: `python -m ray` is not a stable entrypoint across Ray versions
+        # (some builds do not provide ray.__main__). The canonical module
+        # entrypoint is `ray.scripts.scripts`.
+        ray_cli = f"\"{sys.executable}\" -m ray.scripts.scripts"
         cmd = (
-            "ray start --head "
+            f"{ray_cli} start --head "
             f"--port={master_port} "
             f"--node-name={node_name} "
             f"--dashboard-port={dashboard_port} "
@@ -81,8 +88,9 @@ def start_ray_cluster():
     else:
         # fix: 处理大规模下可能会出现的head/worker node创建顺序不一致问题
         time.sleep(5)
+        ray_cli = f"\"{sys.executable}\" -m ray.scripts.scripts"
         cmd = (
-            "ray start "
+            f"{ray_cli} start "
             f"--address={master_addr}:{master_port} "
             f"--node-name={node_name} "
             f"--dashboard-port={dashboard_port} "
@@ -132,34 +140,47 @@ def init():
     # This is common in shared single-node environments where another Ray head
     # is already running (port 6379 by default).
     ray_address = os.getenv("RAY_ADDRESS", "").strip()
-    if ray_address:
-        manual_start = False
-    else:
-        manual_start = start_ray_cluster()
+    # NOTE: We intentionally avoid shelling out to `ray start` here.
+    # - In some environments the Ray CLI can fail due to dependency conflicts
+    #   (click/typer/sentinel issues) even though the Ray Python API works.
+    # - `ray.init()` (with address=None) will start a local Ray runtime using
+    #   the current Python executable, ensuring workers inherit the same venv
+    #   and can import packages like `openreward`.
+    manual_start = False
 
     runtime_env = {
         "env_vars": current_platform.get_custom_env_vars(),
     }
 
     if not ray.is_initialized():
+        # For local init, also respect RAY_TMPDIR/RAY_NUM_GPUS when provided.
+        ray_tmp_dir = (os.getenv("RAY_TMPDIR") or "/tmp/ray").strip()
+        forced_num_gpus = os.getenv("RAY_NUM_GPUS", "").strip()
+        num_gpus = None
+        if forced_num_gpus:
+            try:
+                num_gpus = int(forced_num_gpus)
+            except Exception:
+                num_gpus = None
+        if num_gpus is None:
+            try:
+                import torch
+
+                dc = int(torch.cuda.device_count())
+                if dc > 0:
+                    num_gpus = dc
+            except Exception:
+                num_gpus = None
+
         ray.init(
-            address=(
-                ray_address
-                or (f"{master_addr}:{master_port}" if manual_start else None)
-            ),
+            address=(ray_address or None),
             namespace=RAY_NAMESPACE,
             ignore_reinit_error=True,
-            log_to_driver=not manual_start,
+            log_to_driver=True,
             runtime_env=runtime_env,
+            _temp_dir=ray_tmp_dir or None,
+            num_gpus=num_gpus,
         )
         logger.info("Ray cluster initialized")
 
-    if manual_start:
-        wait_for_nodes(expected=world_size)
-        listener = LogMonitorListener()
-        listener.start()
-
     logger.info(f"Current ray cluster resources: {ray.available_resources()}")
-
-    if manual_start and rank > 0:
-        sys.exit(0)

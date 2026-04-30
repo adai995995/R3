@@ -277,11 +277,15 @@ class AgenticPipeline(BasePipeline):
 
                         # PHASE 7: Rollout Get Batch
                         with Timer(name="rollout", logger=None) as rollout_timer:
+                            get_batch_wait_start = time.time()
                             batch = ray.get(self.train_rollout_scheduler.get_batch.remote(batch, self.pipeline_config.rollout_batch_size))
                             sample_uuids = [f"{traj_id}_{i}" for i, traj_id in enumerate(batch.non_tensor_batch['traj_id'])]
                             batch.non_tensor_batch['sample_uuid'] = np.array(sample_uuids, dtype=object)
                             if "get_batch_return_start_time" in batch.meta_info:
                                 metrics["time/get_batch_cost_train"] = time.time() - batch.meta_info.pop("get_batch_return_start_time")
+                            else:
+                                # Proxy for trainer starvation: time waiting for rollout data availability.
+                                metrics["time/get_batch_cost_train"] = time.time() - get_batch_wait_start
                             actor_infer_metrics = self.actor_infer.get_metrics()
                             metrics.update(reduce_metrics(actor_infer_metrics.meta_info.pop("metrics", {})))
                             metrics.update(compute_rollout_traj_metrics(batch))
@@ -566,6 +570,19 @@ class AgenticPipeline(BasePipeline):
                 metrics["time/step_log"] = log_timer.last
 
             metrics["time/step_total"] = step_timer.last
+            # Resource-utilization proxies (for comparing scheduling variants):
+            # - trainer_busy_ratio_proxy: fraction of step time spent in train
+            # - rollout_busy_ratio_proxy: fraction of step time spent in rollout
+            # - trainer_starvation_ratio_proxy: fraction spent waiting for batches
+            step_total = metrics.get("time/step_total", 0.0) or 0.0
+            if step_total > 0:
+                train_t = float(metrics.get("time/step_train", 0.0) or 0.0)
+                rollout_t = float(metrics.get("time/step_rollout", 0.0) or 0.0)
+                get_batch_t = float(metrics.get("time/get_batch_cost_train", 0.0) or 0.0)
+                metrics["system/trainer_busy_ratio_proxy"] = train_t / step_total
+                metrics["system/rollout_busy_ratio_proxy"] = rollout_t / step_total
+                metrics["system/trainer_starvation_ratio_proxy"] = get_batch_t / step_total
+                metrics["system/trainer_starvation_time_s"] = get_batch_t
             self.tracker.log(values=metrics, step=global_step)
 
             logger.info(f"pipeline step {global_step} finished")

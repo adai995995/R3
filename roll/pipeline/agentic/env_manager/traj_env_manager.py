@@ -66,6 +66,9 @@ class TrajEnvManager(BaseEnvManager):
         # Minimal verification counters for G1 runtime invariant.
         self._resume_request_count = 0
         self._resume_mismatch_count = 0
+        self._resume_e2e_latency_samples: list[float] = []
+        self._resume_infer_latency_samples: list[float] = []
+        self._resume_prefill_tokens_samples: list[float] = []
         self.use_thread_lock = self.env_config.get("use_thread_lock", False) # 避免同时执行大量cpu操作, 可以通过env_config配置
         self.thread_lock = thread_lock if self.use_thread_lock else nullcontext()
         # Set environment step concurrency limit
@@ -172,6 +175,9 @@ class TrajEnvManager(BaseEnvManager):
         self._prev_tool_use_counter = None
         self._resume_request_count = 0
         self._resume_mismatch_count = 0
+        self._resume_e2e_latency_samples = []
+        self._resume_infer_latency_samples = []
+        self._resume_prefill_tokens_samples = []
 
         with self.thread_lock, self.env_step_limiter:
             # `observation` describes the current game-state prompt;
@@ -314,9 +320,11 @@ class TrajEnvManager(BaseEnvManager):
 
         input_messages = [item for items in self.rollout_cache.history for item in items["messages"]]
 
+        infer_start_ts = time.time()
         lm_output: DataProto = self.llm_proxy.generate(messages=input_messages,
                                                        lm_input=lm_input,
                                                        generation_config=generation_config)
+        infer_end_ts = time.time()
 
         if lm_output is None:
             return DataProto(meta_info={"stop_reason": GenerateStopReason.ABORT})
@@ -334,6 +342,33 @@ class TrajEnvManager(BaseEnvManager):
 
         content["response_ids"] = response_ids
         content["messages"].append({"role": "assistant", "content": self.tokenizer.decode(response_ids, skip_special_tokens=True)})
+
+        # Per-resume observability metrics:
+        # - resume_latency_e2e_s: tool-return -> this generation completion
+        # - resume_infer_latency_s: only generation RPC latency for this resume turn
+        # - resume_prefill_tokens: proxy for resume prefill/reload cost
+        if request_type == "resume":
+            resume_infer_latency_s = max(0.0, infer_end_ts - infer_start_ts)
+            self._resume_infer_latency_samples.append(resume_infer_latency_s)
+            self._resume_prefill_tokens_samples.append(float(input_ids.shape[1]))
+            if self._pause_ts is not None:
+                resume_latency_e2e_s = max(0.0, infer_end_ts - self._pause_ts)
+                self._resume_e2e_latency_samples.append(resume_latency_e2e_s)
+
+            if "metrics" not in content or not isinstance(content["metrics"], dict):
+                content["metrics"] = {}
+            if "metrics_agg_mode" not in content or not isinstance(content["metrics_agg_mode"], dict):
+                content["metrics_agg_mode"] = {}
+            if self._resume_e2e_latency_samples:
+                content["metrics"]["resume_latency_e2e_s"] = self._resume_e2e_latency_samples[-1]
+            content["metrics"]["resume_infer_latency_s"] = resume_infer_latency_s
+            content["metrics"]["resume_prefill_tokens"] = float(input_ids.shape[1])
+            content["metrics_agg_mode"].update({
+                "resume_latency_e2e_s": "mean",
+                "resume_infer_latency_s": "mean",
+                "resume_prefill_tokens": "mean",
+            })
+
         lm_output.meta_info["stop_reason"] = GenerateStopReason.FINISH
         return lm_output
 
@@ -472,6 +507,18 @@ class TrajEnvManager(BaseEnvManager):
         history_metrics = [item.get("metrics", {}) for item in self.rollout_cache.history]
         env_metric = aggregate_metrics(history_metrics=history_metrics, metrics_agg_mode=metrics_agg_mode)
         env_metric["num_actions"] = rollout_cache.step
+        if self._resume_e2e_latency_samples:
+            env_metric["resume_latency_e2e_mean_s"] = float(np.mean(self._resume_e2e_latency_samples))
+            env_metric["resume_latency_e2e_p50_s"] = float(np.percentile(self._resume_e2e_latency_samples, 50))
+            env_metric["resume_latency_e2e_p95_s"] = float(np.percentile(self._resume_e2e_latency_samples, 95))
+        if self._resume_infer_latency_samples:
+            env_metric["resume_infer_latency_mean_s"] = float(np.mean(self._resume_infer_latency_samples))
+            env_metric["resume_infer_latency_p50_s"] = float(np.percentile(self._resume_infer_latency_samples, 50))
+            env_metric["resume_infer_latency_p95_s"] = float(np.percentile(self._resume_infer_latency_samples, 95))
+        if self._resume_prefill_tokens_samples:
+            env_metric["resume_prefill_tokens_mean"] = float(np.mean(self._resume_prefill_tokens_samples))
+            env_metric["resume_prefill_tokens_p50"] = float(np.percentile(self._resume_prefill_tokens_samples, 50))
+            env_metric["resume_prefill_tokens_p95"] = float(np.percentile(self._resume_prefill_tokens_samples, 95))
 
         env_metric = {f"env/{rollout_cache.tag}/{k}": v for k, v in env_metric.items()}
         env_metric["env/response_length"] = response_length

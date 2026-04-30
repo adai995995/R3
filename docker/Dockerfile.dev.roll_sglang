@@ -1,0 +1,34 @@
+FROM roll:torch260-sglang
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_ROOT_USER_ACTION=ignore \
+    PIP_DEFAULT_TIMEOUT=600 \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
+    PIP_TRUSTED_HOST=mirrors.aliyun.com
+
+RUN cp /etc/apt/sources.list /etc/apt/sources.list.bak && \
+    { \
+      echo "deb http://mirrors.aliyun.com/ubuntu/ jammy main restricted universe multiverse"; \
+      echo "deb http://mirrors.aliyun.com/ubuntu/ jammy-updates main restricted universe multiverse"; \
+      echo "deb http://mirrors.aliyun.com/ubuntu/ jammy-security main restricted universe multiverse"; \
+      echo "deb http://mirrors.aliyun.com/ubuntu/ jammy-backports main restricted universe multiverse"; \
+    } > /etc/apt/sources.list && \
+    printf '%s\n' \
+      'Acquire::Retries "10";' \
+      'Acquire::http::Timeout "60";' \
+      'Acquire::https::Timeout "60";' \
+      'Acquire::http::Pipeline-Depth "0";' \
+      'Acquire::https::Pipeline-Depth "0";' \
+      > /etc/apt/apt.conf.d/99retry && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    rsync \
+    lsof \
+    iproute2 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /mnt/xxl/R3
+
+CMD ["/bin/bash"]
+
