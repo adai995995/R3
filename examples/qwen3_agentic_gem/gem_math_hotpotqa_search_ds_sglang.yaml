@@ -1,0 +1,163 @@
+# HotpotQA + SearchTool，训练 DeepSpeed ZeRO-2，推理 SGLang（与 toolcall_benchmark 栈对齐）
+defaults:
+  - ../config/traj_envs_gem_qa@_here_
+  - ../config/deepspeed_zero2@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: agentic_hotpotqa_search_ds_sglang
+seed: 42
+
+logging_dir: ./output/agentic_hotpotqa_ds_sglang/logs
+output_dir: ./output/agentic_hotpotqa_ds_sglang
+
+system_envs:
+  USE_MODELSCOPE: "1"
+  # Ray worker 不继承你 shell 里的 export；数据集缓存需写在这里（或与宿主机一致的路径）
+  HF_HOME: "/export/xxl/.cache/huggingface"
+  # datasets/huggingface_hub 仍会访问 Hub；无外网到 huggingface.co 时请改镜像或预下载缓存到 HF_HOME
+  HF_ENDPOINT: "https://hf-mirror.com"
+
+track_with: tensorboard
+tracker_kwargs:
+  log_dir: ./output/agentic_hotpotqa_ds_sglang/tb
+
+checkpoint_config:
+  type: file_system
+  output_dir: ./output/agentic_hotpotqa_ds_sglang/checkpoints
+
+num_gpus_per_node: 8
+rpc_timeout: 3600
+async_generation_ratio: 1
+
+max_steps: 50
+save_steps: 100
+logging_steps: 1
+eval_steps: 10
+resume_from_checkpoint: false
+
+rollout_batch_size: 32
+val_batch_size: 32
+sequence_length: 8192
+max_tokens_per_step: 512
+
+advantage_clip: 20
+ppo_epochs: 1
+adv_estimator: "reinforce"
+init_kl_coef: 0.0
+whiten_advantages: true
+entropy_loss_coef: 0
+max_grad_norm: 1.0
+
+pretrain: Qwen/Qwen3-4B-Base
+reward_pretrain: Qwen/Qwen3-4B-Base
+
+# GPU 6–7：DeepSpeed 训练 + HF reference；GPU 0–5：SGLang rollout（可按机器改写）
+actor_train:
+  model_args:
+    attn_implementation: ~
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 16
+    warmup_steps: 10
+    lr_scheduler_type: cosine
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero2}
+  device_mapping: [6, 7]
+  infer_batch_size: 1
+  model_update_frequency: 1
+
+actor_infer:
+  model_args:
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: ${max_tokens_per_step}
+    top_p: 0.99
+    top_k: 100
+    num_beams: 1
+    temperature: 0.99
+    num_return_sequences: 1
+    stop_strings: ["</search>", "</search>\n"]
+    include_stop_str_in_output: true
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: sglang
+    strategy_config:
+      mem_fraction_static: 0.45
+      skip_tokenizer_init: false
+  device_mapping: [0, 1, 2, 3, 4, 5]
+
+reference:
+  model_args:
+    attn_implementation: ~
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    model_type: ~
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: hf_infer
+    strategy_config: ~
+  device_mapping: [6, 7]
+  infer_batch_size: 1
+
+reward_normalization:
+  grouping: batch
+  method: identity
+
+train_env_manager:
+  max_env_num_per_worker: 8
+  num_env_groups: 64
+  group_size: 1
+  tags: [HotpotQA_with_search]
+  num_groups_partition: [64]
+
+val_env_manager:
+  max_env_num_per_worker: 8
+  num_env_groups: 32
+  group_size: 1
+  tags: [HotpotQA_with_search]
+  num_groups_partition: [32]
+
+custom_envs:
+  HotpotQA:
+    ${gem_qa.HotpotQA}
+  HotpotQA_with_mcp:
+    ${gem_qa.HotpotQA_with_mcp}
+  HotpotQA_with_search:
+    env_type: "roll_qa"
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    agent_system_template: ${qa_agent_system_template}
+    agent_template: ${qa_agent_template}
+    max_env_step_concurrent: 10
+    env_config:
+      dataset_name: axon-rl/HotpotQA
+      split: train
+      question_key: problem
+      answer_key: answer
+    tool_wrapper:
+      wrapper_args:
+        tool_reward: 0.0
+        tool_success_reward: 0.0
+        max_tool_uses: 1
+      tool_configs:
+        - tool_id: search
+          tool_args:
+            # Mosec dense retrieval；勿与 SGLang HTTP（常用 8000）同端口
+            search_url: http://127.0.0.1:8001/retrieve
+            timeout: 120

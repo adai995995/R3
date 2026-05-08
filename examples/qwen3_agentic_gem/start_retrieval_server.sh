@@ -24,7 +24,9 @@
 #gzip -d $save_path/wiki-18.jsonl.gz
 #cat $save_path/part_* > $save_path/e5_HNSW64.index
 #huggingface-cli download intfloat/e5-base-v2 --repo-type model
-#export SEARCH_URL="http://localhost:8000/retrieve"
+# Dense retrieval（Mosec）默认 8001，避免与 SGLang（常用 8000）冲突
+export MOSEC_PORT="${MOSEC_PORT:-8001}"
+export SEARCH_URL="${SEARCH_URL:-http://127.0.0.1:${MOSEC_PORT}/retrieve}"
 
 # Configuration
 SEARCH_URL=$SEARCH_URL

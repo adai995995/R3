@@ -1,0 +1,27 @@
+# HotpotQA+Search 路由消融 — 对照组：关闭 resume-priority 全家桶（与设计文档 baseline 一致）
+# 继承主配置，仅改 router_args 与输出路径，便于与 resume_aware 组 TensorBoard 对比。
+defaults:
+  - gem_math_hotpotqa_search_ds_sglang
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: agentic_hotpotqa_search_ds_sglang_router_baseline
+
+logging_dir: ./output/ablation_router_hotpotqa/baseline/logs
+output_dir: ./output/ablation_router_hotpotqa/baseline
+
+tracker_kwargs:
+  log_dir: ./output/ablation_router_hotpotqa/baseline/tb
+
+checkpoint_config:
+  type: file_system
+  output_dir: ./output/ablation_router_hotpotqa/baseline/checkpoints
+
+router_args:
+  router_name: EnvAffinityRouter
+  router_config:
+    enable_resume_priority: false

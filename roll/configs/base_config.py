@@ -35,6 +35,7 @@ class RouterArguments:
         "PromptAffinityRouter",
         "EnvAffinityRouter",
         "SglangRouter",
+        "SglangOrderingRouter",
     ] = field(
         default=None,
         metadata={

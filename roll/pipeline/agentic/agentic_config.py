@@ -278,6 +278,9 @@ class AgenticConfig(PPOConfig):
         if self.router_args is None:
             self.router_args = RouterArguments(router_name="EnvAffinityRouter", router_config=dict())
             self.router_args.max_running_requests = self.max_running_requests
+        elif self.router_args.router_name is None:
+            # Hydra 仅覆盖 router_config 时 router_name 可能为 None，会错误落到 SglangRouter/SglangOrderingRouter 并要求 grpc_mode。
+            self.router_args.router_name = "EnvAffinityRouter"
 
         self.train_env_manager.name = "train_env"
         self.val_env_manager.name = "val_env"

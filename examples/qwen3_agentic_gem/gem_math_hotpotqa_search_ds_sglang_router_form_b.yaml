@@ -1,0 +1,60 @@
+# HotpotQA+Search — 形态 B：ROLL 全局 ordering（resume/normal 队列）+ 外部 sgl-model-gateway placement（cache_aware + preferred URL）
+# 使用 router_name: SglangOrderingRouter；需 actor_infer 为 strategy_name: sglang 且 strategy_config 含 grpc_mode（HTTP worker URL）。
+defaults:
+  - gem_math_hotpotqa_search_ds_sglang
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: agentic_hotpotqa_search_ds_sglang_router_form_b
+
+logging_dir: ./output/ablation_router_hotpotqa/form_b/logs
+output_dir: ./output/ablation_router_hotpotqa/form_b
+
+tracker_kwargs:
+  log_dir: ./output/ablation_router_hotpotqa/form_b/tb
+
+checkpoint_config:
+  type: file_system
+  output_dir: ./output/ablation_router_hotpotqa/form_b/checkpoints
+
+# SglangRouter / SglangOrderingRouter 要求显式设置 grpc_mode（不可省略）。
+# false → SglangHttpEngine，worker 暴露可被子进程 sglang-router 调度的 HTTP URL；
+# 省略或为 None 时为进程内 SglangEngine（仅适配 EnvAffinityRouter 直连 worker）。
+actor_infer:
+  strategy_args:
+    strategy_config:
+      grpc_mode: false
+
+router_args:
+  router_name: SglangOrderingRouter
+  router_config:
+    # 外部 gateway（placement 决策者）。Router 会把 ordering 选出的请求 POST 到这里。
+    gateway_url: "http://127.0.0.1:30000"
+    # 初始化时自动向 gateway 注册当前 Ray 集群的所有 worker URL（POST /workers {"url": ...}）
+    gateway_auto_register_workers: true
+    enable_resume_priority: true
+    enable_resume_aware_routing: false
+    enable_request_priority_queue: true
+    resume_normal_quota: "3:1"
+    normal_max_queue_wait_s: 10.0
+    resume_max_queue_wait_s: 5.0
+    force_migrate_age_s: 30.0
+    resume_score_weights:
+      age: 1.0
+      hist: 0.001
+      aff: 0.5
+      load: 0.5
+      fair: 0.0
+    request_score_weights:
+      age: 1.0
+      hist: 0.001
+      hit: 0.5
+      rebuild: 0.0
+      fair: 0.0
+    request_wait_aging_weight: 0.1
+    enable_adaptive_quota: false
+    max_running_requests_per_worker: 0

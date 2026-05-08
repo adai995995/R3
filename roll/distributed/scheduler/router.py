@@ -48,6 +48,10 @@ from roll.utils.logging import get_logger
 
 logger = get_logger()
 
+def _norm_url(url: str) -> str:
+    u = str(url or "").strip()
+    return u.rstrip("/") if u else u
+
 
 @dataclass
 class PendingTrajectoryRequest:
@@ -120,16 +124,23 @@ class RouterManager:
             self.router_cls = PromptAffinityRouter
         elif router_name == "EnvAffinityRouter":
             self.router_cls = EnvAffinityRouter
+        elif router_name == "SglangOrderingRouter":
+            self.router_cls = SglangOrderingRouter
         else:
             self.router_cls = SglangRouter
-        assert self.router_cls is not SglangRouter or self.strategy_name == "sglang"
+        assert self.router_cls not in (SglangRouter, SglangOrderingRouter) or self.strategy_name == "sglang"
         # NOTE: historically we used the presence of `grpc_mode` key as a proxy for
         # whether a separate (http/grpc) sglang server is spawned (needed by SglangRouter).
         # For custom routers (EnvAffinityRouter / PromptAffinityRouter), we may still choose
         # to run the http server mode for compatibility (e.g. to provide worker URLs),
         # so we only enforce the requirement in one direction.
-        if self.router_cls is SglangRouter:
-            assert actor_cluster.worker_config.strategy_args.strategy_config.get("grpc_mode", None) is not None
+        if self.router_cls in (SglangRouter, SglangOrderingRouter):
+            assert actor_cluster.worker_config.strategy_args.strategy_config.get("grpc_mode", None) is not None, (
+                f"{self.router_cls.__name__} requires actor_infer.strategy_args.strategy_config.grpc_mode "
+                "to be set (typically false for SglangHttpEngine). "
+                "Omitting it selects in-process SglangEngine, which does not expose HTTP worker URLs "
+                "(required by external gateway placement and/or child routers)."
+            )
         logger.info(f"RouterManager use router {self.router_cls.__name__}")
         self.router: Router = self.router_cls(router_manager=self, workers=self.workers, model_path=self.model_path, router_args=router_args)
 
@@ -152,7 +163,8 @@ class RouterManager:
             "sglang_router": self.router_cls is SglangRouter,
             "router_ip": self.router.router_ip if self.router_cls is SglangRouter else None,
             "router_port": self.router.router_port if self.router_cls is SglangRouter else None,
-            "worker_urls": self.router.worker_urls if self.router_cls is SglangRouter else None,
+            "worker_urls": self.router.worker_urls if self.router_cls in (SglangRouter, SglangOrderingRouter) else None,
+            "gateway_url": getattr(self.router, "gateway_url", None) if self.router_cls is SglangOrderingRouter else None,
         }
 
     @classmethod
@@ -802,6 +814,9 @@ class SglangRouter(Router):
         if router_config:
             router_config.update(extra_router_config)
         router_args = RouterArgs(**router_config)
+        # The workflow-ready check should match the actual backend URLs that the child sglang-router
+        # is configured to route to (may be overridden to a gateway URL list).
+        expected_backend_urls = list(getattr(router_args, "worker_urls", None) or router_config.get("worker_urls") or [])
         self.router_process = multiprocessing.Process(
             target=launch_router,
             args=(router_args,),
@@ -810,7 +825,7 @@ class SglangRouter(Router):
         self.router_process.start()
         logger.info(f"Launch sglang-router {router_args=}")
         await wait_sglang_router_ready(self.router_process, f"http://{self.router_ip}:{self.router_port}")
-        await wait_sglang_router_workflow(f"http://{self.router_ip}:{self.router_port}", self.worker_urls)
+        await wait_sglang_router_workflow(f"http://{self.router_ip}:{self.router_port}", expected_backend_urls)
 
     async def generate_request(self, payload, request_id, uid):
         raise RuntimeError("SglangRouter.generate_request is not expected to be called directly, use RouterClient.")
@@ -2056,3 +2071,249 @@ class EnvAffinityRouter(Router):
         )
 
         return {"aborted": len(selected_src_ranks), "remapped": len(selected_src_ranks)}
+
+
+class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
+    """
+    Form B: global resume/normal ordering in ROLL (reuse EnvAffinityRouter queue semantics),
+    placement via child sglang-router HTTP `/generate` + preferred-worker headers.
+
+    RouterClient is not wrapped with `SglangProxy` (router_meta.sglang_router stays False for this class):
+    POST is performed here after ordering to avoid double `/generate`.
+    """
+
+    _PLACEMENT_SENTINEL_DP_RANK = 0
+
+    async def initialize(self):
+        full_router_cfg = dict(self.router_args.router_config or {})
+        self.gateway_url = _norm_url(full_router_cfg.get("gateway_url", "http://127.0.0.1:30000"))
+        self.gateway_generate_path = full_router_cfg.get("gateway_generate_path", "/generate")
+        self.gateway_workers_path = full_router_cfg.get("gateway_workers_path", "/workers")
+        self.gateway_auto_register_workers = bool(full_router_cfg.get("gateway_auto_register_workers", True))
+        self.gateway_ready_timeout_s = float(full_router_cfg.get("gateway_ready_timeout_s", 120.0))
+        self.gateway_ready_poll_interval_s = float(full_router_cfg.get("gateway_ready_poll_interval_s", 1.0))
+        self.gateway_generate_retry_503 = int(full_router_cfg.get("gateway_generate_retry_503", 20))
+        self.gateway_generate_retry_backoff_s = float(full_router_cfg.get("gateway_generate_retry_backoff_s", 0.25))
+
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(None))
+        self.worker_urls = await asyncio.gather(*[worker.get_url.remote() for worker in self.workers])
+        self.http_mode = False if self.worker_urls[0].startswith("grpc") else True
+        assert self.http_mode
+
+        if self.gateway_auto_register_workers:
+            await self._gateway_register_workers(self.worker_urls)
+        await self._wait_gateway_ready()
+
+        await EnvAffinityRouter.initialize(self)
+        self.enable_resume_aware_routing = False
+        self._direct_dispatch_sem = asyncio.Semaphore(max(1, int(self.router_args.max_running_requests)))
+
+    async def _gateway_register_workers(self, worker_urls: List[str]) -> None:
+        # sgl-model-gateway expects POST {gateway}/workers with json {"url": "..."} per worker.
+        gw = _norm_url(self.gateway_url)
+        if not gw:
+            raise ValueError("gateway_url is empty")
+        workers_url = f"{gw}{self.gateway_workers_path}"
+        responses = await asyncio.gather(
+            *[self.client.post(workers_url, json={"url": url}) for url in worker_urls]
+        )
+        for resp in responses:
+            raise_for_status(resp)
+
+    async def _wait_gateway_ready(self) -> None:
+        """Wait until gateway reports at least one healthy worker (or timeout).
+
+        Without this, early /generate may see transient 503 and crash the rollout loop.
+        """
+        deadline = time.time() + max(0.0, self.gateway_ready_timeout_s)
+        gw = _norm_url(self.gateway_url)
+        if not gw:
+            raise ValueError("gateway_url is empty")
+        workers_url = f"{gw}{self.gateway_workers_path}"
+        last_err: Optional[Exception] = None
+        while True:
+            try:
+                resp = await self.client.get(workers_url)
+                raise_for_status(resp)
+                data = resp.json()
+                workers = data.get("workers") if isinstance(data, dict) else None
+                if isinstance(workers, list):
+                    healthy = [w for w in workers if isinstance(w, dict) and w.get("is_healthy") is True]
+                    if healthy:
+                        return
+            except Exception as e:
+                last_err = e
+            if time.time() >= deadline:
+                # Best-effort: don't hard fail init; generate() has 503 retry too.
+                logger.warning(
+                    f"Gateway not ready after {self.gateway_ready_timeout_s}s: "
+                    f"{workers_url=}, last_err={last_err}"
+                )
+                return
+            await asyncio.sleep(max(0.01, self.gateway_ready_poll_interval_s))
+
+    def _has_worker_capacity(self, dp_rank: int) -> bool:
+        total_inflight = sum(len(s) for s in self.running_requests)
+        return total_inflight < self.router_args.max_running_requests
+
+    def _select_worker_for_request(self, pending: PendingTrajectoryRequest) -> Optional[int]:
+        if not self._has_worker_capacity(self._PLACEMENT_SENTINEL_DP_RANK):
+            return None
+        return self._PLACEMENT_SENTINEL_DP_RANK
+
+    def collect_metrics(self) -> Dict[str, float]:
+        return EnvAffinityRouter.collect_metrics(self)
+
+    async def _router_generate(self, payload: Dict[str, Any], route_meta: Dict[str, Any]) -> Dict[str, Any]:
+        from roll.distributed.strategy.sglang_strategy import postprocess_generate
+
+        headers: Dict[str, str] = {}
+        request_type = route_meta.get("request_type")
+        if isinstance(request_type, str) and request_type:
+            headers["X-ROLL-Request-Type"] = request_type
+        if request_type == "resume":
+            last_backend_id = route_meta.get("last_backend_id")
+            if isinstance(last_backend_id, int) and 0 <= last_backend_id < len(self.worker_urls):
+                headers["X-ROLL-Preferred-Worker-Url"] = self.worker_urls[last_backend_id]
+
+        url = f"{self.gateway_url}{self.gateway_generate_path}"
+        response = None
+        for attempt in range(max(1, self.gateway_generate_retry_503 + 1)):
+            response = await self.client.post(url, json=payload, headers=headers)
+            if response.status_code != 503:
+                break
+            # transient overload / no-healthy-workers window
+            if attempt == 0 or attempt % 5 == 0:
+                logger.warning(
+                    f"Gateway returned 503 for /generate, retrying: attempt={attempt+1}/"
+                    f"{self.gateway_generate_retry_503+1} url={url}"
+                )
+            await asyncio.sleep(self.gateway_generate_retry_backoff_s * (1.5 ** min(attempt, 8)))
+        assert response is not None
+        raise_for_status(response)
+        raw = response.json()
+        chunks = raw if isinstance(raw, list) else [raw]
+        out = postprocess_generate(chunks)
+        self._attach_selected_backend_id(chunks, out)
+        return out
+
+    def _attach_selected_backend_id(self, chunks: List[Dict[str, Any]], out: Dict[str, Any]) -> None:
+        if not chunks:
+            return
+        for chunk in chunks:
+            mi = chunk.get("meta_info")
+            if not isinstance(mi, dict):
+                continue
+            if "selected_backend_id" in mi and isinstance(mi["selected_backend_id"], int):
+                out["selected_backend_id"] = mi["selected_backend_id"]
+                return
+            url = mi.get("worker_url") or mi.get("selected_worker_url") or mi.get("url")
+            if isinstance(url, str) and url in self.worker_urls:
+                out["selected_backend_id"] = self.worker_urls.index(url)
+                return
+
+    async def generate_request(self, payload, request_id, uid):
+        route_meta = extract_roll_route_meta(payload)
+        request_type = route_meta.get("request_type", "normal")
+        src_rank = uid
+        base_priority = self._compute_request_base_priority(request_type=request_type, route_meta=route_meta)
+        dp_rank = self._PLACEMENT_SENTINEL_DP_RANK
+
+        if self.enable_request_priority_queue:
+            pending = PendingTrajectoryRequest(
+                request_id=request_id,
+                uid=src_rank,
+                request_type=request_type,
+                route_meta=route_meta,
+                enqueue_ts=time.time(),
+                enqueue_seq=next(self.request_seq_counter),
+                base_priority=base_priority,
+            )
+            async with self.dispatch_condition:
+                if request_type == "resume":
+                    self.pending_resume_requests[request_id] = pending
+                else:
+                    self.pending_normal_requests[request_id] = pending
+                self.dispatch_condition.notify_all()
+                try:
+                    while True:
+                        if request_id in self.cancelled_pending_requests:
+                            self.cancelled_pending_requests.discard(request_id)
+                            self.pending_resume_requests.pop(request_id, None)
+                            self.pending_normal_requests.pop(request_id, None)
+                            return self._build_abort_response()
+                        selected, selected_dp_rank = self._pick_next_dispatchable_request()
+                        if selected and selected.request_id == request_id and selected_dp_rank is not None:
+                            dp_rank = selected_dp_rank
+                            previous_rank = self.src_rank2_dp_rank.get(src_rank)
+                            self.pending_resume_requests.pop(request_id, None)
+                            self.pending_normal_requests.pop(request_id, None)
+                            self.src_rank2_dp_rank[src_rank] = dp_rank
+                            self.request_id_2_src_rank[request_id] = src_rank
+                            self.running_requests[dp_rank].add(request_id)
+                            if request_type == "resume":
+                                self._record_resume_dispatch(
+                                    src_rank=src_rank,
+                                    dp_rank=dp_rank,
+                                    route_meta=route_meta,
+                                    enqueue_ts=pending.enqueue_ts,
+                                    base_priority=base_priority,
+                                    previous_rank=previous_rank,
+                                )
+                            else:
+                                self._record_normal_dispatch(
+                                    enqueue_ts=pending.enqueue_ts,
+                                    base_priority=base_priority,
+                                )
+                            self.dispatch_condition.notify_all()
+                            break
+                        await self.dispatch_condition.wait()
+                except asyncio.CancelledError:
+                    self.pending_resume_requests.pop(request_id, None)
+                    self.pending_normal_requests.pop(request_id, None)
+                    self.cancelled_pending_requests.discard(request_id)
+                    self.dispatch_condition.notify_all()
+                    raise
+            try:
+                return await self._router_generate(payload, route_meta)
+            finally:
+                async with self.dispatch_condition:
+                    self.running_requests[dp_rank].discard(request_id)
+                    self.request_id_2_src_rank.pop(request_id, None)
+                    self.dispatch_condition.notify_all()
+        else:
+            await self._direct_dispatch_sem.acquire()
+            try:
+                enqueue_ts = time.time()
+                async with self.routing_lock:
+                    self.request_id_2_src_rank[request_id] = src_rank
+                    self.running_requests[dp_rank].add(request_id)
+                if request_type == "resume":
+                    self._record_resume_dispatch(
+                        src_rank=src_rank,
+                        dp_rank=dp_rank,
+                        route_meta=route_meta,
+                        enqueue_ts=enqueue_ts,
+                        base_priority=base_priority,
+                        previous_rank=self.src_rank2_dp_rank.get(src_rank),
+                    )
+                else:
+                    self._record_normal_dispatch(enqueue_ts=enqueue_ts, base_priority=base_priority)
+                return await self._router_generate(payload, route_meta)
+            finally:
+                async with self.routing_lock:
+                    self.running_requests[dp_rank].discard(request_id)
+                self.request_id_2_src_rank.pop(request_id, None)
+                self._direct_dispatch_sem.release()
+
+    async def abort_all(self, request_ids):
+        await SglangRouter.abort_all(self, request_ids)
+        if self.enable_request_priority_queue:
+            async with self.dispatch_condition:
+                for pending_request_id in itertools.chain(
+                    self.pending_resume_requests.keys(), self.pending_normal_requests.keys()
+                ):
+                    self.cancelled_pending_requests.add(pending_request_id)
+                self.pending_resume_requests.clear()
+                self.pending_normal_requests.clear()
+                self.dispatch_condition.notify_all()

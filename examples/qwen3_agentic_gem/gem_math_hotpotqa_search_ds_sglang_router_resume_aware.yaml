@@ -1,0 +1,48 @@
+# HotpotQA+Search 路由消融 — 实验组：开启 EnvAffinityRouter resume-aware + 双队列（与设计文档 treatment 对齐）
+# resume_normal_quota 须为字符串 "a:b"（见 soft_quota_utils.parse_ratio）
+defaults:
+  - gem_math_hotpotqa_search_ds_sglang
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: agentic_hotpotqa_search_ds_sglang_router_resume_aware
+
+logging_dir: ./output/ablation_router_hotpotqa/resume_aware/logs
+output_dir: ./output/ablation_router_hotpotqa/resume_aware
+
+tracker_kwargs:
+  log_dir: ./output/ablation_router_hotpotqa/resume_aware/tb
+
+checkpoint_config:
+  type: file_system
+  output_dir: ./output/ablation_router_hotpotqa/resume_aware/checkpoints
+
+router_args:
+  router_name: EnvAffinityRouter
+  router_config:
+    enable_resume_priority: true
+    enable_resume_aware_routing: true
+    enable_request_priority_queue: true
+    resume_normal_quota: "3:1"
+    normal_max_queue_wait_s: 10.0
+    resume_max_queue_wait_s: 5.0
+    force_migrate_age_s: 30.0
+    resume_score_weights:
+      age: 1.0
+      hist: 0.001
+      aff: 0.5
+      load: 0.5
+      fair: 0.0
+    request_score_weights:
+      age: 1.0
+      hist: 0.001
+      hit: 0.5
+      rebuild: 0.0
+      fair: 0.0
+    request_wait_aging_weight: 0.1
+    enable_adaptive_quota: false
+    max_running_requests_per_worker: 0

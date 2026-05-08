@@ -115,8 +115,17 @@ gem_qa:
       tool_configs:
         - tool_id: search
           tool_args:
-            search_url: http://localhost:8000/retrieve
+            # 与 SGLang 推理端口错开；dense retrieval 默认见 gem_math_hotpotqa_search_ds_sglang.yaml
+            search_url: http://127.0.0.1:8001/retrieve
 
-qa_agent_system_template: You're a helpful assistant.
-qa_agent_template: "{observation}"
+qa_agent_system_template: >-
+  You are a helpful assistant.
+  Answer the question concisely.
+  You MAY use the <search>...</search> tool when needed.
+  Your final output MUST end with a single line in the exact format:
+  FINAL: <answer>
+  Do not add any extra text after the FINAL line.
+qa_agent_template: >-
+  {observation}
+  Remember: end with `FINAL: <answer>`.
 

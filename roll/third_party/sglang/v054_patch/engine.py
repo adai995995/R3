@@ -47,10 +47,43 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 def run_scheduler_process(*args, **kwargs):
-    from roll.third_party.sglang import fp8
-    fp8.monkey_patch_fp8()
+    # torchao is optional; some SGLang paths still call apply_torchao_config_to_model for bf16 runs.
+    try:
+        import sglang.srt.layers.torchao_utils as _torchao_utils
+
+        _orig_apply = getattr(_torchao_utils, "apply_torchao_config_to_model", None)
+
+        if callable(_orig_apply):
+
+            def _safe_apply_torchao_config_to_model(*a, **k):  # type: ignore[no-redef]
+                try:
+                    return _orig_apply(*a, **k)
+                except ModuleNotFoundError as e:
+                    if str(e).startswith("No module named 'torchao'"):
+                        print("[roll][sglang] torchao not installed; skip torchao config")
+                        return None
+                    raise
+
+            _torchao_utils.apply_torchao_config_to_model = _safe_apply_torchao_config_to_model  # type: ignore[attr-defined]
+            try:
+                import sglang.srt.model_executor.model_runner as _model_runner
+
+                if hasattr(_model_runner, "apply_torchao_config_to_model"):
+                    _model_runner.apply_torchao_config_to_model = _safe_apply_torchao_config_to_model  # type: ignore[attr-defined]
+            except Exception as e:
+                print(f"[roll][sglang] torchao model_runner shim not applied: {e}")
+    except Exception as e:
+        print(f"[roll][sglang] torchao shim not applied: {e}")
+
+    try:
+        from roll.third_party.sglang import fp8
+
+        fp8.monkey_patch_fp8()
+    except Exception as e:
+        print(f"[roll][sglang] skip fp8 monkey patch due to: {e}")
 
     from sglang.srt.managers.scheduler import run_scheduler_process
+
     return run_scheduler_process(*args, **kwargs)
 
 def run_data_parallel_controller_process(*args, **kwargs):
