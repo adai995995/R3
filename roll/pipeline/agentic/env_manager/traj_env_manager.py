@@ -69,6 +69,8 @@ class TrajEnvManager(BaseEnvManager):
         self._resume_e2e_latency_samples: list[float] = []
         self._resume_infer_latency_samples: list[float] = []
         self._resume_prefill_tokens_samples: list[float] = []
+        self._external_wait_samples: list[float] = []
+        self._resume_queue_wait_samples: list[float] = []
         self.use_thread_lock = self.env_config.get("use_thread_lock", False) # 避免同时执行大量cpu操作, 可以通过env_config配置
         self.thread_lock = thread_lock if self.use_thread_lock else nullcontext()
         # Set environment step concurrency limit
@@ -178,6 +180,8 @@ class TrajEnvManager(BaseEnvManager):
         self._resume_e2e_latency_samples = []
         self._resume_infer_latency_samples = []
         self._resume_prefill_tokens_samples = []
+        self._external_wait_samples = []
+        self._resume_queue_wait_samples = []
 
         with self.thread_lock, self.env_step_limiter:
             # `observation` describes the current game-state prompt;
@@ -229,8 +233,10 @@ class TrajEnvManager(BaseEnvManager):
     def step(self, llm_output: DataProto):
         responses = self.tokenizer.batch_decode(llm_output.batch['responses'], skip_special_tokens=False)
 
+        tool_call_start_ts = time.time()
         with self.thread_lock, self.env_step_limiter:
             observation, reward, terminated, truncated, info = self.env.step(action=responses[0])
+        tool_return_ts = time.time()
         suffix = info.pop("suffix", None)
 
         is_tool_return = self._is_tool_return_resume_boundary(info)
@@ -260,7 +266,24 @@ class TrajEnvManager(BaseEnvManager):
 
         # Resume only after external tool wait + tool-return observation (aligns with format_messages tool branch).
         if is_tool_return:
-            self._pause_ts = time.time()
+            external_wait_s = max(0.0, tool_return_ts - tool_call_start_ts)
+            self._external_wait_samples.append(external_wait_s)
+            content = self.rollout_cache.history[-2]
+            if "metrics" not in content or not isinstance(content["metrics"], dict):
+                content["metrics"] = {}
+            if "metrics_agg_mode" not in content or not isinstance(content["metrics_agg_mode"], dict):
+                content["metrics_agg_mode"] = {}
+            content["metrics"].update({
+                "tool_call_start_ts": tool_call_start_ts,
+                "tool_return_ts": tool_return_ts,
+                "external_wait_s": external_wait_s,
+            })
+            content["metrics_agg_mode"].update({
+                "tool_call_start_ts": "last",
+                "tool_return_ts": "last",
+                "external_wait_s": "mean",
+            })
+            self._pause_ts = tool_return_ts
             self._next_request_type = "resume"
         else:
             self._pause_ts = None
@@ -361,12 +384,40 @@ class TrajEnvManager(BaseEnvManager):
                 content["metrics_agg_mode"] = {}
             if self._resume_e2e_latency_samples:
                 content["metrics"]["resume_latency_e2e_s"] = self._resume_e2e_latency_samples[-1]
+            content["metrics"]["resume_infer_start_ts"] = infer_start_ts
+            content["metrics"]["resume_first_token_ts"] = infer_end_ts
+            content["metrics"]["resume_infer_end_ts"] = infer_end_ts
             content["metrics"]["resume_infer_latency_s"] = resume_infer_latency_s
             content["metrics"]["resume_prefill_tokens"] = float(input_ids.shape[1])
+            for key in (
+                "resume_enqueue_ts",
+                "resume_dispatch_ts",
+                "resume_queue_wait_s",
+                "context_class_gpu_hit",
+                "context_class_cpu_reload",
+                "context_class_full_prefill",
+                "selected_backend_affinity_hit",
+                "selected_backend_migration",
+            ):
+                if key in lm_output.meta_info:
+                    content["metrics"][key] = float(lm_output.meta_info[key])
+            if "resume_queue_wait_s" in lm_output.meta_info:
+                self._resume_queue_wait_samples.append(float(lm_output.meta_info["resume_queue_wait_s"]))
             content["metrics_agg_mode"].update({
                 "resume_latency_e2e_s": "mean",
+                "resume_infer_start_ts": "last",
+                "resume_first_token_ts": "last",
+                "resume_infer_end_ts": "last",
                 "resume_infer_latency_s": "mean",
                 "resume_prefill_tokens": "mean",
+                "resume_enqueue_ts": "last",
+                "resume_dispatch_ts": "last",
+                "resume_queue_wait_s": "mean",
+                "context_class_gpu_hit": "sum",
+                "context_class_cpu_reload": "sum",
+                "context_class_full_prefill": "sum",
+                "selected_backend_affinity_hit": "mean",
+                "selected_backend_migration": "mean",
             })
 
         lm_output.meta_info["stop_reason"] = GenerateStopReason.FINISH
@@ -519,6 +570,14 @@ class TrajEnvManager(BaseEnvManager):
             env_metric["resume_prefill_tokens_mean"] = float(np.mean(self._resume_prefill_tokens_samples))
             env_metric["resume_prefill_tokens_p50"] = float(np.percentile(self._resume_prefill_tokens_samples, 50))
             env_metric["resume_prefill_tokens_p95"] = float(np.percentile(self._resume_prefill_tokens_samples, 95))
+        if self._external_wait_samples:
+            env_metric["external_wait_mean_s"] = float(np.mean(self._external_wait_samples))
+            env_metric["external_wait_p50_s"] = float(np.percentile(self._external_wait_samples, 50))
+            env_metric["external_wait_p95_s"] = float(np.percentile(self._external_wait_samples, 95))
+        if self._resume_queue_wait_samples:
+            env_metric["resume_queue_wait_mean_s"] = float(np.mean(self._resume_queue_wait_samples))
+            env_metric["resume_queue_wait_p50_s"] = float(np.percentile(self._resume_queue_wait_samples, 50))
+            env_metric["resume_queue_wait_p95_s"] = float(np.percentile(self._resume_queue_wait_samples, 95))
 
         env_metric = {f"env/{rollout_cache.tag}/{k}": v for k, v in env_metric.items()}
         env_metric["env/response_length"] = response_length

@@ -29,6 +29,7 @@ from roll.distributed.scheduler.soft_quota_utils import (
     parse_ratio,
     resume_fallback_reason,
 )
+from roll.pipeline.agentic.context_lifecycle import ContextLifecycleManager
 
 
 @dataclass
@@ -590,8 +591,19 @@ class SglangProxy(RouterProxy):
             last_backend_id = route_meta.get("last_backend_id")
             if isinstance(last_backend_id, int) and 0 <= last_backend_id < len(self.worker_urls):
                 headers["X-ROLL-Preferred-Worker-Url"] = self.worker_urls[last_backend_id]
+            pause_age_s = route_meta.get("pause_age_s")
+            if isinstance(pause_age_s, (int, float)):
+                headers["X-ROLL-Pause-Age-S"] = str(float(pause_age_s))
+            history_len_tokens = route_meta.get("history_len_tokens")
+            if isinstance(history_len_tokens, int):
+                headers["X-ROLL-History-Len-Tokens"] = str(history_len_tokens)
 
         return headers
+
+    def _attach_selected_backend_from_header(self, selected_worker_url: Optional[str], out: Dict[str, Any]) -> None:
+        if isinstance(selected_worker_url, str) and selected_worker_url in self.worker_urls:
+            out["selected_backend_id"] = self.worker_urls.index(selected_worker_url)
+            out["selected_worker_url"] = selected_worker_url
 
     async def generate_request(self, payload, request_id, uid):
         from roll.distributed.strategy.sglang_strategy import postprocess_generate
@@ -600,9 +612,12 @@ class SglangProxy(RouterProxy):
         headers = self._build_router_headers(payload)
         response = await self.client.post(url, json=payload, headers=headers)
         raise_for_status(response)
-        response = response.json()
-        response = response if isinstance(response, list) else [response]
-        return postprocess_generate(response)
+        selected_worker_url = response.headers.get("x-smg-selected-worker-url")
+        raw_response = response.json()
+        chunks = raw_response if isinstance(raw_response, list) else [raw_response]
+        out = postprocess_generate(chunks)
+        self._attach_selected_backend_from_header(selected_worker_url, out)
+        return out
 
     async def on_send_request(self, request_id):
         return await self.proxy.on_send_request(request_id)
@@ -617,9 +632,12 @@ class SglangProxy(RouterProxy):
         headers = self._build_router_headers(payload)
         response = self.client_sync.post(url, json=payload, headers=headers)
         raise_for_status(response)
-        response = response.json()
-        response = response if isinstance(response, list) else [response]
-        return postprocess_generate(response)
+        selected_worker_url = response.headers.get("x-smg-selected-worker-url")
+        raw_response = response.json()
+        chunks = raw_response if isinstance(raw_response, list) else [raw_response]
+        out = postprocess_generate(chunks)
+        self._attach_selected_backend_from_header(selected_worker_url, out)
+        return out
 
     def on_send_request_sync(self, request_id):
         return self.proxy.on_send_request_sync(request_id)
@@ -707,6 +725,19 @@ class RouterClient:
         output_data.meta_info["pad_token_id"] = self.pad_token_id
         if "selected_backend_id" in response:
             output_data.meta_info["selected_backend_id"] = response["selected_backend_id"]
+        for key in (
+            "selected_worker_url",
+            "resume_enqueue_ts",
+            "resume_dispatch_ts",
+            "resume_queue_wait_s",
+            "context_class_gpu_hit",
+            "context_class_cpu_reload",
+            "context_class_full_prefill",
+            "selected_backend_affinity_hit",
+            "selected_backend_migration",
+        ):
+            if key in response:
+                output_data.meta_info[key] = response[key]
         return output_data
 
     async def generate_request(self, req: DataProto, request_id, uid):
@@ -1639,6 +1670,10 @@ class EnvAffinityRouter(Router):
                             self.src_rank2_dp_rank[src_rank] = dp_rank
                             self.request_id_2_src_rank[request_id] = src_rank
                             self.running_requests[dp_rank].add(request_id)
+                            dispatch_ts = time.time()
+                            route_meta["resume_enqueue_ts"] = pending.enqueue_ts
+                            route_meta["resume_dispatch_ts"] = dispatch_ts
+                            route_meta["resume_queue_wait_s"] = max(0.0, dispatch_ts - pending.enqueue_ts)
                             if request_type == "resume":
                                 self._record_resume_dispatch(
                                     src_rank=src_rank,
@@ -2094,6 +2129,15 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
         self.gateway_ready_poll_interval_s = float(full_router_cfg.get("gateway_ready_poll_interval_s", 1.0))
         self.gateway_generate_retry_503 = int(full_router_cfg.get("gateway_generate_retry_503", 20))
         self.gateway_generate_retry_backoff_s = float(full_router_cfg.get("gateway_generate_retry_backoff_s", 0.25))
+        self.context_ttl_s = float(full_router_cfg.get("context_ttl_s", 300.0))
+        self.context_token_budget = int(
+            full_router_cfg.get(
+                "context_token_budget",
+                full_router_cfg.get("context_memory_budget_bytes", 0),
+            )
+        )
+        self.context_offload_after_s = float(full_router_cfg.get("context_offload_after_s", -1.0))
+        self.context_evict_after_s = float(full_router_cfg.get("context_evict_after_s", self.context_ttl_s))
 
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(None))
         self.worker_urls = await asyncio.gather(*[worker.get_url.remote() for worker in self.workers])
@@ -2107,6 +2151,11 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
         await EnvAffinityRouter.initialize(self)
         self.enable_resume_aware_routing = False
         self._direct_dispatch_sem = asyncio.Semaphore(max(1, int(self.router_args.max_running_requests)))
+        self.context_lifecycle = ContextLifecycleManager(token_budget=self.context_token_budget)
+        self.context_class_counts: Dict[str, int] = defaultdict(int)
+        self.selected_backend_resume_total = 0
+        self.selected_backend_affinity_hits = 0
+        self.selected_backend_migrations = 0
 
     async def _gateway_register_workers(self, worker_urls: List[str]) -> None:
         # sgl-model-gateway expects POST {gateway}/workers with json {"url": "..."} per worker.
@@ -2162,7 +2211,99 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
         return self._PLACEMENT_SENTINEL_DP_RANK
 
     def collect_metrics(self) -> Dict[str, float]:
-        return EnvAffinityRouter.collect_metrics(self)
+        metrics = EnvAffinityRouter.collect_metrics(self)
+        if hasattr(self, "context_lifecycle"):
+            metrics.update(self.context_lifecycle.collect_metrics(prefix="scheduler/router/context"))
+        for context_class, count in getattr(self, "context_class_counts", {}).items():
+            metrics[f"scheduler/router/context_class/{context_class}"] = float(count)
+        if hasattr(self, "context_class_counts"):
+            self.context_class_counts.clear()
+        selected_total = getattr(self, "selected_backend_resume_total", 0)
+        if selected_total:
+            total = float(selected_total)
+            metrics.update({
+                "scheduler/router/selected_backend_resume_total": total,
+                "scheduler/router/selected_backend_affinity_hit_rate": self.selected_backend_affinity_hits / total,
+                "scheduler/router/selected_backend_migration_rate": self.selected_backend_migrations / total,
+            })
+            self.selected_backend_resume_total = 0
+            self.selected_backend_affinity_hits = 0
+            self.selected_backend_migrations = 0
+        return metrics
+
+    def _context_rid(self, route_meta: Dict[str, Any]) -> Optional[str]:
+        trajectory_id = route_meta.get("trajectory_id")
+        if isinstance(trajectory_id, str) and trajectory_id:
+            return trajectory_id
+        return None
+
+    def _worker_url_for_backend_id(self, backend_id: Any) -> Optional[str]:
+        if isinstance(backend_id, int) and 0 <= backend_id < len(self.worker_urls):
+            return self.worker_urls[backend_id]
+        return None
+
+    def _apply_context_wait_policy(self, rid: str, route_meta: Dict[str, Any]) -> None:
+        pause_age_s = float(route_meta.get("pause_age_s", 0.0) or 0.0)
+        if self.context_evict_after_s >= 0 and pause_age_s >= self.context_evict_after_s:
+            self.context_lifecycle.unpin_context(rid)
+        elif self.context_offload_after_s >= 0 and pause_age_s >= self.context_offload_after_s:
+            self.context_lifecycle.offload_context(rid)
+
+    def _attach_selected_backend_affinity_info(self, route_meta: Dict[str, Any], out: Dict[str, Any]) -> None:
+        if route_meta.get("request_type") != "resume":
+            return
+        last_backend_id = route_meta.get("last_backend_id")
+        selected_backend_id = out.get("selected_backend_id")
+        if not isinstance(last_backend_id, int) or not isinstance(selected_backend_id, int):
+            return
+        hit = 1.0 if last_backend_id == selected_backend_id else 0.0
+        migration = 1.0 - hit
+        out["selected_backend_affinity_hit"] = hit
+        out["selected_backend_migration"] = migration
+        self.selected_backend_resume_total = getattr(self, "selected_backend_resume_total", 0) + 1
+        self.selected_backend_affinity_hits = getattr(self, "selected_backend_affinity_hits", 0) + int(hit)
+        self.selected_backend_migrations = getattr(self, "selected_backend_migrations", 0) + int(migration)
+
+    def _attach_context_lifecycle_info(self, route_meta: Dict[str, Any], out: Dict[str, Any]) -> None:
+        if not hasattr(self, "context_lifecycle"):
+            return
+        rid = self._context_rid(route_meta)
+        if rid is None:
+            return
+
+        selected_worker_url = out.get("selected_worker_url")
+        if not isinstance(selected_worker_url, str):
+            selected_worker_url = self._worker_url_for_backend_id(out.get("selected_backend_id"))
+
+        if route_meta.get("request_type") == "resume":
+            self._apply_context_wait_policy(rid, route_meta)
+            context_class = self.context_lifecycle.classify_resume(rid, selected_worker_url)
+            self.context_class_counts[context_class] = self.context_class_counts.get(context_class, 0) + 1
+            out["context_class_gpu_hit"] = 1.0 if context_class == "gpu_hit" else 0.0
+            out["context_class_cpu_reload"] = 1.0 if context_class == "cpu_reload" else 0.0
+            out["context_class_full_prefill"] = 1.0 if context_class == "full_prefill" else 0.0
+            if context_class == "cpu_reload":
+                self.context_lifecycle.reload_context(rid, selected_worker_url, latency_s=0.0)
+                self.context_lifecycle.retain_context(rid, ttl_s=self.context_ttl_s)
+            elif context_class == "gpu_hit":
+                self.context_lifecycle.retain_context(rid, ttl_s=self.context_ttl_s)
+            elif isinstance(selected_worker_url, str):
+                estimated_tokens = int(route_meta.get("history_len_tokens", 0) or 0)
+                self.context_lifecycle.pin_context(
+                    rid=rid,
+                    worker_url=selected_worker_url,
+                    ttl_s=self.context_ttl_s,
+                    estimated_tokens=estimated_tokens,
+                )
+        elif isinstance(selected_worker_url, str):
+            estimated_tokens = int(route_meta.get("history_len_tokens", 0) or 0)
+            self.context_lifecycle.pin_context(
+                rid=rid,
+                worker_url=selected_worker_url,
+                ttl_s=self.context_ttl_s,
+                estimated_tokens=estimated_tokens,
+            )
+
 
     async def _router_generate(self, payload: Dict[str, Any], route_meta: Dict[str, Any]) -> Dict[str, Any]:
         from roll.distributed.strategy.sglang_strategy import postprocess_generate
@@ -2175,6 +2316,12 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
             last_backend_id = route_meta.get("last_backend_id")
             if isinstance(last_backend_id, int) and 0 <= last_backend_id < len(self.worker_urls):
                 headers["X-ROLL-Preferred-Worker-Url"] = self.worker_urls[last_backend_id]
+            pause_age_s = route_meta.get("pause_age_s")
+            if isinstance(pause_age_s, (int, float)):
+                headers["X-ROLL-Pause-Age-S"] = str(float(pause_age_s))
+            history_len_tokens = route_meta.get("history_len_tokens")
+            if isinstance(history_len_tokens, int):
+                headers["X-ROLL-History-Len-Tokens"] = str(history_len_tokens)
 
         url = f"{self.gateway_url}{self.gateway_generate_path}"
         response = None
@@ -2194,7 +2341,17 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
         raw = response.json()
         chunks = raw if isinstance(raw, list) else [raw]
         out = postprocess_generate(chunks)
-        self._attach_selected_backend_id(chunks, out)
+        selected_worker_url = response.headers.get("x-smg-selected-worker-url")
+        if isinstance(selected_worker_url, str) and selected_worker_url in self.worker_urls:
+            out["selected_backend_id"] = self.worker_urls.index(selected_worker_url)
+            out["selected_worker_url"] = selected_worker_url
+        else:
+            self._attach_selected_backend_id(chunks, out)
+        for key in ("resume_enqueue_ts", "resume_dispatch_ts", "resume_queue_wait_s"):
+            if key in route_meta:
+                out[key] = route_meta[key]
+        self._attach_selected_backend_affinity_info(route_meta, out)
+        self._attach_context_lifecycle_info(route_meta, out)
         return out
 
     def _attach_selected_backend_id(self, chunks: List[Dict[str, Any]], out: Dict[str, Any]) -> None:
@@ -2251,6 +2408,10 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
                             self.src_rank2_dp_rank[src_rank] = dp_rank
                             self.request_id_2_src_rank[request_id] = src_rank
                             self.running_requests[dp_rank].add(request_id)
+                            dispatch_ts = time.time()
+                            route_meta["resume_enqueue_ts"] = pending.enqueue_ts
+                            route_meta["resume_dispatch_ts"] = dispatch_ts
+                            route_meta["resume_queue_wait_s"] = max(0.0, dispatch_ts - pending.enqueue_ts)
                             if request_type == "resume":
                                 self._record_resume_dispatch(
                                     src_rank=src_rank,
@@ -2288,6 +2449,10 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
                 async with self.routing_lock:
                     self.request_id_2_src_rank[request_id] = src_rank
                     self.running_requests[dp_rank].add(request_id)
+                dispatch_ts = time.time()
+                route_meta["resume_enqueue_ts"] = enqueue_ts
+                route_meta["resume_dispatch_ts"] = dispatch_ts
+                route_meta["resume_queue_wait_s"] = max(0.0, dispatch_ts - enqueue_ts)
                 if request_type == "resume":
                     self._record_resume_dispatch(
                         src_rank=src_rank,
