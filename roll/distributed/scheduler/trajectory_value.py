@@ -141,6 +141,76 @@ def belief_to_p_hit(level: BeliefLevel, belief: BeliefConfig) -> float:
     return belief.p_cold
 
 
+def apply_p_hit_bias(
+    p_hit: float,
+    p_hit_bias: float,
+    *,
+    belief: BeliefConfig,
+) -> float:
+    return max(belief.p_cold, min(belief.p_hot, float(p_hit) + float(p_hit_bias)))
+
+
+@dataclass
+class LeaseTtlWeights:
+    alpha: float = 1.0
+    beta: float = 1.0
+    gamma: float = 0.5
+    delta: float = 1.0
+    t_tool_min: float = 2.0
+    t_tool_max: float = 120.0
+    v_traj_scale: float = 5.0
+
+    @classmethod
+    def from_config(cls, cfg: Optional[Dict]) -> "LeaseTtlWeights":
+        cfg = cfg or {}
+        return cls(
+            alpha=float(cfg.get("alpha", cls.alpha)),
+            beta=float(cfg.get("beta", cls.beta)),
+            gamma=float(cfg.get("gamma", cls.gamma)),
+            delta=float(cfg.get("delta", cls.delta)),
+            t_tool_min=float(cfg.get("t_tool_min", cls.t_tool_min)),
+            t_tool_max=float(cfg.get("t_tool_max", cls.t_tool_max)),
+            v_traj_scale=float(cfg.get("v_traj_scale", cls.v_traj_scale)),
+        )
+
+
+def compute_lease_score(v_traj: float, *, weights: LeaseTtlWeights) -> float:
+    scale = max(1e-6, weights.v_traj_scale)
+    return max(0.0, min(1.0, float(v_traj) / scale))
+
+
+def compute_lease_ttl(
+    route_meta: Dict[str, Any],
+    *,
+    p_hit: float,
+    v_traj: float,
+    t_tool_s: float,
+    belief_level: BeliefLevel,
+    weights: LeaseTtlWeights,
+) -> tuple[float, float]:
+    """Return (ttl_s, lease_score) from trajectory value and belief."""
+    h = _float_meta(route_meta, "history_len_tokens")
+    remaining_ratio = _float_meta(route_meta, "remaining_steps_ratio", 1.0)
+    if "remaining_steps" in route_meta and "max_steps" in route_meta:
+        max_steps = max(1.0, _float_meta(route_meta, "max_steps", 1.0))
+        remaining_ratio = _float_meta(route_meta, "remaining_steps") / max_steps
+    n_h = _norm_log(h, 32768.0)
+    n_r = max(0.0, min(1.0, remaining_ratio))
+    lease_score = compute_lease_score(v_traj, weights=weights)
+    penalty = _indicator(route_meta, "trajectory_invalid") + _indicator(route_meta, "trajectory_loop")
+    ttl = (
+        float(t_tool_s)
+        + weights.alpha * lease_score * n_h
+        + weights.beta * float(p_hit) * float(t_tool_s)
+        + weights.gamma * (1.0 - n_r) * float(t_tool_s)
+        - weights.delta * penalty * float(t_tool_s)
+    )
+    if belief_level == BeliefLevel.COLD or _indicator(route_meta, "trajectory_terminated") >= 0.5:
+        ttl = min(ttl, weights.t_tool_min)
+    ttl = max(weights.t_tool_min, min(weights.t_tool_max, ttl))
+    return ttl, lease_score
+
+
 def p_hit_for_worker(
     dp_rank: int,
     route_meta: Dict[str, Any],
@@ -213,15 +283,19 @@ def compute_resume_priority(
     value_weights: TrajectoryValueWeights,
     penalty_weights: LearningPenaltyWeights,
     last_worker_overloaded: bool = False,
+    p_hit_bias: float = 0.0,
+    feedback_hot_downgrade_bias: float = -0.15,
 ) -> tuple[float, BeliefLevel, float]:
-    """Ordering score for resume requests. Returns (priority, belief_level, p_hit)."""
+    """Ordering score for resume requests. Returns (priority, belief_level, p_hit_effective)."""
     level = classify_belief(
         route_meta,
         belief=belief,
         force_migrate_age_s=force_migrate_age_s,
         last_worker_overloaded=last_worker_overloaded,
     )
-    p_hit = belief_to_p_hit(level, belief)
+    if level == BeliefLevel.HOT and p_hit_bias <= feedback_hot_downgrade_bias:
+        level = BeliefLevel.WARM
+    p_hit = apply_p_hit_bias(belief_to_p_hit(level, belief), p_hit_bias, belief=belief)
     priority = compute_trajectory_value(
         route_meta,
         p_hit=p_hit,

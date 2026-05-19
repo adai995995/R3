@@ -27,6 +27,7 @@ from roll.utils.functionals import pad_to_length, aggregate_metrics
 from roll.utils.logging import get_logger
 from roll.utils.str_utils import contains_renderable_field
 from roll.pipeline.agentic.trajectory_signals import compute_trajectory_signals
+from roll.distributed.scheduler.resume_state import get_trajectory_scheduling_state
 
 
 class TrajEnvManager(BaseEnvManager):
@@ -155,6 +156,8 @@ class TrajEnvManager(BaseEnvManager):
         ray.get(self.output_queue.put.remote(self.env_config['group_id'], self.episode_id, start_step, None, self.env_config['env_id']))
 
     def reset(self) -> RolloutCache:
+        if self.trajectory_id:
+            get_trajectory_scheduling_state().clear(self.trajectory_id)
         self.rollout_cache = RolloutCache(env_id=self.env_config['env_id'],
                                           group_id=self.env_config['group_id'],
                                           tag=self.env_config['tag'])
@@ -286,6 +289,10 @@ class TrajEnvManager(BaseEnvManager):
             })
             self._pause_ts = tool_return_ts
             self._next_request_type = "resume"
+            if self.trajectory_id:
+                get_trajectory_scheduling_state().update_tool_wait(
+                    self.trajectory_id, external_wait_s
+                )
         else:
             self._pause_ts = None
             self._next_request_type = "normal"

@@ -22,13 +22,21 @@ from roll.distributed.scheduler.resume_priority import (
     compute_request_priority,
     compute_resume_score,
 )
+from roll.distributed.scheduler.resume_state import (
+    BeliefFeedbackConfig,
+    get_trajectory_scheduling_state,
+    reset_trajectory_scheduling_state,
+)
 from roll.distributed.scheduler.trajectory_value import (
     BeliefConfig,
     BeliefLevel,
     LearningPenaltyWeights,
+    LeaseTtlWeights,
     TrajectoryValueWeights,
     classify_belief,
+    compute_lease_ttl,
     compute_resume_priority,
+    compute_trajectory_value,
     compute_worker_route_score,
     should_send_preferred_header,
 )
@@ -1147,6 +1155,20 @@ class EnvAffinityRouter(Router):
             router_config.get("learning_penalty_weights", {})
         )
         self.belief_config = BeliefConfig.from_config(router_config.get("belief_config", {}))
+        self.enable_belief_feedback = bool(router_config.get("enable_belief_feedback", False))
+        self.enable_value_driven_lease = bool(router_config.get("enable_value_driven_lease", False))
+        self.belief_feedback_config = BeliefFeedbackConfig.from_config(
+            router_config.get("belief_feedback_config", {})
+        )
+        self.lease_ttl_weights = LeaseTtlWeights.from_config(router_config.get("lease_ttl_weights", {}))
+        self.default_t_tool_s = float(router_config.get("default_t_tool_s", 5.0))
+        self.tool_wait_ema_alpha = float(router_config.get("tool_wait_ema_alpha", 0.2))
+        if self.enable_belief_feedback or self.enable_value_driven_lease:
+            reset_trajectory_scheduling_state(
+                default_t_tool_s=self.default_t_tool_s,
+                tool_ema_alpha=self.tool_wait_ema_alpha,
+            )
+        self.scheduling_state = get_trajectory_scheduling_state()
         self.force_migrate_age_s = float(router_config.get("force_migrate_age_s", 30.0))
         self.fairness_enable = bool(router_config.get("fairness_enable", False))
         self.fairness_boost_max = float(router_config.get("fairness_boost_max", 1.0))
@@ -1156,6 +1178,8 @@ class EnvAffinityRouter(Router):
             self.enable_resume_aware_routing = False
             self.enable_request_priority_queue = False
             self.enable_adaptive_quota = False
+            self.enable_belief_feedback = False
+            self.enable_value_driven_lease = False
             self.normal_max_queue_wait_s = 0.0
             self.resume_max_queue_wait_s = 0.0
         # Pending requests split by request_type for soft-quota dispatch.
@@ -1188,6 +1212,8 @@ class EnvAffinityRouter(Router):
             f"trajectory_value_weights={self.trajectory_value_weights}, "
             f"learning_penalty_weights={self.learning_penalty_weights}, "
             f"belief_config={self.belief_config}, "
+            f"enable_belief_feedback={self.enable_belief_feedback}, "
+            f"enable_value_driven_lease={self.enable_value_driven_lease}, "
             f"force_migrate_age_s={self.force_migrate_age_s}, "
             f"max_running_requests_per_worker={self.max_running_requests_per_worker}, "
             f"resume_normal_quota={self.resume_normal_quota}, "
@@ -1418,10 +1444,94 @@ class EnvAffinityRouter(Router):
             except (TypeError, ValueError):
                 pass
 
+    def _trajectory_id_from_route_meta(self, route_meta: Dict[str, Any]) -> Optional[str]:
+        tid = route_meta.get("trajectory_id")
+        return tid if isinstance(tid, str) and tid else None
+
+    def _p_hit_bias_for_route_meta(self, route_meta: Dict[str, Any]) -> float:
+        if not self.enable_belief_feedback:
+            return 0.0
+        return self.scheduling_state.get_p_hit_bias(self._trajectory_id_from_route_meta(route_meta))
+
+    def _resolve_ttl_s(self, route_meta: Dict[str, Any], level: BeliefLevel, p_hit: float, v_traj: float) -> float:
+        if self.enable_value_driven_lease:
+            t_tool = self.scheduling_state.get_t_tool_s(self._trajectory_id_from_route_meta(route_meta))
+            ttl, lease_score = compute_lease_ttl(
+                route_meta,
+                p_hit=p_hit,
+                v_traj=v_traj,
+                t_tool_s=t_tool,
+                belief_level=level,
+                weights=self.lease_ttl_weights,
+            )
+            route_meta["resume_lease_score"] = lease_score
+            route_meta["resume_lease_ttl_s"] = ttl
+            return ttl
+        return float(self.context_ttl_s) if hasattr(self, "context_ttl_s") else 300.0
+
+    def _attach_lease_headers(self, headers: Dict[str, str], route_meta: Dict[str, Any]) -> None:
+        if not self.enable_value_driven_lease:
+            return
+        tid = self._trajectory_id_from_route_meta(route_meta)
+        if tid:
+            headers["X-ROLL-Trajectory-Id"] = tid
+        ttl = route_meta.get("resume_lease_ttl_s")
+        if isinstance(ttl, (int, float)):
+            headers["X-ROLL-Resume-Lease-Ttl-S"] = str(float(ttl))
+        score = route_meta.get("resume_lease_score")
+        if isinstance(score, (int, float)):
+            headers["X-ROLL-Resume-Lease-Score"] = str(float(score))
+        level = route_meta.get("belief_level")
+        if isinstance(level, str) and level:
+            headers["X-ROLL-Belief-Level"] = level
+        pending_ttl, pending_score, _ = self.scheduling_state.pop_pending_tool_lease(tid)
+        if pending_ttl is not None:
+            headers["X-ROLL-Resume-Lease-Ttl-S"] = str(float(pending_ttl))
+            headers["X-ROLL-Lease-Phase"] = "tool_suspend"
+        if pending_score is not None:
+            headers["X-ROLL-Resume-Lease-Score"] = str(float(pending_score))
+
+    def _observe_resume_outcome(self, route_meta: Dict[str, Any], out: Dict[str, Any]) -> None:
+        if route_meta.get("request_type") != "resume":
+            return
+        tid = self._trajectory_id_from_route_meta(route_meta)
+        if not tid:
+            return
+        last_backend_id = route_meta.get("last_backend_id")
+        selected_backend_id = out.get("selected_backend_id")
+        affinity_hit = (
+            isinstance(last_backend_id, int)
+            and isinstance(selected_backend_id, int)
+            and last_backend_id == selected_backend_id
+        )
+        if out.get("context_class_gpu_hit", 0) >= 0.5:
+            context_class = "gpu_hit"
+        elif out.get("context_class_cpu_reload", 0) >= 0.5:
+            context_class = "cpu_reload"
+        elif out.get("context_class_full_prefill", 0) >= 0.5:
+            context_class = "full_prefill"
+        elif affinity_hit:
+            context_class = "gpu_hit"
+        else:
+            context_class = "full_prefill"
+        history_len = float(route_meta.get("history_len_tokens", 0) or 0)
+        prefill = float(out.get("resume_prefill_tokens", history_len) or history_len)
+        prefill_ratio = prefill / max(1.0, history_len)
+        if self.enable_belief_feedback:
+            self.scheduling_state.observe_resume_outcome(
+                tid,
+                affinity_hit=affinity_hit,
+                context_class=context_class,
+                prefill_ratio=prefill_ratio,
+                feedback=self.belief_feedback_config,
+            )
+            route_meta["p_hit_bias"] = self.scheduling_state.get_p_hit_bias(tid)
+
     def _compute_request_base_priority(self, request_type: str, route_meta: Dict[str, Any]) -> float:
         if request_type != "resume":
             return self.normal_request_base_score
         if self.enable_trajectory_value_scheduling:
+            p_hit_bias = self._p_hit_bias_for_route_meta(route_meta)
             priority, level, p_hit = compute_resume_priority(
                 route_meta,
                 belief=self.belief_config,
@@ -1429,8 +1539,13 @@ class EnvAffinityRouter(Router):
                 value_weights=self.trajectory_value_weights,
                 penalty_weights=self.learning_penalty_weights,
                 last_worker_overloaded=self._last_worker_overloaded(route_meta),
+                p_hit_bias=p_hit_bias,
+                feedback_hot_downgrade_bias=self.belief_feedback_config.hot_downgrade_bias,
             )
             route_meta["belief_p_hit"] = p_hit
+            route_meta["p_hit_bias"] = p_hit_bias
+            route_meta["trajectory_value"] = priority
+            self._resolve_ttl_s(route_meta, level, p_hit, priority)
             self._record_trajectory_value_meta(route_meta, priority, level)
             return priority
         pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
@@ -1855,6 +1970,10 @@ class EnvAffinityRouter(Router):
             response = await self.workers[dp_rank].generate_request.remote(payload)
             if isinstance(response, dict):
                 response["selected_backend_id"] = dp_rank
+                if request_type == "resume" and (
+                    self.enable_belief_feedback or self.enable_value_driven_lease
+                ):
+                    self._observe_resume_outcome(route_meta, response)
             return response
         finally:
             if self.enable_request_priority_queue:
@@ -2412,6 +2531,15 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
         if not isinstance(selected_worker_url, str):
             selected_worker_url = self._worker_url_for_backend_id(out.get("selected_backend_id"))
 
+        level_str = route_meta.get("belief_level")
+        try:
+            belief_level = BeliefLevel(level_str) if isinstance(level_str, str) else BeliefLevel.WARM
+        except ValueError:
+            belief_level = BeliefLevel.WARM
+        p_hit = float(route_meta.get("belief_p_hit", 0.45) or 0.45)
+        v_traj = float(route_meta.get("trajectory_value", 0.0) or 0.0)
+        ttl_s = self._resolve_ttl_s(route_meta, belief_level, p_hit, v_traj)
+
         if route_meta.get("request_type") == "resume":
             self._apply_context_wait_policy(rid, route_meta)
             context_class = self.context_lifecycle.classify_resume(rid, selected_worker_url)
@@ -2419,25 +2547,28 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
             out["context_class_gpu_hit"] = 1.0 if context_class == "gpu_hit" else 0.0
             out["context_class_cpu_reload"] = 1.0 if context_class == "cpu_reload" else 0.0
             out["context_class_full_prefill"] = 1.0 if context_class == "full_prefill" else 0.0
+            out["resume_lease_ttl_s"] = ttl_s
+            out["resume_lease_score"] = route_meta.get("resume_lease_score", 0.0)
             if context_class == "cpu_reload":
                 self.context_lifecycle.reload_context(rid, selected_worker_url, latency_s=0.0)
-                self.context_lifecycle.retain_context(rid, ttl_s=self.context_ttl_s)
+                self.context_lifecycle.retain_context(rid, ttl_s=ttl_s)
             elif context_class == "gpu_hit":
-                self.context_lifecycle.retain_context(rid, ttl_s=self.context_ttl_s)
+                self.context_lifecycle.retain_context(rid, ttl_s=ttl_s)
             elif isinstance(selected_worker_url, str):
                 estimated_tokens = int(route_meta.get("history_len_tokens", 0) or 0)
                 self.context_lifecycle.pin_context(
                     rid=rid,
                     worker_url=selected_worker_url,
-                    ttl_s=self.context_ttl_s,
+                    ttl_s=ttl_s,
                     estimated_tokens=estimated_tokens,
                 )
+            self._observe_resume_outcome(route_meta, out)
         elif isinstance(selected_worker_url, str):
             estimated_tokens = int(route_meta.get("history_len_tokens", 0) or 0)
             self.context_lifecycle.pin_context(
                 rid=rid,
                 worker_url=selected_worker_url,
-                ttl_s=self.context_ttl_s,
+                ttl_s=ttl_s,
                 estimated_tokens=estimated_tokens,
             )
 
@@ -2467,6 +2598,7 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
             history_len_tokens = route_meta.get("history_len_tokens")
             if isinstance(history_len_tokens, int):
                 headers["X-ROLL-History-Len-Tokens"] = str(history_len_tokens)
+            self._attach_lease_headers(headers, route_meta)
 
         url = f"{self.gateway_url}{self.gateway_generate_path}"
         response = None

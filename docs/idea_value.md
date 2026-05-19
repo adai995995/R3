@@ -186,10 +186,23 @@ route_score(worker) =
   这个方式的好处是：你不需要把所有 KV 状态持续同步给调度器，只在 resume 发生时做低成本查询。坏处是会增加一次调度 RPC，但 tool-return 场景下通常可以接受，而且可以和 tool result post-processing 并行
 
 ---------------
-## 轨迹价值调度（已实现）
+## 轨迹价值调度
 
-见 **[trajectory_value_scheduling.md](./trajectory_value_scheduling.md)**：
+**完整设计（公式、belief、负反馈、CacheTTL 对照、KV Lease 计划）**：
 
-- `V_traj = V_sys + V_learn_neg`（系统净收益 + 负反馈惩罚）
-- Belief HOT/WARM/COLD 驱动 placement / conditional preferred header
-- 配置开关：`enable_trajectory_value_scheduling`
+→ **[trajectory_value_scheduling.md](./trajectory_value_scheduling.md)**
+
+**三层路线总览**：
+
+→ **[idea_hierarchical.md](./idea_hierarchical.md)**
+
+已实现（L1）：
+
+- `V_traj = V_sys + V_learn_neg`
+- Belief `p_hit` + HOT/WARM/COLD → ordering / placement / conditional preferred header
+- `enable_trajectory_value_scheduling`
+
+计划中（L2/L3）：
+
+- 引擎 `lookup_resume` 校准 belief
+- `V_traj` → `lease_score` + `ttl_s` 透传 SGLang（Value-driven TTL，扩展 CacheTTL）

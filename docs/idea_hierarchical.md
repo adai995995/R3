@@ -1,68 +1,109 @@
-第一层：不改后端的 resume-aware soft scheduling。这是最小可跑版本。
+# 分层设计：Belief 调度 → 引擎可观测 → Value-driven KV Lease
 
-包括 Resume Request、HOT/WARM/COLD recoverability belief、confidence-aware routing、soft lease、反馈闭环。这一层解决“调度器看不到 KV 状态”的问题，但它本身偏轻。
+本文档是 **总览**；公式、字段、配置与实现状态以 **[trajectory_value_scheduling.md](./trajectory_value_scheduling.md)** 为准。
 
-第二层：后端协作的 resume observability。这是系统贡献的关键。
+---
 
-你不一定要做完整 page-level KV eviction，但至少要给推理后端加一个轻量 API，让 scheduler 能知道“这个 resume request 去某个 worker 大概能命中多少”。否则你的 restore_cost 永远是猜测。
+## 三层分工
 
-最小 API 可以不是 pin/evict，而是 query：
-lookup_resume(prefix_hash, trajectory_id) 
+| 层 | 名称 | 做什么 | 依赖后端 | 状态 |
+|---|---|---|---|---|
+| **L1** | ROLL 内 soft scheduling | Resume 语义、`V_traj`、`p_hit` belief、ordering/placement、控制面 lease 骨架 | 否 | **已实现**（lease 未接 `V_traj`） |
+| **L2** | Resume observability | `lookup_resume` / `probe_and_dispatch`，用实测 hit 校准 belief | 轻量 API | 未实现 |
+| **L3** | Lease enforcement | `set_resume_lease` + `eviction_score = LRU - λ·lease_score` | 引擎协作 | 未实现 |
+
+```text
+tool-return
+    → Resume Request（非 Fresh）
+    → classify_belief → HOT / WARM / COLD → p_hit
+    → V_traj = V_sys + V_learn_neg
+    → ordering / placement / (计划) TTL·lease_score → SGLang
+```
+
+---
+
+## 第一层（L1）：Belief-based Resume Scheduling
+
+**问题**：调度器看不见 KV，不能把「刚 tool-return」等同于「高价值」。
+
+**做法**：
+
+1. **Resume Request**：仅在 tool-return 边界标注 `request_type=resume`（G1）。
+2. **Belief**：`p_hit` 是「低成本恢复的主观概率」，不是后端实测值（见主文档 §4）。
+3. **路由三分支**：
+   - **HOT**：直送 `last_worker`；Form B 发 preferred header。
+   - **WARM**：比较 `route_score(last)` vs 其它 worker。
+   - **COLD**：放弃强亲和，load-aware。
+4. **轨迹价值**：`V_sys`（恢复收益−重算−负载）+ `V_learn_neg`（invalid/loop/stall/term 只减不加）。
+5. **Soft lease（控制面）**：`ContextLifecycleManager` 记录 HOT/WARM/EVICTED；**待**与 `V_traj` 算出的 `ttl_s` 对齐。
+
+**反馈（计划加强）**：affinity hit、full_prefill → 更新 per-trajectory belief；当前以 aggregate 指标为主。
+
+---
+
+## 第二层（L2）：后端可观测
+
+**问题**：`restore_cost` 若永远靠猜，`p_hit` 与 TTL 会漂。
+
+**最小 API**（二选一）：
+
+```text
+lookup_resume(prefix_hash, trajectory_id)
   -> hit_tokens, resident_blocks, estimated_prefill_tokens, cache_confidence
 
-  或者更保守：
-  probe_and_dispatch(request, candidate_worker)
-  -> 如果命中，直接 resume；如果未命中，直接 prefill，不额外往返
+probe_and_dispatch(request, candidate_worker)
+  -> hit 则 resume，miss 则 prefill（可与 tool 后处理并行）
+```
 
+**用途**：校准 `p_hit`、验证 belief 分桶、为 §7 TTL 提供 `cache_confidence`。
 
-第三层：后端协作的 soft lease enforcement。这是硬度最高、也最能和 Heddle 拉开差距的部分。
+---
 
-不要一开始做 page-level value-density eviction，可以先做 trajectory/segment-level lease：
-set_resume_lease(
-  trajectory_id,
-  prefix_hash,
-  ttl,
-  lease_score,
-  demotion_policy
-)
-worker 的 KV manager 不需要完全交出控制权，只需要在 eviction 时把 lease_score 作为 tie-breaker 或 priority modifier。
-例如：
+## 第三层（L3）：Value-driven KV Lease（对齐 CacheTTL，参数更直接）
+
+**问题**：end-of-turn eviction 在 agent tool wait 中浪费 KV；固定 TTL 无法区分高/低价值轨迹。
+
+**参考**：[CacheTTL (2511.02230)](https://arxiv.org/abs/2511.02230) — tool 期间 pin KV + TTL，权衡 reload、queueing、tool 耗时分布。
+
+**我们的扩展**：ROLL 已具备 **`V_traj`、`p_hit`、负反馈、`remaining_steps`**，可直接驱动：
+
+```text
+lease_score = clip(V_traj, 0, 1)
+ttl_s = f(t_tool, lease_score, p_hit, ñ_h, ñ_r, I_invalid, I_loop)
+```
+
+透传（计划）：
+
+```text
+set_resume_lease(trajectory_id, prefix_hash?, ttl, lease_score, demotion_policy)
+```
+
+引擎 eviction：
+
+```text
 eviction_score = LRU_score - λ × lease_score
+```
 
---------------------------------------------
-第一层实现 ：
-tool-return 请求来了
-↓
-它是 Resume Request，不是 Fresh Request
-↓
-我判断它的 KV 可能处于 HOT / WARM / COLD 哪种状态
-↓
-根据状态选择路由策略
-这三个状态可以这样理解：
-HOT:
-  我很有把握它上一轮的 KV 还在 last_worker 上。
-  策略：直接送回 last_worker，不做 probe。
+**原则**：
 
-WARM:
-  KV 可能还在，但不确定。
-  策略：可以 probe last_worker，或者比较 last_worker 和低负载 worker。
+- 高 `V_traj` + HOT → 更长 TTL，更高 anti-eviction 权重。
+- invalid / loop / COLD → **缩短或取消** lease，避免死循环占显存（CacheTTL 长尾 tool 同理）。
+- **不**用 reward 正反馈决定 lease；与 GRPO 解耦。
 
-COLD:
-  KV 大概率没了，或者恢复收益很低。
-  策略：别强行亲和，按普通 load-aware routing 走。
+协议草案见 [trajectory_value_scheduling.md §7](./trajectory_value_scheduling.md#7-价值驱动的-kv-ttl--lease)。
 
-重点是：HOT/WARM/COLD 不是后端告诉你的精确事实，而是你维护的一个 belief，也就是概率判断。
+---
 
-比如：
-pause 时间很短 → 更可能 HOT
-history 很长 → 如果命中，收益很大
-last_worker 内存压力高 → 更可能已经被 evict
-上次类似请求命中过 → 提高 HOT 概率
-上次 sticky 回去但还是重算了 → 降低 HOT 概率
+## 与「轨迹价值」文档的关系
 
-系统不是在说：
-我知道 KV page 一定在，所以我调度它。
-而是在说：
-我根据 rollout 层可见的信息，估计这个 resume request 低成本恢复的概率，并按置信度选择路由策略。
-------------
-这就是 belief-based resume scheduling。
+- 概念与模块拆分：[idea_value.md](./idea_value.md)
+- **可落地公式、字段、CacheTTL 对照、实现状态**：[trajectory_value_scheduling.md](./trajectory_value_scheduling.md)
+
+---
+
+## 实施顺序建议
+
+1. **P0（完成）**：L1 — `enable_trajectory_value_scheduling` + 单测 + 消融 yaml。
+2. **P1**：`compute_lease_ttl(V_traj)` + HTTP header 下发；gateway 分桶消费 TTL。
+3. **P2**：L2 `lookup_resume`；belief 反馈闭环。
+4. **P3**：L3 引擎 `set_resume_lease` + eviction modifier。
