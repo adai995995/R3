@@ -22,6 +22,16 @@ from roll.distributed.scheduler.resume_priority import (
     compute_request_priority,
     compute_resume_score,
 )
+from roll.distributed.scheduler.trajectory_value import (
+    BeliefConfig,
+    BeliefLevel,
+    LearningPenaltyWeights,
+    TrajectoryValueWeights,
+    classify_belief,
+    compute_resume_priority,
+    compute_worker_route_score,
+    should_send_preferred_header,
+)
 from roll.distributed.scheduler.soft_quota_utils import (
     ResumeFallbackContext,
     bucketize_queue_wait_s,
@@ -691,6 +701,13 @@ class RouterClient:
             "last_backend_id",
             "tool_type",
             "fairness_bucket",
+            "remaining_steps",
+            "max_steps",
+            "remaining_steps_ratio",
+            "trajectory_invalid",
+            "trajectory_loop",
+            "trajectory_stall",
+            "trajectory_terminated",
         ):
             if key in req.meta_info:
                 route_meta[key] = req.meta_info[key]
@@ -1120,6 +1137,16 @@ class EnvAffinityRouter(Router):
             router_config.get("request_score_weights", {})
         )
         self.resume_score_weights = ResumeScoreWeights.from_config(router_config.get("resume_score_weights", {}))
+        self.enable_trajectory_value_scheduling = bool(
+            router_config.get("enable_trajectory_value_scheduling", False)
+        )
+        self.trajectory_value_weights = TrajectoryValueWeights.from_config(
+            router_config.get("trajectory_value_weights", {})
+        )
+        self.learning_penalty_weights = LearningPenaltyWeights.from_config(
+            router_config.get("learning_penalty_weights", {})
+        )
+        self.belief_config = BeliefConfig.from_config(router_config.get("belief_config", {}))
         self.force_migrate_age_s = float(router_config.get("force_migrate_age_s", 30.0))
         self.fairness_enable = bool(router_config.get("fairness_enable", False))
         self.fairness_boost_max = float(router_config.get("fairness_boost_max", 1.0))
@@ -1157,6 +1184,10 @@ class EnvAffinityRouter(Router):
             f"queue_enabled={self.enable_request_priority_queue}, "
             f"request_score_weights={self.request_score_weights}, "
             f"worker_score_weights={self.resume_score_weights}, "
+            f"enable_trajectory_value_scheduling={self.enable_trajectory_value_scheduling}, "
+            f"trajectory_value_weights={self.trajectory_value_weights}, "
+            f"learning_penalty_weights={self.learning_penalty_weights}, "
+            f"belief_config={self.belief_config}, "
             f"force_migrate_age_s={self.force_migrate_age_s}, "
             f"max_running_requests_per_worker={self.max_running_requests_per_worker}, "
             f"resume_normal_quota={self.resume_normal_quota}, "
@@ -1254,6 +1285,9 @@ class EnvAffinityRouter(Router):
         self.queue_wait_bucket_served: Dict[str, int] = defaultdict(int)
         self.score_bucket_served: Dict[str, int] = defaultdict(int)
         self.resume_fallback_reason_count: Dict[str, int] = defaultdict(int)
+        self.trajectory_value_sum = 0.0
+        self.belief_state_counts: Dict[str, int] = defaultdict(int)
+        self.trajectory_penalty_counts: Dict[str, int] = defaultdict(int)
 
     @staticmethod
     def _percentile(values: List[float], q: float) -> float:
@@ -1345,9 +1379,60 @@ class EnvAffinityRouter(Router):
         deficit_ratio = max(0.0, (avg_served - served) / avg_served)
         return min(deficit_ratio * self.fairness_boost_max, self.fairness_boost_max)
 
+    def _last_worker_overloaded(self, route_meta: Dict[str, Any]) -> bool:
+        last_backend_id = route_meta.get("last_backend_id")
+        if not isinstance(last_backend_id, int):
+            return False
+        if last_backend_id not in self.active_dp_ranks:
+            return True
+        st = self.backend_state.get(last_backend_id)
+        if st is not None:
+            if not st.present:
+                return True
+            if st.ready is False:
+                return True
+            if (
+                self.overloaded_inflight_threshold > 0
+                and st.inflight is not None
+                and st.inflight >= self.overloaded_inflight_threshold
+            ):
+                return True
+            if (
+                self.overloaded_queue_depth_threshold > 0
+                and st.queue_depth is not None
+                and st.queue_depth >= self.overloaded_queue_depth_threshold
+            ):
+                return True
+        if not self._has_worker_capacity(last_backend_id):
+            return True
+        return False
+
+    def _record_trajectory_value_meta(self, route_meta: Dict[str, Any], priority: float, level: BeliefLevel) -> None:
+        route_meta["belief_level"] = level.value
+        self.belief_state_counts[level.value] += 1
+        self.trajectory_value_sum += priority
+        for key in ("trajectory_invalid", "trajectory_loop", "trajectory_stall", "trajectory_terminated"):
+            try:
+                if float(route_meta.get(key, 0.0) or 0.0) >= 0.5:
+                    self.trajectory_penalty_counts[key] += 1
+            except (TypeError, ValueError):
+                pass
+
     def _compute_request_base_priority(self, request_type: str, route_meta: Dict[str, Any]) -> float:
         if request_type != "resume":
             return self.normal_request_base_score
+        if self.enable_trajectory_value_scheduling:
+            priority, level, p_hit = compute_resume_priority(
+                route_meta,
+                belief=self.belief_config,
+                force_migrate_age_s=self.force_migrate_age_s,
+                value_weights=self.trajectory_value_weights,
+                penalty_weights=self.learning_penalty_weights,
+                last_worker_overloaded=self._last_worker_overloaded(route_meta),
+            )
+            route_meta["belief_p_hit"] = p_hit
+            self._record_trajectory_value_meta(route_meta, priority, level)
+            return priority
         pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
         history_len = float(route_meta.get("history_len_tokens", 0.0) or 0.0)
         hit_prob = 1.0 if route_meta.get("last_backend_id") is not None else 0.0
@@ -1509,11 +1594,55 @@ class EnvAffinityRouter(Router):
             return True
         return len(self.running_requests[dp_rank]) < self.max_running_requests_per_worker
 
+    def _belief_level_from_route_meta(self, route_meta: Dict[str, Any]) -> BeliefLevel:
+        raw = route_meta.get("belief_level")
+        if isinstance(raw, str):
+            try:
+                return BeliefLevel(raw)
+            except ValueError:
+                pass
+        return classify_belief(
+            route_meta,
+            belief=self.belief_config,
+            force_migrate_age_s=self.force_migrate_age_s,
+            last_worker_overloaded=self._last_worker_overloaded(route_meta),
+        )
+
+    def _select_worker_trajectory_value(self, pending: PendingTrajectoryRequest) -> Optional[int]:
+        route_meta = pending.route_meta
+        candidate_ranks = [r for r in self.active_dp_ranks if self._has_worker_capacity(r)]
+        if not candidate_ranks:
+            return None
+        level = self._belief_level_from_route_meta(route_meta)
+        last_backend_id = route_meta.get("last_backend_id")
+        if (
+            level == BeliefLevel.HOT
+            and isinstance(last_backend_id, int)
+            and last_backend_id in candidate_ranks
+        ):
+            return last_backend_id
+        if level == BeliefLevel.COLD:
+            return min(candidate_ranks, key=lambda r: len(self.running_requests[r]))
+        return max(
+            candidate_ranks,
+            key=lambda r: compute_worker_route_score(
+                r,
+                route_meta,
+                belief_level=level,
+                belief=self.belief_config,
+                worker_load=float(len(self.running_requests[r])),
+                value_weights=self.trajectory_value_weights,
+                penalty_weights=self.learning_penalty_weights,
+            ),
+        )
+
     def _select_worker_for_request(self, pending: PendingTrajectoryRequest) -> Optional[int]:
         src_rank = pending.uid
         request_type = pending.request_type
         route_meta = pending.route_meta
         if self.enable_resume_aware_routing and request_type == "resume":
+            if self.enable_trajectory_value_scheduling:
+                return self._select_worker_trajectory_value(pending)
             candidate_ranks = [r for r in self.active_dp_ranks if self._has_worker_capacity(r)]
             if not candidate_ranks:
                 return None
@@ -1812,6 +1941,14 @@ class EnvAffinityRouter(Router):
             metrics[f"scheduler/router/score_bucket_served/{bucket}"] = float(served)
         for reason, cnt in self.resume_fallback_reason_count.items():
             metrics[f"scheduler/router/resume_fallback_reason/{reason}"] = float(cnt)
+        if self.trajectory_value_sum and self.resume_total_requests:
+            metrics["scheduler/router/trajectory_value_mean"] = (
+                self.trajectory_value_sum / float(self.resume_total_requests)
+            )
+        for state, cnt in self.belief_state_counts.items():
+            metrics[f"scheduler/router/belief_state/{state}_count"] = float(cnt)
+        for key, cnt in self.trajectory_penalty_counts.items():
+            metrics[f"scheduler/router/penalty/{key}_count"] = float(cnt)
 
         if self.normal_total_requests:
             total = float(self.normal_total_requests)
@@ -2313,8 +2450,16 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
         if isinstance(request_type, str) and request_type:
             headers["X-ROLL-Request-Type"] = request_type
         if request_type == "resume":
+            emit_preferred = True
+            if self.enable_trajectory_value_scheduling:
+                level = self._belief_level_from_route_meta(route_meta)
+                emit_preferred = should_send_preferred_header(level, route_meta)
             last_backend_id = route_meta.get("last_backend_id")
-            if isinstance(last_backend_id, int) and 0 <= last_backend_id < len(self.worker_urls):
+            if (
+                emit_preferred
+                and isinstance(last_backend_id, int)
+                and 0 <= last_backend_id < len(self.worker_urls)
+            ):
                 headers["X-ROLL-Preferred-Worker-Url"] = self.worker_urls[last_backend_id]
             pause_age_s = route_meta.get("pause_age_s")
             if isinstance(pause_age_s, (int, float)):

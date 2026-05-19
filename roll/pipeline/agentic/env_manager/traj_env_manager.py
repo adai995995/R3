@@ -26,6 +26,7 @@ from roll.utils.constants import GenerateStopReason
 from roll.utils.functionals import pad_to_length, aggregate_metrics
 from roll.utils.logging import get_logger
 from roll.utils.str_utils import contains_renderable_field
+from roll.pipeline.agentic.trajectory_signals import compute_trajectory_signals
 
 
 class TrajEnvManager(BaseEnvManager):
@@ -326,6 +327,13 @@ class TrajEnvManager(BaseEnvManager):
                     self.rollout_cache.step,
                 )
 
+        traj_signals = compute_trajectory_signals(
+            history=self.rollout_cache.history,
+            step=self.rollout_cache.step,
+            max_steps=self.env_config.max_steps,
+            terminated=bool(self.rollout_cache.terminated),
+            truncated=bool(self.rollout_cache.truncated),
+        )
         lm_input.meta_info.update({
             "trajectory_id": self.trajectory_id,
             "request_type": request_type,
@@ -338,6 +346,8 @@ class TrajEnvManager(BaseEnvManager):
             "resume_expected_tool_return": expected_tool_return,
             "resume_request_count": self._resume_request_count,
             "resume_mismatch_count": self._resume_mismatch_count,
+            # Trajectory value scheduling (see docs/trajectory_value_scheduling.md).
+            **traj_signals,
         })
         self._next_request_type = "normal"
 
