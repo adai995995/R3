@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from threading import Lock
-from typing import Dict, Optional
+from typing import Dict, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from roll.distributed.scheduler.kv_lease_client import LookupResumeResult
+    from roll.distributed.scheduler.trajectory_value import (
+        BeliefConfig,
+        LearningPenaltyWeights,
+        LeaseTtlWeights,
+        TrajectoryValueWeights,
+    )
 
 
 @dataclass
@@ -35,6 +44,30 @@ class BeliefFeedbackConfig:
             bias_max=float(cfg.get("bias_max", cls.bias_max)),
             hot_downgrade_bias=float(cfg.get("hot_downgrade_bias", cls.hot_downgrade_bias)),
         )
+
+
+@dataclass
+class SchedulingWeightSnapshot:
+    """Shared weights for Env suspend-lease and Router (set on router initialize)."""
+
+    value_weights: "TrajectoryValueWeights"
+    penalty_weights: "LearningPenaltyWeights"
+    belief: "BeliefConfig"
+    lease_weights: "LeaseTtlWeights"
+    force_migrate_age_s: float = 30.0
+    feedback_hot_downgrade_bias: float = -0.15
+
+
+_WEIGHT_SNAPSHOT: Optional[SchedulingWeightSnapshot] = None
+
+
+def set_scheduling_weight_snapshot(snapshot: SchedulingWeightSnapshot) -> None:
+    global _WEIGHT_SNAPSHOT
+    _WEIGHT_SNAPSHOT = snapshot
+
+
+def get_scheduling_weight_snapshot() -> Optional[SchedulingWeightSnapshot]:
+    return _WEIGHT_SNAPSHOT
 
 
 class TrajectorySchedulingState:
@@ -99,6 +132,38 @@ class TrajectorySchedulingState:
                     rec.p_hit_bias - feedback.alpha_miss,
                 )
             elif not affinity_hit and context_class in ("cpu_reload", "full_prefill"):
+                rec.p_hit_bias = max(
+                    feedback.bias_min,
+                    rec.p_hit_bias - feedback.alpha_miss * 0.5,
+                )
+
+    def observe_lookup_resume(
+        self,
+        trajectory_id: str,
+        lookup: "LookupResumeResult",
+        *,
+        feedback: BeliefFeedbackConfig,
+        history_len_tokens: float = 0.0,
+    ) -> None:
+        """L2: adjust p_hit_bias from engine lookup_resume before dispatch."""
+        if not trajectory_id or not lookup.found:
+            return
+        with self._lock:
+            rec = self._records.setdefault(trajectory_id, TrajectorySchedulingRecord())
+            conf = max(0.0, min(1.0, float(lookup.cache_confidence)))
+            h = max(1.0, float(history_len_tokens))
+            prefill_ratio = float(lookup.estimated_prefill_tokens) / h
+            if conf >= 0.5 and lookup.hit_tokens > 0:
+                rec.p_hit_bias = min(
+                    feedback.bias_max,
+                    rec.p_hit_bias + feedback.alpha_hit * conf * (1.0 - rec.p_hit_bias),
+                )
+            elif prefill_ratio >= 0.9 or lookup.estimated_prefill_tokens >= h * 0.9:
+                rec.p_hit_bias = max(
+                    feedback.bias_min,
+                    rec.p_hit_bias - feedback.alpha_miss,
+                )
+            elif lookup.hit_tokens <= 0 and conf < 0.2:
                 rec.p_hit_bias = max(
                     feedback.bias_min,
                     rec.p_hit_bias - feedback.alpha_miss * 0.5,

@@ -27,7 +27,11 @@ from roll.utils.functionals import pad_to_length, aggregate_metrics
 from roll.utils.logging import get_logger
 from roll.utils.str_utils import contains_renderable_field
 from roll.pipeline.agentic.trajectory_signals import compute_trajectory_signals
-from roll.distributed.scheduler.resume_state import get_trajectory_scheduling_state
+from roll.distributed.scheduler.resume_state import (
+    get_scheduling_weight_snapshot,
+    get_trajectory_scheduling_state,
+)
+from roll.distributed.scheduler.trajectory_value import plan_tool_suspend_lease
 
 
 class TrajEnvManager(BaseEnvManager):
@@ -234,10 +238,56 @@ class TrajEnvManager(BaseEnvManager):
         except (TypeError, ValueError):
             pass
 
+    def _maybe_set_pending_tool_suspend_lease(self) -> None:
+        """Register tool-wait KV lease before external tool blocks in env.step (L1 suspend)."""
+        snapshot = get_scheduling_weight_snapshot()
+        if snapshot is None or not self.trajectory_id or self._last_backend_id is None:
+            return
+        traj_signals = compute_trajectory_signals(
+            history=self.rollout_cache.history,
+            step=self.rollout_cache.step,
+            max_steps=self.env_config.max_steps,
+            terminated=bool(self.rollout_cache.terminated),
+            truncated=bool(self.rollout_cache.truncated),
+        )
+        history_len_tokens = 0
+        for entry in self.rollout_cache.history:
+            if entry.get("prompt_ids") is not None:
+                history_len_tokens += len(entry["prompt_ids"])
+            if entry.get("response_ids") is not None:
+                history_len_tokens += len(entry["response_ids"])
+        route_meta = {
+            "trajectory_id": self.trajectory_id,
+            "last_backend_id": self._last_backend_id,
+            "history_len_tokens": float(history_len_tokens),
+            **traj_signals,
+        }
+        state = get_trajectory_scheduling_state()
+        t_tool = state.get_t_tool_s(self.trajectory_id)
+        bias = state.get_p_hit_bias(self.trajectory_id)
+        ttl, score, _, _ = plan_tool_suspend_lease(
+            route_meta,
+            belief=snapshot.belief,
+            force_migrate_age_s=snapshot.force_migrate_age_s,
+            value_weights=snapshot.value_weights,
+            penalty_weights=snapshot.penalty_weights,
+            lease_weights=snapshot.lease_weights,
+            t_tool_s=t_tool,
+            p_hit_bias=bias,
+            feedback_hot_downgrade_bias=snapshot.feedback_hot_downgrade_bias,
+        )
+        state.set_pending_tool_lease(
+            self.trajectory_id,
+            ttl_s=ttl,
+            lease_score=score,
+            backend_id=self._last_backend_id,
+        )
+
     def step(self, llm_output: DataProto):
         responses = self.tokenizer.batch_decode(llm_output.batch['responses'], skip_special_tokens=False)
 
         tool_call_start_ts = time.time()
+        self._maybe_set_pending_tool_suspend_lease()
         with self.thread_lock, self.env_step_limiter:
             observation, reward, terminated, truncated, info = self.env.step(action=responses[0])
         tool_return_ts = time.time()

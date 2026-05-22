@@ -8,9 +8,9 @@
 
 | 层 | 名称 | 做什么 | 依赖后端 | 状态 |
 |---|---|---|---|---|
-| **L1** | ROLL 内 soft scheduling | Resume 语义、`V_traj`、`p_hit` belief、ordering/placement、控制面 lease 骨架 | 否 | **已实现**（lease 未接 `V_traj`） |
-| **L2** | Resume observability | `lookup_resume` / `probe_and_dispatch`，用实测 hit 校准 belief | 轻量 API | 未实现 |
-| **L3** | Lease enforcement | `set_resume_lease` + `eviction_score = LRU - λ·lease_score` | 引擎协作 | 未实现 |
+| **L1** | ROLL 内 soft scheduling | Resume 语义、`V_traj`、`p_hit` belief、ordering/placement、suspend pending lease | 否 | **已实现** |
+| **L2** | Resume observability | `lookup_resume` / `probe_and_dispatch`，用实测 hit 校准 belief | 轻量 API | ROLL 客户端已实现；**引擎 GET 待联调** |
+| **L3** | Lease enforcement | `set_resume_lease` + `eviction_score = LRU - λ·lease_score` | 引擎协作 | ROLL header/POST 已实现；**引擎 enforce 待联调** |
 
 ```text
 tool-return

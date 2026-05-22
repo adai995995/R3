@@ -1,0 +1,59 @@
+# Form B + 轨迹价值：ROLL ordering 用 V_traj；gateway 仅在 belief=HOT 时发 preferred header
+defaults:
+  - gem_math_hotpotqa_search_ds_sglang
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: agentic_hotpotqa_search_ds_sglang_router_form_b_trajectory_value
+
+logging_dir: ./output/ablation_router_hotpotqa/form_b_trajectory_value/logs
+output_dir: ./output/ablation_router_hotpotqa/form_b_trajectory_value
+
+tracker_kwargs:
+  log_dir: ./output/ablation_router_hotpotqa/form_b_trajectory_value/tb
+
+checkpoint_config:
+  type: file_system
+  output_dir: ./output/ablation_router_hotpotqa/form_b_trajectory_value/checkpoints
+
+actor_infer:
+  strategy_args:
+    strategy_config:
+      grpc_mode: false
+
+router_args:
+  router_name: SglangOrderingRouter
+  router_config:
+    gateway_url: "http://127.0.0.1:30000"
+    gateway_auto_register_workers: true
+    enable_resume_priority: true
+    enable_resume_aware_routing: false
+    enable_request_priority_queue: true
+    enable_trajectory_value_scheduling: true
+    enable_belief_feedback: true
+    enable_value_driven_lease: true
+    enable_lookup_resume: false
+    enable_gateway_kv_lease_push: false
+    enable_refresh_resume_priority_on_dispatch: true
+    gateway_status_url: "http://127.0.0.1:30000"
+    gateway_status_poll_interval_s: 2.0
+    resume_normal_quota: "3:1"
+    normal_max_queue_wait_s: 10.0
+    resume_max_queue_wait_s: 5.0
+    force_migrate_age_s: 30.0
+    trajectory_value_weights:
+      w_p: 1.0
+      w_f: 0.5
+      w_a: 0.3
+      w_c: 0.8
+    learning_penalty_weights:
+      c_inv: 1.5
+      c_loop: 1.0
+      c_stall: 0.5
+    belief_config:
+      hot_pause_age_s: 5.0
+      cold_pause_age_s: 30.0

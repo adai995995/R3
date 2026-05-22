@@ -327,6 +327,41 @@ def compute_worker_route_score(
     )
 
 
+def plan_tool_suspend_lease(
+    route_meta: Dict[str, Any],
+    *,
+    belief: BeliefConfig,
+    force_migrate_age_s: float,
+    value_weights: TrajectoryValueWeights,
+    penalty_weights: LearningPenaltyWeights,
+    lease_weights: LeaseTtlWeights,
+    t_tool_s: float,
+    p_hit_bias: float = 0.0,
+    last_worker_overloaded: bool = False,
+    feedback_hot_downgrade_bias: float = -0.15,
+) -> tuple[float, float, BeliefLevel, float]:
+    """Compute (ttl_s, lease_score, belief_level, v_traj) at tool-suspend boundary."""
+    priority, level, p_hit = compute_resume_priority(
+        route_meta,
+        belief=belief,
+        force_migrate_age_s=force_migrate_age_s,
+        value_weights=value_weights,
+        penalty_weights=penalty_weights,
+        last_worker_overloaded=last_worker_overloaded,
+        p_hit_bias=p_hit_bias,
+        feedback_hot_downgrade_bias=feedback_hot_downgrade_bias,
+    )
+    ttl, lease_score = compute_lease_ttl(
+        route_meta,
+        p_hit=p_hit,
+        v_traj=priority,
+        t_tool_s=t_tool_s,
+        belief_level=level,
+        weights=lease_weights,
+    )
+    return ttl, lease_score, level, priority
+
+
 def should_send_preferred_header(belief_level: BeliefLevel, route_meta: Dict[str, Any]) -> bool:
     """Form B: only emit strong affinity hint when belief is HOT and hint exists."""
     if belief_level != BeliefLevel.HOT:

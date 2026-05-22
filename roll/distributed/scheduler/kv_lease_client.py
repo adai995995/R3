@@ -1,0 +1,146 @@
+"""HTTP client for gateway/SGLang KV lease and resume lookup (L2/L3)."""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+from urllib.parse import quote
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LookupResumeResult:
+    """Engine-side resume/KV observability (L2)."""
+
+    found: bool = False
+    hit_tokens: int = 0
+    resident_blocks: int = 0
+    estimated_prefill_tokens: int = 0
+    cache_confidence: float = 0.0
+    lease_remaining_s: Optional[float] = None
+    worker_url: Optional[str] = None
+
+    @classmethod
+    def from_json(cls, data: Dict[str, Any]) -> "LookupResumeResult":
+        if not isinstance(data, dict):
+            return cls()
+        hit = data.get("hit_tokens") or data.get("matched_prefix_tokens") or 0
+        prefill = data.get("estimated_prefill_tokens") or data.get("prefill_tokens") or 0
+        conf = data.get("cache_confidence") or data.get("confidence")
+        remaining = data.get("lease_remaining_s") or data.get("remaining_s")
+        return cls(
+            found=bool(data.get("found", True)),
+            hit_tokens=int(hit) if hit is not None else 0,
+            resident_blocks=int(data.get("resident_blocks") or 0),
+            estimated_prefill_tokens=int(prefill) if prefill is not None else 0,
+            cache_confidence=float(conf) if conf is not None else 0.0,
+            lease_remaining_s=float(remaining) if remaining is not None else None,
+            worker_url=data.get("worker_url") if isinstance(data.get("worker_url"), str) else None,
+        )
+
+
+def _norm_gateway_url(gateway_url: str) -> str:
+    return str(gateway_url or "").rstrip("/")
+
+
+async def lookup_resume(
+    client: httpx.AsyncClient,
+    gateway_url: str,
+    trajectory_id: str,
+    *,
+    lookup_path_template: str = "/kv/resume/{trajectory_id}",
+    worker_url: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout_s: float = 2.0,
+) -> LookupResumeResult:
+    """GET resume/KV state before dispatch. Returns empty result if API missing."""
+    gw = _norm_gateway_url(gateway_url)
+    if not gw or not trajectory_id:
+        return LookupResumeResult()
+    path = lookup_path_template.format(trajectory_id=quote(trajectory_id, safe=""))
+    url = f"{gw}{path}"
+    params: Dict[str, str] = {}
+    if worker_url:
+        params["worker_url"] = worker_url
+    try:
+        resp = await client.get(url, params=params or None, headers=headers, timeout=timeout_s)
+        if resp.status_code == 404:
+            return LookupResumeResult(found=False)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict) and "data" in data and isinstance(data["data"], dict):
+            data = data["data"]
+        return LookupResumeResult.from_json(data if isinstance(data, dict) else {})
+    except Exception as e:
+        logger.debug("lookup_resume failed for %s: %s", trajectory_id, e)
+        return LookupResumeResult(found=False)
+
+
+async def set_kv_lease(
+    client: httpx.AsyncClient,
+    gateway_url: str,
+    *,
+    trajectory_id: str,
+    ttl_s: float,
+    lease_score: float,
+    worker_url: Optional[str] = None,
+    belief_level: Optional[str] = None,
+    lease_path: str = "/kv/lease",
+    headers: Optional[Dict[str, str]] = None,
+    timeout_s: float = 2.0,
+) -> bool:
+    """POST lease registration (L3). No-op on failure."""
+    gw = _norm_gateway_url(gateway_url)
+    if not gw or not trajectory_id:
+        return False
+    body: Dict[str, Any] = {
+        "trajectory_id": trajectory_id,
+        "ttl_s": float(ttl_s),
+        "lease_score": float(lease_score),
+    }
+    if worker_url:
+        body["worker_url"] = worker_url
+    if belief_level:
+        body["belief_level"] = belief_level
+    try:
+        resp = await client.post(
+            f"{gw}{lease_path}",
+            json=body,
+            headers=headers,
+            timeout=timeout_s,
+        )
+        if resp.status_code in (200, 201, 204):
+            return True
+        if resp.status_code == 404:
+            logger.debug("set_kv_lease endpoint not found: %s", lease_path)
+            return False
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        logger.debug("set_kv_lease failed for %s: %s", trajectory_id, e)
+        return False
+
+
+async def delete_kv_lease(
+    client: httpx.AsyncClient,
+    gateway_url: str,
+    trajectory_id: str,
+    *,
+    lease_path_template: str = "/kv/lease/{trajectory_id}",
+    headers: Optional[Dict[str, str]] = None,
+    timeout_s: float = 2.0,
+) -> bool:
+    gw = _norm_gateway_url(gateway_url)
+    if not gw or not trajectory_id:
+        return False
+    path = lease_path_template.format(trajectory_id=quote(trajectory_id, safe=""))
+    try:
+        resp = await client.delete(f"{gw}{path}", headers=headers, timeout=timeout_s)
+        return resp.status_code in (200, 204, 404)
+    except Exception as e:
+        logger.debug("delete_kv_lease failed for %s: %s", trajectory_id, e)
+        return False
