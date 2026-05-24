@@ -33,7 +33,7 @@ class LookupResumeResult:
         conf = data.get("cache_confidence") or data.get("confidence")
         remaining = data.get("lease_remaining_s") or data.get("remaining_s")
         return cls(
-            found=bool(data.get("found", True)),
+            found=bool(data.get("found", False)),
             hit_tokens=int(hit) if hit is not None else 0,
             resident_blocks=int(data.get("resident_blocks") or 0),
             estimated_prefill_tokens=int(prefill) if prefill is not None else 0,

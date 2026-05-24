@@ -23,8 +23,9 @@
 
 ### Tool suspend → pending lease
 
-- `TrajEnvManager.step()` 在 `env.step()` 前调用 `_maybe_set_pending_tool_suspend_lease()`
-- Router `_attach_lease_headers()` 在 resume 时 `pop_pending_tool_lease`
+- `TrajEnvManager.step()` 仅在 LLM 输出可能触发 tool 时设置 pending lease
+- Env 经 `meta_info` 传递 `scheduling_t_tool_s`、`pending_resume_lease_*`（跨 Ray Actor）
+- Router `_merge_resume_lease_ttl_score()`：`ttl = max(resume, pending)`，避免 suspend TTL 覆盖 resume
 
 ### L2/L3 网关客户端（ROLL）
 

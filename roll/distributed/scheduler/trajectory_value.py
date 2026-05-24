@@ -362,6 +362,42 @@ def plan_tool_suspend_lease(
     return ttl, lease_score, level, priority
 
 
+def merge_resume_lease_ttl_score(
+    route_meta: Dict[str, Any],
+    *,
+    store_pending_ttl: Optional[float] = None,
+    store_pending_score: Optional[float] = None,
+) -> tuple[Optional[float], Optional[float], bool]:
+    """Merge resume-computed lease with env pending suspend lease (max TTL / score)."""
+    resume_ttl = route_meta.get("resume_lease_ttl_s")
+    resume_score = route_meta.get("resume_lease_score")
+    pending_ttl = route_meta.get("pending_resume_lease_ttl_s")
+    pending_score = route_meta.get("pending_resume_lease_score")
+    from_pending_meta = pending_ttl is not None or pending_score is not None
+    if store_pending_ttl is not None:
+        pending_ttl = (
+            store_pending_ttl
+            if pending_ttl is None
+            else max(float(pending_ttl), float(store_pending_ttl))
+        )
+    if store_pending_score is not None and pending_score is None:
+        pending_score = store_pending_score
+    candidates_ttl = [
+        float(x) for x in (resume_ttl, pending_ttl) if isinstance(x, (int, float))
+    ]
+    candidates_score = [
+        float(x) for x in (resume_score, pending_score) if isinstance(x, (int, float))
+    ]
+    final_ttl = max(candidates_ttl) if candidates_ttl else None
+    final_score = max(candidates_score) if candidates_score else None
+    used_pending = from_pending_meta or store_pending_ttl is not None
+    if final_ttl is not None:
+        route_meta["resume_lease_ttl_s"] = final_ttl
+    if final_score is not None:
+        route_meta["resume_lease_score"] = final_score
+    return final_ttl, final_score, used_pending
+
+
 def should_send_preferred_header(belief_level: BeliefLevel, route_meta: Dict[str, Any]) -> bool:
     """Form B: only emit strong affinity hint when belief is HOT and hint exists."""
     if belief_level != BeliefLevel.HOT:

@@ -2,7 +2,7 @@ import copy
 import time
 from contextlib import nullcontext
 from threading import Lock
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import gem
 import numpy as np
@@ -190,6 +190,8 @@ class TrajEnvManager(BaseEnvManager):
         self._resume_prefill_tokens_samples = []
         self._external_wait_samples = []
         self._resume_queue_wait_samples = []
+        self._pending_resume_lease_ttl_s: Optional[float] = None
+        self._pending_resume_lease_score: Optional[float] = None
 
         with self.thread_lock, self.env_step_limiter:
             # `observation` describes the current game-state prompt;
@@ -238,6 +240,16 @@ class TrajEnvManager(BaseEnvManager):
         except (TypeError, ValueError):
             pass
 
+    @staticmethod
+    def _llm_response_may_invoke_tool(response_text: str) -> bool:
+        """Heuristic: LLM output is likely to trigger an external tool call."""
+        if not isinstance(response_text, str):
+            return False
+        text = response_text.strip()
+        if not text:
+            return False
+        return "<tool_call>" in text
+
     def _maybe_set_pending_tool_suspend_lease(self) -> None:
         """Register tool-wait KV lease before external tool blocks in env.step (L1 suspend)."""
         snapshot = get_scheduling_weight_snapshot()
@@ -282,12 +294,28 @@ class TrajEnvManager(BaseEnvManager):
             lease_score=score,
             backend_id=self._last_backend_id,
         )
+        self._pending_resume_lease_ttl_s = ttl
+        self._pending_resume_lease_score = score
+
+    def _scheduling_fields_for_meta(self) -> Dict[str, float]:
+        """Fields passed to Router via meta_info (cross Ray actor)."""
+        out: Dict[str, float] = {}
+        if not self.trajectory_id:
+            return out
+        state = get_trajectory_scheduling_state()
+        out["scheduling_t_tool_s"] = float(state.get_t_tool_s(self.trajectory_id))
+        if self._pending_resume_lease_ttl_s is not None:
+            out["pending_resume_lease_ttl_s"] = float(self._pending_resume_lease_ttl_s)
+        if self._pending_resume_lease_score is not None:
+            out["pending_resume_lease_score"] = float(self._pending_resume_lease_score)
+        return out
 
     def step(self, llm_output: DataProto):
         responses = self.tokenizer.batch_decode(llm_output.batch['responses'], skip_special_tokens=False)
 
         tool_call_start_ts = time.time()
-        self._maybe_set_pending_tool_suspend_lease()
+        if self._llm_response_may_invoke_tool(responses[0]):
+            self._maybe_set_pending_tool_suspend_lease()
         with self.thread_lock, self.env_step_limiter:
             observation, reward, terminated, truncated, info = self.env.step(action=responses[0])
         tool_return_ts = time.time()
@@ -405,7 +433,11 @@ class TrajEnvManager(BaseEnvManager):
             "resume_mismatch_count": self._resume_mismatch_count,
             # Trajectory value scheduling (see docs/trajectory_value_scheduling.md).
             **traj_signals,
+            **self._scheduling_fields_for_meta(),
         })
+        if request_type == "resume":
+            self._pending_resume_lease_ttl_s = None
+            self._pending_resume_lease_score = None
         self._next_request_type = "normal"
 
         input_messages = [item for items in self.rollout_cache.history for item in items["messages"]]

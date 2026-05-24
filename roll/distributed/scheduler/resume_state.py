@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import Lock
-from typing import Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from roll.distributed.scheduler.kv_lease_client import LookupResumeResult
@@ -99,6 +99,18 @@ class TrajectorySchedulingState:
                 return self._default_t_tool_s
             return float(rec.t_tool_ema_s)
 
+    def sync_from_route_meta(self, trajectory_id: str, route_meta: Dict[str, Any]) -> None:
+        """Apply scheduling fields from env meta (cross-process Router/Env)."""
+        with self._lock:
+            rec = self._records.setdefault(trajectory_id, TrajectorySchedulingRecord())
+            raw_t = route_meta.get("scheduling_t_tool_s")
+            if raw_t is not None:
+                try:
+                    rec.t_tool_ema_s = max(0.0, float(raw_t))
+                    rec.tool_wait_samples = max(rec.tool_wait_samples, 1)
+                except (TypeError, ValueError):
+                    pass
+
     def update_tool_wait(self, trajectory_id: str, external_wait_s: float) -> None:
         wait_s = max(0.0, float(external_wait_s))
         with self._lock:
@@ -131,7 +143,7 @@ class TrajectorySchedulingState:
                     feedback.bias_min,
                     rec.p_hit_bias - feedback.alpha_miss,
                 )
-            elif not affinity_hit and context_class in ("cpu_reload", "full_prefill"):
+            elif not affinity_hit and context_class == "cpu_reload":
                 rec.p_hit_bias = max(
                     feedback.bias_min,
                     rec.p_hit_bias - feedback.alpha_miss * 0.5,

@@ -11,6 +11,7 @@ from roll.distributed.scheduler.trajectory_value import (
 def test_lookup_resume_result_from_json():
     r = LookupResumeResult.from_json(
         {
+            "found": True,
             "hit_tokens": 128,
             "estimated_prefill_tokens": 32,
             "cache_confidence": 0.9,
@@ -21,6 +22,11 @@ def test_lookup_resume_result_from_json():
     assert r.found is True
     assert r.hit_tokens == 128
     assert r.cache_confidence == 0.9
+
+
+def test_lookup_resume_empty_defaults_not_found():
+    r = LookupResumeResult.from_json({})
+    assert r.found is False
 
 
 def test_plan_tool_suspend_lease_positive_ttl():
