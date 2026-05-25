@@ -1,0 +1,6 @@
+#!/mnt/xxl/R3/.venv-train/bin/python
+
+from deepspeed.launcher.runner import main
+
+if __name__ == '__main__':
+    main()
