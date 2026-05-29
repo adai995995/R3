@@ -100,7 +100,14 @@ def is_report_data_finished(data: DataProto) -> bool:
     finish_reasons = data.meta_info.get("finish_reasons", [])
     assert isinstance(finish_reasons, list), f"{finish_reasons}"
     assert all(isinstance(finish_reason, str) for finish_reason in finish_reasons), f"{finish_reasons}"
-    return not any(finish_reason == "abort" for finish_reason in finish_reasons)
+    if any(finish_reason == "abort" for finish_reason in finish_reasons):
+        return False
+    output_token_ids = data.meta_info.get("output_token_ids")
+    if output_token_ids is not None and (
+        not output_token_ids or any(len(ids) == 0 for ids in output_token_ids)
+    ):
+        return False
+    return True
 
 def raise_for_status(response: httpx.Response):
     if not response.is_success:
@@ -739,7 +746,9 @@ class RouterClient:
 
         match self.strategy_name:
             case "sglang":
-                from roll.distributed.strategy.sglang_strategy import create_sampling_params_for_sglang
+                from roll.distributed.strategy.sglang_sampling_params import (
+                    create_sampling_params_for_sglang,
+                )
                 sampling_params = create_sampling_params_for_sglang(gen_kwargs=generation_config)
                 payload["sampling_params"] = sampling_params
                 payload["return_logprob"] = generation_config.get("logprobs", 0) is not None
@@ -771,6 +780,19 @@ class RouterClient:
             "context_class_full_prefill",
             "selected_backend_affinity_hit",
             "selected_backend_migration",
+            "worker_load_skew_at_dispatch",
+            "selected_worker_load_at_dispatch",
+            "routing_policy",
+            "remaining_steps",
+            "max_steps",
+            "remaining_steps_ratio",
+            "trajectory_value",
+            "belief_level",
+            "belief_p_hit",
+            "resume_lease_ttl_s",
+            "resume_lease_score",
+            "pending_resume_lease_ttl_s",
+            "pending_resume_lease_score",
         ):
             if key in response:
                 output_data.meta_info[key] = response[key]
@@ -1130,12 +1152,21 @@ class EnvAffinityRouter(Router):
         self.active_dp_ranks: Set[int] = set(range(len(self.workers)))  # All ranks initially active
         self.routing_lock = asyncio.Lock()  # Protect routing updates
         router_config = self.router_args.router_config or {}
+        self.routing_policy = str(router_config.get("routing_policy", "prefix_affinity"))
+        if self.routing_policy not in ("prefix_affinity", "least_load", "hybrid_threshold", "length_priority"):
+            raise ValueError(
+                f"Unsupported EnvAffinityRouter routing_policy={self.routing_policy!r}; "
+                "expected 'prefix_affinity', 'least_load', 'hybrid_threshold', or 'length_priority'."
+            )
         self.enable_resume_priority = bool(router_config.get("enable_resume_priority", True))
         self.enable_resume_aware_routing = bool(router_config.get("enable_resume_aware_routing", False))
         self.enable_request_priority_queue = bool(router_config.get("enable_request_priority_queue", False))
         self.request_wait_aging_weight = float(router_config.get("request_wait_aging_weight", 0.1))
         self.normal_request_base_score = float(router_config.get("normal_request_base_score", 0.0))
         self.max_running_requests_per_worker = int(router_config.get("max_running_requests_per_worker", 0))
+        self.hybrid_load_skew_threshold = float(router_config.get("hybrid_load_skew_threshold", 2.0))
+        self.length_priority_weight = float(router_config.get("length_priority_weight", 1.0))
+        self.length_priority_age_weight = float(router_config.get("length_priority_age_weight", 0.1))
         self.resume_normal_quota = str(router_config.get("resume_normal_quota", "3:1"))
         self.normal_max_queue_wait_s = float(router_config.get("normal_max_queue_wait_s", 0.0))
         self.resume_max_queue_wait_s = float(router_config.get("resume_max_queue_wait_s", 0.0))
@@ -1215,7 +1246,8 @@ class EnvAffinityRouter(Router):
         # Unified rollback switch: disable all resume-priority behaviors.
         if not self.enable_resume_priority:
             self.enable_resume_aware_routing = False
-            self.enable_request_priority_queue = False
+            if self.routing_policy != "length_priority":
+                self.enable_request_priority_queue = False
             self.enable_adaptive_quota = False
             self.enable_belief_feedback = False
             self.enable_value_driven_lease = False
@@ -1245,6 +1277,7 @@ class EnvAffinityRouter(Router):
         self._reset_resume_metrics()
         logger.info(
             "EnvAffinityRouter resume-aware config: "
+            f"routing_policy={self.routing_policy}, "
             f"enable_resume_priority={self.enable_resume_priority}, "
             f"enabled={self.enable_resume_aware_routing}, "
             f"queue_enabled={self.enable_request_priority_queue}, "
@@ -1261,6 +1294,8 @@ class EnvAffinityRouter(Router):
             f"enable_refresh_resume_priority_on_dispatch={self.enable_refresh_resume_priority_on_dispatch}, "
             f"force_migrate_age_s={self.force_migrate_age_s}, "
             f"max_running_requests_per_worker={self.max_running_requests_per_worker}, "
+            f"hybrid_load_skew_threshold={self.hybrid_load_skew_threshold}, "
+            f"length_priority_weight={self.length_priority_weight}, "
             f"resume_normal_quota={self.resume_normal_quota}, "
             f"normal_max_queue_wait_s={self.normal_max_queue_wait_s}, "
             f"resume_max_queue_wait_s={self.resume_max_queue_wait_s}, "
@@ -1349,6 +1384,9 @@ class EnvAffinityRouter(Router):
         self.resume_pause_age_samples: List[float] = []
         self.resume_queue_wait_samples: List[float] = []
         self.resume_history_len_tokens_samples: List[float] = []
+        self.worker_load_skew_sum = 0.0
+        self.worker_load_skew_samples: List[float] = []
+        self.selected_worker_load_samples: List[float] = []
         self.resume_wait_bucket_served: Dict[str, int] = defaultdict(int)
         self.normal_total_requests = 0
         self.normal_queue_wait_sum = 0.0
@@ -1359,6 +1397,7 @@ class EnvAffinityRouter(Router):
         self.trajectory_value_sum = 0.0
         self.belief_state_counts: Dict[str, int] = defaultdict(int)
         self.trajectory_penalty_counts: Dict[str, int] = defaultdict(int)
+        self.dispatch_policy_counts: Dict[str, int] = defaultdict(int)
 
     @staticmethod
     def _percentile(values: List[float], q: float) -> float:
@@ -1501,6 +1540,31 @@ class EnvAffinityRouter(Router):
         if st is not None and st.inflight is not None:
             return local + self.gateway_inflight_load_weight * float(st.inflight)
         return local
+
+    def _current_worker_loads(self) -> List[float]:
+        return [self._worker_load_for_rank(rank) for rank in range(len(self.workers))]
+
+    def _worker_load_skew(self) -> float:
+        loads = self._current_worker_loads()
+        if not loads:
+            return 0.0
+        return float(max(loads) - min(loads))
+
+    def _record_dispatch_load_metrics(self, route_meta: Dict[str, Any], dp_rank: int) -> None:
+        loads = self._current_worker_loads()
+        if loads:
+            skew = float(max(loads) - min(loads))
+            selected_load = float(loads[dp_rank]) if 0 <= dp_rank < len(loads) else 0.0
+        else:
+            skew = 0.0
+            selected_load = 0.0
+        route_meta["worker_load_skew_at_dispatch"] = skew
+        route_meta["selected_worker_load_at_dispatch"] = selected_load
+        route_meta["routing_policy"] = self.routing_policy
+        self.worker_load_skew_sum += skew
+        self.worker_load_skew_samples.append(skew)
+        self.selected_worker_load_samples.append(selected_load)
+        self.dispatch_policy_counts[self.routing_policy] += 1
 
     async def _enrich_resume_route_meta(self, route_meta: Dict[str, Any]) -> None:
         """L2: optional lookup_resume before computing resume priority."""
@@ -1706,6 +1770,13 @@ class EnvAffinityRouter(Router):
             route_meta["p_hit_bias"] = self.scheduling_state.get_p_hit_bias(tid)
 
     def _compute_request_base_priority(self, request_type: str, route_meta: Dict[str, Any]) -> float:
+        if self.routing_policy == "length_priority":
+            remaining_steps = float(route_meta.get("remaining_steps", 0.0) or 0.0)
+            pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
+            return (
+                self.length_priority_weight * remaining_steps
+                + self.length_priority_age_weight * math.log1p(max(0.0, pause_age))
+            )
         if request_type != "resume":
             return self.normal_request_base_score
         self._sync_scheduling_meta(route_meta)
@@ -1824,6 +1895,17 @@ class EnvAffinityRouter(Router):
     def _pick_from_normal_queue(self) -> tuple[Optional[PendingTrajectoryRequest], Optional[int]]:
         if not self.pending_normal_requests:
             return None, None
+        if self.routing_policy == "length_priority":
+            sorted_requests = sorted(
+                self.pending_normal_requests.values(),
+                key=lambda req: (self._effective_request_priority(req), -req.enqueue_seq),
+                reverse=True,
+            )
+            for pending in sorted_requests:
+                dp_rank = self._select_worker_for_request(pending)
+                if dp_rank is not None:
+                    return pending, dp_rank
+            return None, None
         sorted_requests = sorted(
             self.pending_normal_requests.values(),
             key=lambda req: req.enqueue_seq,
@@ -1834,9 +1916,27 @@ class EnvAffinityRouter(Router):
                 return pending, dp_rank
         return None, None
 
+    def _pick_from_unified_priority_queue(self) -> tuple[Optional[PendingTrajectoryRequest], Optional[int]]:
+        pending_requests = list(self.pending_resume_requests.values()) + list(self.pending_normal_requests.values())
+        if not pending_requests:
+            return None, None
+        sorted_requests = sorted(
+            pending_requests,
+            key=lambda req: (self._effective_request_priority(req), -req.enqueue_seq),
+            reverse=True,
+        )
+        for pending in sorted_requests:
+            dp_rank = self._select_worker_for_request(pending)
+            if dp_rank is not None:
+                return pending, dp_rank
+        return None, None
+
     def _pick_next_dispatchable_request(self) -> tuple[Optional[PendingTrajectoryRequest], Optional[int]]:
         if not self.pending_resume_requests and not self.pending_normal_requests:
             return None, None
+
+        if self.routing_policy == "length_priority":
+            return self._pick_from_unified_priority_queue()
 
         self._maybe_update_adaptive_quota()
 
@@ -1935,6 +2035,19 @@ class EnvAffinityRouter(Router):
         src_rank = pending.uid
         request_type = pending.request_type
         route_meta = pending.route_meta
+        if self.routing_policy in ("least_load", "length_priority"):
+            candidate_ranks = [r for r in self.active_dp_ranks if self._has_worker_capacity(r)]
+            if not candidate_ranks:
+                return None
+            return min(candidate_ranks, key=lambda r: self._worker_load_for_rank(r))
+
+        if self.routing_policy == "hybrid_threshold":
+            candidate_ranks = [r for r in self.active_dp_ranks if self._has_worker_capacity(r)]
+            if not candidate_ranks:
+                return None
+            if self._worker_load_skew() >= self.hybrid_load_skew_threshold:
+                return min(candidate_ranks, key=lambda r: self._worker_load_for_rank(r))
+
         if self.enable_resume_aware_routing and request_type == "resume":
             if self.enable_trajectory_value_scheduling:
                 return self._select_worker_trajectory_value(pending)
@@ -2100,6 +2213,7 @@ class EnvAffinityRouter(Router):
                             route_meta["resume_enqueue_ts"] = pending.enqueue_ts
                             route_meta["resume_dispatch_ts"] = dispatch_ts
                             route_meta["resume_queue_wait_s"] = max(0.0, dispatch_ts - pending.enqueue_ts)
+                            self._record_dispatch_load_metrics(route_meta, dp_rank)
                             if request_type == "resume":
                                 self._record_resume_dispatch(
                                     src_rank=src_rank,
@@ -2126,17 +2240,76 @@ class EnvAffinityRouter(Router):
         else:
             # Atomic routing assignment under lock to prevent TOCTOU race with shrink/expand
             async with self.routing_lock:
-                if self.enable_resume_aware_routing and request_type == "resume":
+                enqueue_ts = time.time()
+                route_meta["resume_enqueue_ts"] = enqueue_ts
+                if self.routing_policy in ("least_load", "length_priority"):
+                    previous_rank = self.src_rank2_dp_rank.get(src_rank)
+                    candidate_ranks = [r for r in self.active_dp_ranks if self._has_worker_capacity(r)]
+                    if not candidate_ranks:
+                        raise RuntimeError("No active DP ranks with capacity")
+                    dp_rank = min(candidate_ranks, key=lambda r: self._worker_load_for_rank(r))
+                    # Keep the mapping updated only for observability (migration/affinity);
+                    # least_load deliberately re-evaluates it for every request.
+                    self.src_rank2_dp_rank[src_rank] = dp_rank
+                    self.request_id_2_src_rank[request_id] = src_rank
+                    self.running_requests[dp_rank].add(request_id)
+                    dispatch_ts = time.time()
+                    route_meta["resume_dispatch_ts"] = dispatch_ts
+                    route_meta["resume_queue_wait_s"] = max(0.0, dispatch_ts - enqueue_ts)
+                    self._record_dispatch_load_metrics(route_meta, dp_rank)
+                    if request_type == "resume":
+                        self._record_resume_dispatch(
+                            src_rank=src_rank,
+                            dp_rank=dp_rank,
+                            route_meta=route_meta,
+                            enqueue_ts=enqueue_ts,
+                            base_priority=base_priority,
+                            previous_rank=previous_rank,
+                        )
+                elif self.routing_policy == "hybrid_threshold":
+                    previous_rank = self.src_rank2_dp_rank.get(src_rank)
+                    candidate_ranks = [r for r in self.active_dp_ranks if self._has_worker_capacity(r)]
+                    if not candidate_ranks:
+                        raise RuntimeError("No active DP ranks with capacity")
+                    if self._worker_load_skew() >= self.hybrid_load_skew_threshold:
+                        dp_rank = min(candidate_ranks, key=lambda r: self._worker_load_for_rank(r))
+                        self.src_rank2_dp_rank[src_rank] = dp_rank
+                    else:
+                        if src_rank not in self.src_rank2_dp_rank:
+                            self.src_rank2_dp_rank[src_rank] = min(candidate_ranks, key=lambda r: len(self.running_requests[r]))
+                        dp_rank = self.src_rank2_dp_rank[src_rank]
+                        if not self._has_worker_capacity(dp_rank):
+                            raise RuntimeError("No active DP ranks with capacity")
+                    self.request_id_2_src_rank[request_id] = src_rank
+                    self.running_requests[dp_rank].add(request_id)
+                    dispatch_ts = time.time()
+                    route_meta["resume_dispatch_ts"] = dispatch_ts
+                    route_meta["resume_queue_wait_s"] = max(0.0, dispatch_ts - enqueue_ts)
+                    self._record_dispatch_load_metrics(route_meta, dp_rank)
+                    if request_type == "resume":
+                        self._record_resume_dispatch(
+                            src_rank=src_rank,
+                            dp_rank=dp_rank,
+                            route_meta=route_meta,
+                            enqueue_ts=enqueue_ts,
+                            base_priority=base_priority,
+                            previous_rank=previous_rank,
+                        )
+                elif self.enable_resume_aware_routing and request_type == "resume":
                     previous_rank = self.src_rank2_dp_rank.get(src_rank)
                     dp_rank = self._select_resume_dp_rank(src_rank=src_rank, route_meta=route_meta)
                     self.src_rank2_dp_rank[src_rank] = dp_rank
                     self.request_id_2_src_rank[request_id] = src_rank
                     self.running_requests[dp_rank].add(request_id)
+                    dispatch_ts = time.time()
+                    route_meta["resume_dispatch_ts"] = dispatch_ts
+                    route_meta["resume_queue_wait_s"] = max(0.0, dispatch_ts - enqueue_ts)
+                    self._record_dispatch_load_metrics(route_meta, dp_rank)
                     self._record_resume_dispatch(
                         src_rank=src_rank,
                         dp_rank=dp_rank,
                         route_meta=route_meta,
-                        enqueue_ts=time.time(),
+                        enqueue_ts=enqueue_ts,
                         base_priority=base_priority,
                         previous_rank=previous_rank,
                     )
@@ -2147,11 +2320,35 @@ class EnvAffinityRouter(Router):
                     dp_rank = self.src_rank2_dp_rank[src_rank]
                     self.request_id_2_src_rank[request_id] = src_rank
                     self.running_requests[dp_rank].add(request_id)
+                    dispatch_ts = time.time()
+                    route_meta["resume_dispatch_ts"] = dispatch_ts
+                    route_meta["resume_queue_wait_s"] = max(0.0, dispatch_ts - enqueue_ts)
+                    self._record_dispatch_load_metrics(route_meta, dp_rank)
 
         try:
             response = await self.workers[dp_rank].generate_request.remote(payload)
             if isinstance(response, dict):
                 response["selected_backend_id"] = dp_rank
+                for key in (
+                    "resume_enqueue_ts",
+                    "resume_dispatch_ts",
+                    "resume_queue_wait_s",
+                    "worker_load_skew_at_dispatch",
+                    "selected_worker_load_at_dispatch",
+                    "routing_policy",
+                    "remaining_steps",
+                    "max_steps",
+                    "remaining_steps_ratio",
+                    "trajectory_value",
+                    "belief_level",
+                    "belief_p_hit",
+                    "resume_lease_ttl_s",
+                    "resume_lease_score",
+                    "pending_resume_lease_ttl_s",
+                    "pending_resume_lease_score",
+                ):
+                    if key in route_meta:
+                        response[key] = route_meta[key]
                 if request_type == "resume" and (
                     self.enable_belief_feedback or self.enable_value_driven_lease
                 ):
@@ -2250,6 +2447,19 @@ class EnvAffinityRouter(Router):
             metrics[f"scheduler/router/belief_state/{state}_count"] = float(cnt)
         for key, cnt in self.trajectory_penalty_counts.items():
             metrics[f"scheduler/router/penalty/{key}_count"] = float(cnt)
+        for policy, cnt in self.dispatch_policy_counts.items():
+            metrics[f"scheduler/router/dispatch_policy/{policy}_count"] = float(cnt)
+        if self.worker_load_skew_samples:
+            metrics["scheduler/router/worker_load_skew_mean"] = (
+                self.worker_load_skew_sum / float(len(self.worker_load_skew_samples))
+            )
+            metrics["scheduler/router/worker_load_skew_p50"] = self._percentile(self.worker_load_skew_samples, 0.50)
+            metrics["scheduler/router/worker_load_skew_p95"] = self._percentile(self.worker_load_skew_samples, 0.95)
+        if self.selected_worker_load_samples:
+            metrics["scheduler/router/selected_worker_load_mean"] = (
+                sum(self.selected_worker_load_samples) / float(len(self.selected_worker_load_samples))
+            )
+            metrics["scheduler/router/selected_worker_load_p95"] = self._percentile(self.selected_worker_load_samples, 0.95)
 
         if self.normal_total_requests:
             total = float(self.normal_total_requests)

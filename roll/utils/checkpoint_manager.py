@@ -79,6 +79,9 @@ class CheckpointManager:
         logger.info(f"checkpoint_config: {checkpoint_config}")
         if self.checkpoint_config:
             upload_type = self.checkpoint_config.pop("type", "file_system")
+            if upload_type in ("disabled", "none", "null"):
+                logger.info("checkpoint upload disabled by checkpoint_config.type")
+                return
             if upload_type not in uploader_registry:
                 raise ValueError(
                     f"Unknown tracker name: {upload_type}, total registered trackers: {uploader_registry.keys()}")

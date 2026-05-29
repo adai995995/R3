@@ -222,12 +222,54 @@ class SgLangStrategy(InferenceStrategy):
         )
         generator = self.model.engine.tokenizer_manager.generate_request(obj, None)
         chunks = None
+        last_non_empty_chunks = None
+        chunk_count = 0
+        chunk_summaries = []
         async for chunks in generator:
-            chunks = chunks
+            chunk_count += 1
+            chunk_list = chunks if isinstance(chunks, list) else [chunks]
+            chunk_summaries.append(
+                [
+                    {
+                        "keys": sorted(chunk.keys()),
+                        "output_len": len(chunk.get("output_ids", []) or []),
+                        "text_len": len(chunk.get("text", "") or ""),
+                        "text_preview": (chunk.get("text", "") or "")[:80],
+                        "meta_keys": sorted(chunk.get("meta_info", {}).keys()),
+                        "finish_reason": chunk.get("meta_info", {}).get("finish_reason"),
+                    }
+                    for chunk in chunk_list
+                ]
+            )
+            if any(len(chunk.get("output_ids", []) or []) > 0 for chunk in chunk_list):
+                last_non_empty_chunks = chunks
         assert chunks is not None
         chunks = chunks if isinstance(chunks, list) else [chunks]
+        selected_chunks = last_non_empty_chunks if last_non_empty_chunks is not None else chunks
+        selected_chunks = selected_chunks if isinstance(selected_chunks, list) else [selected_chunks]
+        for chunk in selected_chunks:
+            if not chunk.get("output_ids") and chunk.get("text"):
+                # SGLang 0.4.x returns decoded text instead of token ids when
+                # skip_tokenizer_init=False. ROLL's PolicyProxy consumes ids.
+                chunk["output_ids"] = self.model.tokenizer.encode(
+                    chunk["text"], add_special_tokens=False
+                )
 
-        return postprocess_generate(chunks)
+        output_data = postprocess_generate(selected_chunks)
+        logger.info(
+            "[sglang_generate_request] rid=%s input_len=%s max_new_tokens=%s stop=%s "
+            "chunk_count=%s used_last_non_empty=%s chunk_summaries=%s final_output_lens=%s finish_reasons=%s",
+            payload.get("rid"),
+            len(payload.get("input_ids", []) or []),
+            payload.get("sampling_params", {}).get("max_new_tokens"),
+            payload.get("sampling_params", {}).get("stop"),
+            chunk_count,
+            last_non_empty_chunks is not None,
+            chunk_summaries[-5:],
+            [len(ids) for ids in output_data.get("output_token_ids", [])],
+            output_data.get("finish_reasons"),
+        )
+        return output_data
 
     async def generate(self, batch: DataProto, generation_config):
         # assert isinstance(self.model, SglangEngine)
@@ -365,16 +407,12 @@ class SglangEngine:
         # global rank as a CUDA device ordinal (e.g., barrier(device_ids=[rank])), which breaks under
         # single-visible-GPU workers (rank>0 => invalid device ordinal).
         #
-        # We patch SGLang's helper to use ROLL's compatibility implementation that avoids binding CUDA
-        # device ids to rank. This only affects SGLang internals such as init_weights_update_group.
+        # Patch model-update NCCL for single-visible-GPU Ray workers (also applied in scheduler child).
         try:
-            import sglang.srt.utils as srt_utils
-            from roll.utils.collective.pg_utils import init_custom_process_group as roll_init_pg
+            from roll.third_party.sglang.v046post4_patch.model_update_pg import apply_model_update_pg_patch
 
-            if hasattr(srt_utils, "init_custom_process_group"):
-                srt_utils.init_custom_process_group = roll_init_pg
+            apply_model_update_pg_patch()
         except Exception:
-            # Best-effort patching; if the import path changes across versions we just proceed.
             pass
         # Local Engine path also constructs ServerArgs(**kwargs) internally.
         # Filter unsupported keys (e.g. vLLM-style gpu_memory_utilization) for compatibility
@@ -390,6 +428,24 @@ class SglangEngine:
         return await self.engine.tokenizer_manager.init_weights_update_group(InitWeightsUpdateGroupReqInput(**payload))
 
     async def update_weights_from_distributed(self, payload):
+        if "names" in payload:
+            results = []
+            for name, dtype, shape in zip(payload["names"], payload["dtypes"], payload["shapes"]):
+                req = UpdateWeightsFromDistributedReqInput(
+                    name=name,
+                    dtype=str(dtype).removeprefix("torch."),
+                    shape=list(shape),
+                )
+                results.append(
+                    await self.engine.tokenizer_manager.update_weights_from_distributed(req)
+                )
+            return results[-1] if results else (True, "No weights to update.")
+
+        payload = dict(payload)
+        if "dtype" in payload:
+            payload["dtype"] = str(payload["dtype"]).removeprefix("torch.")
+        if "shape" in payload:
+            payload["shape"] = list(payload["shape"])
         return await self.engine.tokenizer_manager.update_weights_from_distributed(UpdateWeightsFromDistributedReqInput(**payload))
 
     async def update_weights_from_tensor(self, payload):
@@ -576,18 +632,7 @@ def gather_outputs_to_pad_tensor(request_outputs, pad_token_id, device=None) -> 
     return output_tensor
 
 
-def create_sampling_params_for_sglang(gen_kwargs: dict):
-    return dict(
-        max_new_tokens=gen_kwargs["max_new_tokens"],
-        temperature=gen_kwargs["temperature"],
-        top_p=gen_kwargs["top_p"],
-        top_k=gen_kwargs["top_k"],
-        stop_token_ids=gen_kwargs["eos_token_id"],
-        repetition_penalty=gen_kwargs["repetition_penalty"],
-        n=gen_kwargs["num_return_sequences"],
-        stop=gen_kwargs["stop_strings"],
-        no_stop_trim=gen_kwargs.get("include_stop_str_in_output", True),
-    )
+from roll.distributed.strategy.sglang_sampling_params import create_sampling_params_for_sglang
 
 def postprocess_generate(chunks):
     output_data = {}

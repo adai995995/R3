@@ -21,7 +21,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
-import msgspec
 import requests
 
 from gem.tools.base_tool import BaseTool
@@ -41,6 +40,7 @@ class SearchTool(BaseTool):
     search_url: Optional[str] = None
     topk: int = 3
     timeout: float = _DEFAULT_TIMEOUT
+    api_format: str = "msgpack"
 
     def __post_init__(self) -> None:
         self._search_url_resolved = self.search_url is not None
@@ -63,15 +63,27 @@ class SearchTool(BaseTool):
 
     def _search(self, query: str) -> str:
         url = self._resolve_search_url()
-        payload = {"query": query, "topk": self.topk, "return_scores": True}
         try:
-            response = requests.post(
-                url,
-                data=msgspec.msgpack.encode(payload),
-                timeout=self.timeout,
-            )
+            if self.api_format == "search_r1_json":
+                payload = {"queries": [query], "topk": self.topk, "return_scores": True}
+                response = requests.post(url, json=payload, timeout=self.timeout)
+            else:
+                import msgspec
+                payload = {"query": query, "topk": self.topk, "return_scores": True}
+                response = requests.post(
+                    url,
+                    data=msgspec.msgpack.encode(payload),
+                    timeout=self.timeout,
+                )
             response.raise_for_status()
-            decoded = msgspec.msgpack.decode(response.content)
+            if self.api_format == "search_r1_json":
+                decoded = response.json()
+                # Search-R1 returns a batch-shaped result: [[doc, ...]].
+                if decoded.get("result") and isinstance(decoded["result"][0], list):
+                    decoded["result"] = decoded["result"][0]
+            else:
+                import msgspec
+                decoded = msgspec.msgpack.decode(response.content)
             result = decoded.get("result", [])
             return self._passages2string(result)
         except Exception as e:

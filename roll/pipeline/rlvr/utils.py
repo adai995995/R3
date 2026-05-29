@@ -50,8 +50,11 @@ def write_to_json_process(path, data, columns_configs):
             f.write(json.dumps(data, ensure_ascii=False) + "\n")
     logger.info(f"dump_rollout to {path}: {timer.last}")
 
-def json_checker(path:str):
-    return path.startswith("/")
+def json_checker(path: str):
+    # Accept absolute paths and local relative rollout_dump_dir (e.g. ./output/...).
+    if not path:
+        return False
+    return path.startswith("/") or path.startswith("./") or path.startswith("output/")
 
 DUMPING_FUNC = [
     [json_checker, write_to_json_process],

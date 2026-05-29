@@ -143,6 +143,8 @@ class DeepSpeedWeightUpdater:
             master_addr=master_address,
             master_port=master_port,
         )
+        # SGLang infer schedulers barrier after joining; train rank 0 must participate.
+        collective.barrier(self.model_update_group_name)
         ray.get(refs)
 
         logger.info(f"Init weights update group {self.model_update_group_name}")

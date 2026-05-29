@@ -1,4 +1,5 @@
 import copy
+import json
 import time
 from contextlib import nullcontext
 from threading import Lock
@@ -130,6 +131,7 @@ class TrajEnvManager(BaseEnvManager):
         start_step = self.current_step
 
         log_stats = {"generate_time": [], "step_time": [], "current_step": []}
+        consecutive_abort_count = 0
 
         while self.running and rollout_cache is not None:
 
@@ -138,6 +140,42 @@ class TrajEnvManager(BaseEnvManager):
                 stop_reason = lm_output.meta_info.pop("stop_reason")
             log_stats["current_step"].append(self.current_step)
             log_stats["generate_time"].append(generate_timer.last)
+
+            if stop_reason == GenerateStopReason.ABORT:
+                consecutive_abort_count += 1
+                self.logger.warning(
+                    "generation aborted group_id=%s env_id=%s episode_id=%s "
+                    "consecutive_abort_count=%s",
+                    self.env_config["group_id"],
+                    self.env_config["env_id"],
+                    self.episode_id,
+                    consecutive_abort_count,
+                )
+                if consecutive_abort_count >= 3:
+                    # Make progress instead of retrying the same prompt forever.
+                    content = self.rollout_cache.history[-1]
+                    content.setdefault("messages", [])
+                    content.setdefault("prompt_ids", [])
+                    eos_token_id = self.tokenizer.eos_token_id
+                    if eos_token_id is None:
+                        eos_token_id = self.tokenizer.pad_token_id
+                    content["response_ids"] = [eos_token_id]
+                    content["reward"] = 0
+                    content["llm_response"] = ""
+                    content.setdefault("metrics", {})
+                    content.setdefault("metrics_agg_mode", {})
+                    content["metrics"]["generation_abort"] = 1
+                    content["metrics_agg_mode"]["generation_abort"] = "sum"
+                    rollout_cache.step += 1
+                    rollout_cache.terminated = True
+                    rollout_cache.truncated = True
+                    rollout_cache.history.append({
+                        "observation": "",
+                        "actions_left": max(self.env_config.max_steps - rollout_cache.step, 0),
+                        "messages": None,
+                    })
+            else:
+                consecutive_abort_count = 0
 
             with Timer(name="step", logger=None) as step_timer:
                 if stop_reason == GenerateStopReason.FINISH:
@@ -390,6 +428,8 @@ class TrajEnvManager(BaseEnvManager):
                              self.pipeline_config.sequence_length-input_ids.shape[1])
         generation_config = self.worker_config.generating_args.to_dict()
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
+        if generation_config["max_new_tokens"] <= 0:
+            return DataProto(meta_info={"stop_reason": GenerateStopReason.MAX_LENGTH})
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
         request_type = self._next_request_type
         pause_age_s = 0.0
@@ -488,6 +528,7 @@ class TrajEnvManager(BaseEnvManager):
             content["metrics"]["resume_infer_end_ts"] = infer_end_ts
             content["metrics"]["resume_infer_latency_s"] = resume_infer_latency_s
             content["metrics"]["resume_prefill_tokens"] = float(input_ids.shape[1])
+            content["metrics"]["resume_history_len_tokens"] = float(input_ids.shape[1])
             for key in (
                 "resume_enqueue_ts",
                 "resume_dispatch_ts",
@@ -497,9 +538,25 @@ class TrajEnvManager(BaseEnvManager):
                 "context_class_full_prefill",
                 "selected_backend_affinity_hit",
                 "selected_backend_migration",
+                "worker_load_skew_at_dispatch",
+                "selected_worker_load_at_dispatch",
+                "routing_policy",
+                "remaining_steps",
+                "max_steps",
+                "remaining_steps_ratio",
+                "trajectory_value",
+                "belief_p_hit",
+                "resume_lease_ttl_s",
+                "resume_lease_score",
+                "pending_resume_lease_ttl_s",
+                "pending_resume_lease_score",
             ):
                 if key in lm_output.meta_info:
-                    content["metrics"][key] = float(lm_output.meta_info[key])
+                    value = lm_output.meta_info[key]
+                    try:
+                        content["metrics"][key] = float(value)
+                    except (TypeError, ValueError):
+                        content["metrics"][key] = value
             if "resume_queue_wait_s" in lm_output.meta_info:
                 self._resume_queue_wait_samples.append(float(lm_output.meta_info["resume_queue_wait_s"]))
             content["metrics_agg_mode"].update({
@@ -509,6 +566,7 @@ class TrajEnvManager(BaseEnvManager):
                 "resume_infer_end_ts": "last",
                 "resume_infer_latency_s": "mean",
                 "resume_prefill_tokens": "mean",
+                "resume_history_len_tokens": "mean",
                 "resume_enqueue_ts": "last",
                 "resume_dispatch_ts": "last",
                 "resume_queue_wait_s": "mean",
@@ -517,6 +575,17 @@ class TrajEnvManager(BaseEnvManager):
                 "context_class_full_prefill": "sum",
                 "selected_backend_affinity_hit": "mean",
                 "selected_backend_migration": "mean",
+                "worker_load_skew_at_dispatch": "mean",
+                "selected_worker_load_at_dispatch": "mean",
+                "remaining_steps": "mean",
+                "max_steps": "last",
+                "remaining_steps_ratio": "mean",
+                "trajectory_value": "mean",
+                "belief_p_hit": "mean",
+                "resume_lease_ttl_s": "mean",
+                "resume_lease_score": "mean",
+                "pending_resume_lease_ttl_s": "mean",
+                "pending_resume_lease_score": "mean",
             })
 
         lm_output.meta_info["stop_reason"] = GenerateStopReason.FINISH
@@ -680,5 +749,49 @@ class TrajEnvManager(BaseEnvManager):
 
         env_metric = {f"env/{rollout_cache.tag}/{k}": v for k, v in env_metric.items()}
         env_metric["env/response_length"] = response_length
-        lm_input.meta_info = {"metrics": env_metric}
+
+        traj_group_id = (
+            f"{rollout_cache.tag}_{rollout_cache.group_id}_{self.episode_id}_{self.group_seed}"
+        )
+        traj_id = f"{traj_group_id}_{rollout_cache.env_id}"
+        serializable_history = []
+        for item in history:
+            entry = {
+                k: v
+                for k, v in item.items()
+                if k not in ("prompt_ids", "response_ids", "infer_logprobs")
+            }
+            if "metrics" in entry and isinstance(entry["metrics"], dict):
+                entry["metrics"] = dict(entry["metrics"])
+            serializable_history.append(entry)
+        trajectory_payload = {
+            "trajectory_id": traj_id,
+            "tag": rollout_cache.tag,
+            "group_id": rollout_cache.group_id,
+            "env_id": rollout_cache.env_id,
+            "episode_id": self.episode_id,
+            "num_actions": rollout_cache.step,
+            "response_length": response_length,
+            "episode_score": episode_score,
+            "resume_count": len(self._resume_prefill_tokens_samples),
+            "tool_use_count": sum(1 for h in history if h.get("use_tool")),
+            "resume_prefill_tokens_samples": list(self._resume_prefill_tokens_samples),
+            "resume_latency_e2e_samples": list(self._resume_e2e_latency_samples),
+            "resume_infer_latency_samples": list(self._resume_infer_latency_samples),
+            "resume_queue_wait_samples": list(self._resume_queue_wait_samples),
+            "external_wait_samples": list(self._external_wait_samples),
+            "history": serializable_history,
+        }
+        lm_input.non_tensor_batch["trajectory_json"] = np.array(
+            [json.dumps(trajectory_payload, ensure_ascii=False)], dtype=object
+        )
+        # traj_id is set again in run_rollout_loop; do not list it in COLUMMNS_CONFIG
+        # because dump_rollout_trajectories pops listed keys before train/log grouping.
+        lm_input.meta_info = {
+            "metrics": env_metric,
+            # Only dump observation fields; dump_rollout_trajectories pops listed keys.
+            "COLUMMNS_CONFIG": [
+                ["trajectory_json", "string"],
+            ],
+        }
         return lm_input

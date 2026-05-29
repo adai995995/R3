@@ -66,13 +66,31 @@ class AgenticPipeline(BasePipeline):
             kl_horizon=self.pipeline_config.kl_horizon,
         )
 
-        # INIT PHASE: Create Clusters
+        # INIT PHASE: Create actor_train first and initialize before spawning infer workers.
+        # Otherwise NCCL topology scan can SIGSEGV when other Ray actors already hold GPUs 0..N-1.
         self.actor_train: Any = Cluster(
             name=self.pipeline_config.actor_train.name,
             worker_cls=self.pipeline_config.actor_train.worker_cls,
             resource_manager=self.resource_manager,
             worker_config=self.pipeline_config.actor_train,
         )
+        self.download_models(self.actor_train)
+        self.tokenizer = default_tokenizer_provider(model_args=self.pipeline_config.actor_train.model_args)
+
+        train_init_refs: List[ray.ObjectRef] = []
+        train_init_refs.extend(self.actor_train.initialize(pipeline_config=self.pipeline_config, blocking=False))
+        if self.pipeline_config.adv_estimator == "gae":
+            # critic shares train GPUs in partial_gpu_mode; create before train init if needed
+            self.critic: Any = Cluster(
+                name=self.pipeline_config.critic.name,
+                worker_cls=self.pipeline_config.critic.worker_cls,
+                resource_manager=self.resource_manager,
+                worker_config=self.pipeline_config.critic,
+            )
+            self.download_models(self.critic)
+            train_init_refs.extend(self.critic.initialize(pipeline_config=self.pipeline_config, blocking=False))
+        ray.get(train_init_refs)
+        logger.info("actor_train (and critic if any) initialized before actor_infer spawn")
 
         self.actor_infer: Any = Cluster(
             name=self.pipeline_config.actor_infer.name,
@@ -80,7 +98,7 @@ class AgenticPipeline(BasePipeline):
             resource_manager=self.resource_manager,
             worker_config=self.pipeline_config.actor_infer,
         )
-        download_clusters = [self.actor_train, self.actor_infer]
+        infer_download_clusters = [self.actor_infer]
 
         if self.use_ref_model:
             self.reference: Any = Cluster(
@@ -89,17 +107,7 @@ class AgenticPipeline(BasePipeline):
                 resource_manager=self.resource_manager,
                 worker_config=self.pipeline_config.reference,
             )
-            download_clusters.append(self.reference)
-
-
-        if self.pipeline_config.adv_estimator == "gae":
-            self.critic: Any = Cluster(
-                name=self.pipeline_config.critic.name,
-                worker_cls=self.pipeline_config.critic.worker_cls,
-                resource_manager=self.resource_manager,
-                worker_config=self.pipeline_config.critic,
-            )
-            download_clusters.append(self.critic)
+            infer_download_clusters.append(self.reference)
 
         # INIT PHASE: Create Reward Cluster (if device_mapping is configured)
         self.reward = None
@@ -114,11 +122,9 @@ class AgenticPipeline(BasePipeline):
                 resource_manager=self.resource_manager,
                 worker_config=self.pipeline_config.reward,
             )
-            download_clusters.append(self.reward)
+            infer_download_clusters.append(self.reward)
 
-        # INIT PHASE: Download Models
-        self.download_models(*download_clusters)
-        self.tokenizer = default_tokenizer_provider(model_args=self.pipeline_config.actor_train.model_args)
+        self.download_models(*infer_download_clusters)
 
         if self.reward:
             # Create reward scheduler as Ray named actor for environment managers to access
@@ -165,14 +171,8 @@ class AgenticPipeline(BasePipeline):
         self.val_dataset_manager = GlobalDatasetManager.options(name=f"val_dataset_manager",
                                                                 get_if_exists=True,
                                                                 namespace=RAY_NAMESPACE).remote()
-        # INIT PHASE: Initialize Clusters
+        # INIT PHASE: Initialize infer / reward (actor_train already initialized above)
         refs: List[ray.ObjectRef] = []
-        refs.extend(self.actor_train.initialize(pipeline_config=self.pipeline_config, blocking=False))
-        if self.pipeline_config.adv_estimator == "gae":
-            refs.extend(self.critic.initialize(pipeline_config=self.pipeline_config, blocking=False))
-        ray.get(refs)
-
-        refs = []
         if self.reward:
             # INIT PHASE: Initialize Reward Cluster
             refs.extend(self.reward.initialize(pipeline_config=self.pipeline_config, blocking=False))

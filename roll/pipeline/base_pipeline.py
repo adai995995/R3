@@ -76,6 +76,12 @@ class BasePipeline:
         return metrics
 
     def do_checkpoint(self, global_step, is_last_step=None):
+        checkpoint_type = None
+        if self.pipeline_config.checkpoint_config:
+            checkpoint_type = self.pipeline_config.checkpoint_config.get("type", "file_system")
+        if checkpoint_type in ("disabled", "none", "null"):
+            return {}
+
         if is_last_step is None:
             is_last_step = global_step == self.pipeline_config.max_steps - 1
 

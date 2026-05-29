@@ -36,8 +36,12 @@ class PolicyProxy(BaseLLMProxy):
 
         # postprocess_generate, input_ids, attention_mask, left pad
         eos_token_id = response_data.meta_info["eos_token_id"]
+        if isinstance(eos_token_id, (list, tuple)):
+            eos_token_id = eos_token_id[0]
         pad_token_id = response_data.meta_info["pad_token_id"]
         output_token_ids = response_data.meta_info["output_token_ids"]
+        if not output_token_ids or any(len(ids) == 0 for ids in output_token_ids):
+            return None
         output_tokens = [torch.tensor(token_ids) for token_ids in output_token_ids]
 
         output_logprobs = response_data.meta_info.get("output_logprobs", None)

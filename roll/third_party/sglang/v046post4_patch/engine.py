@@ -79,6 +79,13 @@ def run_scheduler_process(*args, **kwargs):
         # The scheduler can still run without fp8 monkey patches.
         print(f"[roll][sglang] skip fp8 monkey patch due to: {e}")
 
+    try:
+        from roll.third_party.sglang.v046post4_patch.model_update_pg import apply_model_update_pg_patch
+
+        apply_model_update_pg_patch()
+    except Exception as e:
+        print(f"[roll][sglang] model_update_pg patch not applied: {e}")
+
     from sglang.srt.managers.scheduler import run_scheduler_process
     return run_scheduler_process(*args, **kwargs)
 

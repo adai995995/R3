@@ -403,6 +403,7 @@ class MegatronWeightUpdater:
             master_addr=master_address,
             master_port=master_port,
         )
+        collective.barrier(self.model_update_group_name)
         ray.get(refs)
 
         logger.info(f"Init weights update group {model_update_group_name}")
