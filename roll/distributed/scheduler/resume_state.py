@@ -12,6 +12,7 @@ if TYPE_CHECKING:
         BeliefConfig,
         LearningPenaltyWeights,
         LeaseTtlWeights,
+        SystemCostWeights,
         TrajectoryValueWeights,
     )
 
@@ -54,8 +55,10 @@ class SchedulingWeightSnapshot:
     penalty_weights: "LearningPenaltyWeights"
     belief: "BeliefConfig"
     lease_weights: "LeaseTtlWeights"
+    system_cost_weights: Optional["SystemCostWeights"] = None
     force_migrate_age_s: float = 30.0
     feedback_hot_downgrade_bias: float = -0.15
+    enable_system_cost_resume_scheduling: bool = False
 
 
 _WEIGHT_SNAPSHOT: Optional[SchedulingWeightSnapshot] = None

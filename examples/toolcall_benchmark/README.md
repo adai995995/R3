@@ -30,7 +30,8 @@ bash examples/toolcall_benchmark/run_experiment.sh
 | `enable_resume_priority` | false | true |
 | `enable_resume_aware_routing` | false | true |
 | `enable_request_priority_queue` | false | true |
-| `resume_normal_quota` | - | [3, 1] |
+| `enable_system_cost_resume_scheduling` | false | true |
+| `resume_normal_quota` | - | `"3:1"` |
 | `force_migrate_age_s` | - | 30.0 |
 
 ## 关键指标

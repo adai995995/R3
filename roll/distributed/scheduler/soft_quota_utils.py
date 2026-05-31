@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Set, Tuple, Literal
+from typing import Any, Dict, Optional, Sequence, Set, Tuple, Literal
 
 
 @dataclass(frozen=True)
@@ -21,22 +21,38 @@ class ResumeFallbackContext:
     hint_worker_load: int
 
 
-def parse_ratio(value: str) -> Tuple[int, int]:
-    """Parse a quota ratio string like '3:1' -> (3, 1)."""
-    raw = (value or "").strip()
+def _validate_ratio_pair(a: int, b: int) -> Tuple[int, int]:
+    a = max(0, int(a))
+    b = max(0, int(b))
+    if a == 0 and b == 0:
+        return 1, 1
+    return a, b
+
+
+def parse_ratio(value: Any) -> Tuple[int, int]:
+    """Parse quota ratios like '3:1', [3, 1], or {'resume': 3, 'normal': 1}."""
+    if isinstance(value, dict):
+        try:
+            return _validate_ratio_pair(value.get("resume", value.get("r", 1)), value.get("normal", value.get("n", 1)))
+        except (TypeError, ValueError):
+            return 1, 1
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        if len(value) != 2:
+            return 1, 1
+        try:
+            return _validate_ratio_pair(value[0], value[1])
+        except (TypeError, ValueError):
+            return 1, 1
+    raw = str(value or "").strip()
     if not raw:
         return 1, 1
     parts = raw.split(":")
     if len(parts) != 2:
         return 1, 1
     try:
-        a = max(0, int(parts[0]))
-        b = max(0, int(parts[1]))
+        return _validate_ratio_pair(parts[0], parts[1])
     except ValueError:
         return 1, 1
-    if a == 0 and b == 0:
-        return 1, 1
-    return a, b
 
 
 def bucketize_queue_wait_s(queue_wait_s: float) -> str:

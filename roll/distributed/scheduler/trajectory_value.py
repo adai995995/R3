@@ -174,6 +174,49 @@ class LeaseTtlWeights:
         )
 
 
+@dataclass
+class SystemCostWeights:
+    """System-only resume scheduling weights.
+
+    These weights intentionally exclude semantic trajectory quality signals such
+    as loop/stall/low reward. Lifecycle invalidation should be handled outside
+    the score as a hard state-machine rule.
+    """
+
+    prefill_h_max: float = 32768.0
+    queue_cost: float = 1.0
+    load_cost: float = 0.5
+    delay_regret: float = 1.0
+    dispatch_value: float = 1.0
+    age: float = 0.1
+    age_norm_s: float = 10.0
+    age_max: float = 5.0
+    p_hit_decay_per_s: float = 0.02
+    horizon_delta_s: float = 1.0
+    kv_bytes_per_token: float = 2048.0
+    memory_cost: float = 1.0e-9
+    memory_pressure_default: float = 1.0
+
+    @classmethod
+    def from_config(cls, cfg: Optional[Dict]) -> "SystemCostWeights":
+        cfg = cfg or {}
+        return cls(
+            prefill_h_max=float(cfg.get("prefill_h_max", cls.prefill_h_max)),
+            queue_cost=float(cfg.get("queue_cost", cfg.get("lambda_q", cls.queue_cost))),
+            load_cost=float(cfg.get("load_cost", cfg.get("lambda_load", cls.load_cost))),
+            delay_regret=float(cfg.get("delay_regret", cfg.get("lambda_1", cls.delay_regret))),
+            dispatch_value=float(cfg.get("dispatch_value", cfg.get("lambda_2", cls.dispatch_value))),
+            age=float(cfg.get("age", cfg.get("lambda_3", cls.age))),
+            age_norm_s=float(cfg.get("age_norm_s", cls.age_norm_s)),
+            age_max=float(cfg.get("age_max", cls.age_max)),
+            p_hit_decay_per_s=float(cfg.get("p_hit_decay_per_s", cls.p_hit_decay_per_s)),
+            horizon_delta_s=float(cfg.get("horizon_delta_s", cls.horizon_delta_s)),
+            kv_bytes_per_token=float(cfg.get("kv_bytes_per_token", cls.kv_bytes_per_token)),
+            memory_cost=float(cfg.get("memory_cost", cfg.get("lambda_mem", cls.memory_cost))),
+            memory_pressure_default=float(cfg.get("memory_pressure_default", cls.memory_pressure_default)),
+        )
+
+
 def compute_lease_score(v_traj: float, *, weights: LeaseTtlWeights) -> float:
     scale = max(1e-6, weights.v_traj_scale)
     return max(0.0, min(1.0, float(v_traj) / scale))
@@ -306,6 +349,181 @@ def compute_resume_priority(
     return priority, level, p_hit
 
 
+def classify_system_cost_belief(
+    route_meta: Dict[str, Any],
+    *,
+    belief: BeliefConfig,
+    force_migrate_age_s: float,
+    last_worker_overloaded: bool = False,
+) -> BeliefLevel:
+    """Belief for system-cost scheduling.
+
+    Unlike `classify_belief`, this does not treat loop/stall/semantic invalid as
+    a cache-locality signal. COLD is reserved for lifecycle or cache eligibility
+    failures and very stale resumes.
+    """
+    pause_age = _float_meta(route_meta, "pause_age_s")
+    last_backend_id = route_meta.get("last_backend_id")
+
+    if _indicator(route_meta, "trajectory_terminated") >= 0.5:
+        return BeliefLevel.COLD
+    if _indicator(route_meta, "model_version_mismatch") >= 0.5:
+        return BeliefLevel.COLD
+    if _indicator(route_meta, "prefix_hash_mismatch") >= 0.5:
+        return BeliefLevel.COLD
+    if pause_age >= max(force_migrate_age_s, belief.cold_pause_age_s):
+        return BeliefLevel.COLD
+    if last_backend_id is None:
+        return BeliefLevel.COLD
+    if last_worker_overloaded:
+        return BeliefLevel.WARM
+    if pause_age <= belief.hot_pause_age_s:
+        return BeliefLevel.HOT
+    return BeliefLevel.WARM
+
+
+def compute_history_prefill_cost(route_meta: Dict[str, Any], *, weights: SystemCostWeights) -> float:
+    """Normalized proxy for the prefill cost saved by a KV/prefix hit."""
+    return _norm_log(_float_meta(route_meta, "history_len_tokens"), weights.prefill_h_max)
+
+
+def compute_system_dispatch_score(
+    route_meta: Dict[str, Any],
+    *,
+    p_hit: float,
+    worker_load: float,
+    worker_queue_delay_s: float = 0.0,
+    weights: SystemCostWeights,
+) -> tuple[float, float]:
+    """Return (dispatch_score, expected_prefill_saved)."""
+    prefill_cost = compute_history_prefill_cost(route_meta, weights=weights)
+    expected_saved = max(0.0, float(p_hit)) * prefill_cost
+    score = (
+        expected_saved
+        - weights.queue_cost * max(0.0, float(worker_queue_delay_s))
+        - weights.load_cost * max(0.0, float(worker_load))
+    )
+    return score, expected_saved
+
+
+def compute_system_order_score(
+    route_meta: Dict[str, Any],
+    *,
+    belief: BeliefConfig,
+    force_migrate_age_s: float,
+    weights: SystemCostWeights,
+    worker_load: float = 0.0,
+    worker_queue_delay_s: float = 0.0,
+    queue_wait_s: float = 0.0,
+    last_worker_overloaded: bool = False,
+    p_hit_bias: float = 0.0,
+    feedback_hot_downgrade_bias: float = -0.15,
+) -> tuple[float, BeliefLevel, float, float]:
+    """Ordering score for resume requests under system-cost design.
+
+    Returns (order_score, belief_level, p_hit_effective, dispatch_score).
+    """
+    level = classify_system_cost_belief(
+        route_meta,
+        belief=belief,
+        force_migrate_age_s=force_migrate_age_s,
+        last_worker_overloaded=last_worker_overloaded,
+    )
+    if level == BeliefLevel.HOT and p_hit_bias <= feedback_hot_downgrade_bias:
+        level = BeliefLevel.WARM
+    p_hit = apply_p_hit_bias(belief_to_p_hit(level, belief), p_hit_bias, belief=belief)
+    dispatch_score, expected_saved = compute_system_dispatch_score(
+        route_meta,
+        p_hit=p_hit,
+        worker_load=worker_load,
+        worker_queue_delay_s=worker_queue_delay_s,
+        weights=weights,
+    )
+    delta = max(0.0, float(weights.horizon_delta_s))
+    decay = max(0.0, float(weights.p_hit_decay_per_s)) * delta
+    ttl_remaining = _float_meta(route_meta, "ttl_remaining_s", -1.0)
+    if ttl_remaining >= 0.0:
+        decay = max(decay, max(0.0, delta - ttl_remaining) / max(delta, 1e-6))
+    p_after = max(belief.p_cold, p_hit - decay)
+    delay_regret = max(0.0, p_hit - p_after) * compute_history_prefill_cost(route_meta, weights=weights)
+    age_norm = max(1e-6, float(weights.age_norm_s))
+    age_bonus = min(max(0.0, float(queue_wait_s)) / age_norm, max(0.0, float(weights.age_max)))
+    order_score = (
+        weights.delay_regret * delay_regret
+        + weights.dispatch_value * max(0.0, dispatch_score)
+        + weights.age * age_bonus
+    )
+    route_meta["system_delay_regret"] = delay_regret
+    route_meta["expected_prefill_saved"] = expected_saved
+    route_meta["dispatch_score"] = dispatch_score
+    route_meta["order_score"] = order_score
+    return order_score, level, p_hit, dispatch_score
+
+
+def compute_system_worker_route_score(
+    dp_rank: int,
+    route_meta: Dict[str, Any],
+    *,
+    belief_level: BeliefLevel,
+    belief: BeliefConfig,
+    worker_load: float,
+    weights: SystemCostWeights,
+) -> float:
+    p_w = p_hit_for_worker(dp_rank, route_meta, belief_level=belief_level, belief=belief)
+    score, expected_saved = compute_system_dispatch_score(
+        route_meta,
+        p_hit=p_w,
+        worker_load=worker_load,
+        weights=weights,
+    )
+    if route_meta.get("last_backend_id") == dp_rank:
+        route_meta["expected_prefill_saved"] = expected_saved
+    return score
+
+
+def compute_system_lease_ttl(
+    route_meta: Dict[str, Any],
+    *,
+    p_hit: float,
+    t_tool_s: float,
+    belief_level: BeliefLevel,
+    weights: SystemCostWeights,
+    lease_weights: LeaseTtlWeights,
+) -> tuple[float, float]:
+    """System-cost TTL/lease score from prefill benefit minus memory byte-seconds."""
+    t_min = max(0.0, lease_weights.t_tool_min)
+    t_max = max(t_min, lease_weights.t_tool_max)
+    t_tool = max(0.1, float(t_tool_s))
+    candidates = sorted({
+        t_min,
+        min(t_max, t_tool),
+        min(t_max, 2.0 * t_tool),
+        t_max,
+    })
+    prefill_cost = compute_history_prefill_cost(route_meta, weights=weights)
+    expected_saved = max(0.0, float(p_hit)) * prefill_cost
+    history_len = _float_meta(route_meta, "history_len_tokens")
+    kv_bytes = _float_meta(route_meta, "kv_bytes", history_len * weights.kv_bytes_per_token)
+    memory_pressure = _float_meta(route_meta, "memory_pressure", weights.memory_pressure_default)
+    best_ttl = t_min
+    best_value = float("-inf")
+    for ttl in candidates:
+        tool_return_prob = max(0.0, min(1.0, ttl / t_tool))
+        value = (
+            tool_return_prob * expected_saved
+            - weights.memory_cost * max(0.0, kv_bytes) * ttl * max(0.0, memory_pressure)
+        )
+        if value > best_value:
+            best_value = value
+            best_ttl = ttl
+    if belief_level == BeliefLevel.COLD or _indicator(route_meta, "trajectory_terminated") >= 0.5:
+        best_ttl = min(best_ttl, t_min)
+    lease_score = max(0.0, min(1.0, best_value))
+    route_meta["kv_bytes_proxy"] = max(0.0, kv_bytes)
+    route_meta["memory_pressure"] = max(0.0, memory_pressure)
+    return best_ttl, lease_score
+
+
 def compute_worker_route_score(
     dp_rank: int,
     route_meta: Dict[str, Any],
@@ -339,8 +557,32 @@ def plan_tool_suspend_lease(
     p_hit_bias: float = 0.0,
     last_worker_overloaded: bool = False,
     feedback_hot_downgrade_bias: float = -0.15,
+    use_system_cost: bool = False,
+    system_cost_weights: Optional[SystemCostWeights] = None,
 ) -> tuple[float, float, BeliefLevel, float]:
     """Compute (ttl_s, lease_score, belief_level, v_traj) at tool-suspend boundary."""
+    if use_system_cost:
+        system_cost_weights = system_cost_weights or SystemCostWeights()
+        priority, level, p_hit, _ = compute_system_order_score(
+            route_meta,
+            belief=belief,
+            force_migrate_age_s=force_migrate_age_s,
+            weights=system_cost_weights,
+            worker_load=0.0,
+            last_worker_overloaded=last_worker_overloaded,
+            p_hit_bias=p_hit_bias,
+            feedback_hot_downgrade_bias=feedback_hot_downgrade_bias,
+        )
+        ttl, lease_score = compute_system_lease_ttl(
+            route_meta,
+            p_hit=p_hit,
+            t_tool_s=t_tool_s,
+            belief_level=level,
+            weights=system_cost_weights,
+            lease_weights=lease_weights,
+        )
+        return ttl, lease_score, level, priority
+
     priority, level, p_hit = compute_resume_priority(
         route_meta,
         belief=belief,

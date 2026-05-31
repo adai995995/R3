@@ -39,10 +39,14 @@ from roll.distributed.scheduler.trajectory_value import (
     BeliefLevel,
     LearningPenaltyWeights,
     LeaseTtlWeights,
+    SystemCostWeights,
     TrajectoryValueWeights,
     classify_belief,
     compute_lease_ttl,
     compute_resume_priority,
+    compute_system_lease_ttl,
+    compute_system_order_score,
+    compute_system_worker_route_score,
     compute_trajectory_value,
     compute_worker_route_score,
     merge_resume_lease_ttl_score,
@@ -238,6 +242,12 @@ class RouterManager:
 
     async def generate_request(self, payload, request_id, uid):
         return await self.router.generate_request(payload=payload, request_id=request_id, uid=uid)
+
+    async def set_tool_suspend_lease(self, route_meta: Dict[str, Any]):
+        return await self.router.set_tool_suspend_lease(route_meta=route_meta)
+
+    async def delete_kv_lease(self, trajectory_id: str):
+        return await self.router.delete_kv_lease(trajectory_id=trajectory_id)
 
     async def abort_requests(self, request_ids, uid):
         return await self.router.abort_requests(request_ids, uid)
@@ -787,12 +797,31 @@ class RouterClient:
             "max_steps",
             "remaining_steps_ratio",
             "trajectory_value",
+            "order_score",
+            "dispatch_score",
+            "system_dispatch_score",
+            "system_delay_regret",
+            "expected_prefill_saved",
             "belief_level",
             "belief_p_hit",
             "resume_lease_ttl_s",
             "resume_lease_score",
+            "kv_bytes_proxy",
+            "memory_pressure",
             "pending_resume_lease_ttl_s",
             "pending_resume_lease_score",
+            "lookup_resume_found",
+            "lookup_hit_tokens",
+            "lookup_cache_confidence",
+            "lookup_estimated_prefill_tokens",
+            "lookup_lease_remaining_s",
+            "ttl_remaining_s",
+            "actual_hit",
+            "matched_prefix_tokens",
+            "resume_prefill_tokens",
+            "estimated_prefill_tokens",
+            "prefill_time_ms",
+            "cache_confidence",
         ):
             if key in response:
                 output_data.meta_info[key] = response[key]
@@ -852,6 +881,12 @@ class Router:
     @abstractmethod
     async def abort_all(self, request_ids):
         pass
+
+    async def set_tool_suspend_lease(self, route_meta: Dict[str, Any]) -> Dict[str, Any]:
+        return {"pushed": False, "reason": "unsupported_router"}
+
+    async def delete_kv_lease(self, trajectory_id: str) -> Dict[str, Any]:
+        return {"deleted": False, "reason": "unsupported_router"}
 
     async def rebalance_on_shrink(self, shrink_dp_ranks: List[int]) -> Dict[str, int]:
         raise NotImplementedError
@@ -1167,7 +1202,7 @@ class EnvAffinityRouter(Router):
         self.hybrid_load_skew_threshold = float(router_config.get("hybrid_load_skew_threshold", 2.0))
         self.length_priority_weight = float(router_config.get("length_priority_weight", 1.0))
         self.length_priority_age_weight = float(router_config.get("length_priority_age_weight", 0.1))
-        self.resume_normal_quota = str(router_config.get("resume_normal_quota", "3:1"))
+        self.resume_normal_quota = router_config.get("resume_normal_quota", "3:1")
         self.normal_max_queue_wait_s = float(router_config.get("normal_max_queue_wait_s", 0.0))
         self.resume_max_queue_wait_s = float(router_config.get("resume_max_queue_wait_s", 0.0))
         self.enable_adaptive_quota = bool(router_config.get("enable_adaptive_quota", False))
@@ -1190,8 +1225,19 @@ class EnvAffinityRouter(Router):
         self.enable_trajectory_value_scheduling = bool(
             router_config.get("enable_trajectory_value_scheduling", False)
         )
+        self.enable_system_cost_resume_scheduling = bool(
+            router_config.get("enable_system_cost_resume_scheduling", False)
+        )
+        if self.enable_system_cost_resume_scheduling and self.enable_trajectory_value_scheduling:
+            logger.warning(
+                "Both enable_system_cost_resume_scheduling and enable_trajectory_value_scheduling are true; "
+                "system-cost scoring will take precedence for resume ordering/placement/lease."
+            )
         self.trajectory_value_weights = TrajectoryValueWeights.from_config(
             router_config.get("trajectory_value_weights", {})
+        )
+        self.system_cost_weights = SystemCostWeights.from_config(
+            router_config.get("system_cost_weights", {})
         )
         self.learning_penalty_weights = LearningPenaltyWeights.from_config(
             router_config.get("learning_penalty_weights", {})
@@ -1229,15 +1275,21 @@ class EnvAffinityRouter(Router):
                 tool_ema_alpha=self.tool_wait_ema_alpha,
             )
         self.scheduling_state = get_trajectory_scheduling_state()
-        if self.enable_trajectory_value_scheduling or self.enable_value_driven_lease:
+        if (
+            self.enable_trajectory_value_scheduling
+            or self.enable_system_cost_resume_scheduling
+            or self.enable_value_driven_lease
+        ):
             set_scheduling_weight_snapshot(
                 SchedulingWeightSnapshot(
                     value_weights=self.trajectory_value_weights,
                     penalty_weights=self.learning_penalty_weights,
                     belief=self.belief_config,
                     lease_weights=self.lease_ttl_weights,
+                    system_cost_weights=self.system_cost_weights,
                     force_migrate_age_s=self.force_migrate_age_s,
                     feedback_hot_downgrade_bias=self.belief_feedback_config.hot_downgrade_bias,
+                    enable_system_cost_resume_scheduling=self.enable_system_cost_resume_scheduling,
                 )
             )
         self.fairness_enable = bool(router_config.get("fairness_enable", False))
@@ -1252,6 +1304,7 @@ class EnvAffinityRouter(Router):
             self.enable_belief_feedback = False
             self.enable_value_driven_lease = False
             self.enable_lookup_resume = False
+            self.enable_system_cost_resume_scheduling = False
             self.enable_gateway_kv_lease_push = False
             self.enable_refresh_resume_priority_on_dispatch = False
             self.normal_max_queue_wait_s = 0.0
@@ -1284,7 +1337,9 @@ class EnvAffinityRouter(Router):
             f"request_score_weights={self.request_score_weights}, "
             f"worker_score_weights={self.resume_score_weights}, "
             f"enable_trajectory_value_scheduling={self.enable_trajectory_value_scheduling}, "
+            f"enable_system_cost_resume_scheduling={self.enable_system_cost_resume_scheduling}, "
             f"trajectory_value_weights={self.trajectory_value_weights}, "
+            f"system_cost_weights={self.system_cost_weights}, "
             f"learning_penalty_weights={self.learning_penalty_weights}, "
             f"belief_config={self.belief_config}, "
             f"enable_belief_feedback={self.enable_belief_feedback}, "
@@ -1521,6 +1576,8 @@ class EnvAffinityRouter(Router):
         route_meta["belief_level"] = level.value
         self.belief_state_counts[level.value] += 1
         self.trajectory_value_sum += priority
+        if self.enable_system_cost_resume_scheduling:
+            return
         for key in ("trajectory_invalid", "trajectory_loop", "trajectory_stall", "trajectory_terminated"):
             try:
                 if float(route_meta.get(key, 0.0) or 0.0) >= 0.5:
@@ -1540,6 +1597,12 @@ class EnvAffinityRouter(Router):
         if st is not None and st.inflight is not None:
             return local + self.gateway_inflight_load_weight * float(st.inflight)
         return local
+
+    def _worker_load_for_last_backend(self, route_meta: Dict[str, Any]) -> float:
+        last_backend_id = route_meta.get("last_backend_id")
+        if isinstance(last_backend_id, int) and 0 <= last_backend_id < len(self.running_requests):
+            return self._worker_load_for_rank(last_backend_id)
+        return 0.0
 
     def _current_worker_loads(self) -> List[float]:
         return [self._worker_load_for_rank(rank) for rank in range(len(self.workers))]
@@ -1598,6 +1661,10 @@ class EnvAffinityRouter(Router):
         route_meta["lookup_estimated_prefill_tokens"] = float(result.estimated_prefill_tokens)
         if result.lease_remaining_s is not None:
             route_meta["lookup_lease_remaining_s"] = float(result.lease_remaining_s)
+            route_meta["ttl_remaining_s"] = float(result.lease_remaining_s)
+        if result.worker_url and result.worker_url in self.worker_urls:
+            route_meta["preferred_worker_url"] = result.worker_url
+            route_meta["last_backend_id"] = self.worker_urls.index(result.worker_url)
         if self.enable_belief_feedback:
             self.scheduling_state.observe_lookup_resume(
                 tid,
@@ -1684,6 +1751,62 @@ class EnvAffinityRouter(Router):
             timeout_s=self.lookup_resume_timeout_s,
         )
 
+    async def _delete_kv_lease_for_trajectory(self, trajectory_id: str) -> bool:
+        gateway_url = getattr(self, "gateway_url", None)
+        if not gateway_url or not trajectory_id:
+            return False
+        headers = {str(k): str(v) for k, v in self.gateway_kv_headers.items()} or None
+        client = getattr(self, "client", None)
+        if client is None:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(self.lookup_resume_timeout_s)) as tmp:
+                return await delete_kv_lease(
+                    tmp,
+                    gateway_url,
+                    trajectory_id,
+                    lease_path_template=self.gateway_kv_lease_delete_path,
+                    headers=headers,
+                    timeout_s=self.lookup_resume_timeout_s,
+                )
+        return await delete_kv_lease(
+            client,
+            gateway_url,
+            trajectory_id,
+            lease_path_template=self.gateway_kv_lease_delete_path,
+            headers=headers,
+            timeout_s=self.lookup_resume_timeout_s,
+        )
+
+    async def set_tool_suspend_lease(self, route_meta: Dict[str, Any]) -> Dict[str, Any]:
+        self._sync_scheduling_meta(route_meta)
+        route_meta.setdefault("request_type", "resume")
+        ttl = route_meta.get("resume_lease_ttl_s") or route_meta.get("pending_resume_lease_ttl_s")
+        score = route_meta.get("resume_lease_score") or route_meta.get("pending_resume_lease_score")
+        if ttl is not None:
+            route_meta["resume_lease_ttl_s"] = ttl
+        if score is not None:
+            route_meta["resume_lease_score"] = score
+        if ttl is None or score is None:
+            level = route_meta.get("belief_level")
+            try:
+                level = BeliefLevel(str(level)) if isinstance(level, str) else BeliefLevel.WARM
+            except ValueError:
+                level = BeliefLevel.WARM
+            p_hit = float(route_meta.get("belief_p_hit", 0.0) or 0.0)
+            v_traj = float(route_meta.get("trajectory_value", 0.0) or 0.0)
+            self._resolve_ttl_s(route_meta, level, p_hit, v_traj)
+        await self._maybe_push_kv_lease(route_meta, phase="tool_suspend")
+        return {
+            "pushed": bool(self.enable_gateway_kv_lease_push and self.enable_value_driven_lease),
+            "trajectory_id": self._trajectory_id_from_route_meta(route_meta),
+            "ttl_s": route_meta.get("resume_lease_ttl_s"),
+            "lease_score": route_meta.get("resume_lease_score"),
+        }
+
+    async def delete_kv_lease(self, trajectory_id: str) -> Dict[str, Any]:
+        deleted = await self._delete_kv_lease_for_trajectory(trajectory_id)
+        self.scheduling_state.clear(trajectory_id)
+        return {"deleted": bool(deleted), "trajectory_id": trajectory_id}
+
     def _p_hit_bias_for_route_meta(self, route_meta: Dict[str, Any]) -> float:
         if not self.enable_belief_feedback:
             return 0.0
@@ -1692,14 +1815,24 @@ class EnvAffinityRouter(Router):
     def _resolve_ttl_s(self, route_meta: Dict[str, Any], level: BeliefLevel, p_hit: float, v_traj: float) -> float:
         if self.enable_value_driven_lease:
             t_tool = self._t_tool_s_for_route_meta(route_meta)
-            ttl, lease_score = compute_lease_ttl(
-                route_meta,
-                p_hit=p_hit,
-                v_traj=v_traj,
-                t_tool_s=t_tool,
-                belief_level=level,
-                weights=self.lease_ttl_weights,
-            )
+            if self.enable_system_cost_resume_scheduling:
+                ttl, lease_score = compute_system_lease_ttl(
+                    route_meta,
+                    p_hit=p_hit,
+                    t_tool_s=t_tool,
+                    belief_level=level,
+                    weights=self.system_cost_weights,
+                    lease_weights=self.lease_ttl_weights,
+                )
+            else:
+                ttl, lease_score = compute_lease_ttl(
+                    route_meta,
+                    p_hit=p_hit,
+                    v_traj=v_traj,
+                    t_tool_s=t_tool,
+                    belief_level=level,
+                    weights=self.lease_ttl_weights,
+                )
             route_meta["resume_lease_score"] = lease_score
             route_meta["resume_lease_ttl_s"] = ttl
             return ttl
@@ -1780,6 +1913,32 @@ class EnvAffinityRouter(Router):
         if request_type != "resume":
             return self.normal_request_base_score
         self._sync_scheduling_meta(route_meta)
+        if self.enable_system_cost_resume_scheduling:
+            p_hit_bias = self._p_hit_bias_for_route_meta(route_meta)
+            queue_wait = 0.0
+            if "resume_enqueue_ts" in route_meta:
+                try:
+                    queue_wait = max(0.0, time.time() - float(route_meta["resume_enqueue_ts"]))
+                except (TypeError, ValueError):
+                    queue_wait = 0.0
+            priority, level, p_hit, dispatch_score = compute_system_order_score(
+                route_meta,
+                belief=self.belief_config,
+                force_migrate_age_s=self.force_migrate_age_s,
+                weights=self.system_cost_weights,
+                worker_load=self._worker_load_for_last_backend(route_meta),
+                queue_wait_s=queue_wait,
+                last_worker_overloaded=self._last_worker_overloaded(route_meta),
+                p_hit_bias=p_hit_bias,
+                feedback_hot_downgrade_bias=self.belief_feedback_config.hot_downgrade_bias,
+            )
+            route_meta["belief_p_hit"] = p_hit
+            route_meta["p_hit_bias"] = p_hit_bias
+            route_meta["trajectory_value"] = priority
+            route_meta["system_dispatch_score"] = dispatch_score
+            self._resolve_ttl_s(route_meta, level, p_hit, priority)
+            self._record_trajectory_value_meta(route_meta, priority, level)
+            return priority
         if self.enable_trajectory_value_scheduling:
             p_hit_bias = self._p_hit_bias_for_route_meta(route_meta)
             priority, level, p_hit = compute_resume_priority(
@@ -1814,6 +1973,10 @@ class EnvAffinityRouter(Router):
 
     def _effective_request_priority(self, pending: PendingTrajectoryRequest) -> float:
         queue_wait = max(0.0, time.time() - pending.enqueue_ts)
+        if self.enable_system_cost_resume_scheduling and pending.request_type == "resume":
+            pending.route_meta["resume_enqueue_ts"] = pending.enqueue_ts
+            pending.base_priority = self._compute_request_base_priority("resume", pending.route_meta)
+            return pending.base_priority
         return pending.base_priority + self.request_wait_aging_weight * queue_wait
 
     @staticmethod
@@ -2031,6 +2194,33 @@ class EnvAffinityRouter(Router):
             ),
         )
 
+    def _select_worker_system_cost(self, pending: PendingTrajectoryRequest) -> Optional[int]:
+        route_meta = pending.route_meta
+        candidate_ranks = [r for r in self.active_dp_ranks if self._has_worker_capacity(r)]
+        if not candidate_ranks:
+            return None
+        level = self._belief_level_from_route_meta(route_meta)
+        last_backend_id = route_meta.get("last_backend_id")
+        if (
+            level == BeliefLevel.HOT
+            and isinstance(last_backend_id, int)
+            and last_backend_id in candidate_ranks
+        ):
+            return last_backend_id
+        if level == BeliefLevel.COLD:
+            return min(candidate_ranks, key=lambda r: self._worker_load_for_rank(r))
+        return max(
+            candidate_ranks,
+            key=lambda r: compute_system_worker_route_score(
+                r,
+                route_meta,
+                belief_level=level,
+                belief=self.belief_config,
+                worker_load=self._worker_load_for_rank(r),
+                weights=self.system_cost_weights,
+            ),
+        )
+
     def _select_worker_for_request(self, pending: PendingTrajectoryRequest) -> Optional[int]:
         src_rank = pending.uid
         request_type = pending.request_type
@@ -2049,6 +2239,8 @@ class EnvAffinityRouter(Router):
                 return min(candidate_ranks, key=lambda r: self._worker_load_for_rank(r))
 
         if self.enable_resume_aware_routing and request_type == "resume":
+            if self.enable_system_cost_resume_scheduling:
+                return self._select_worker_system_cost(pending)
             if self.enable_trajectory_value_scheduling:
                 return self._select_worker_trajectory_value(pending)
             candidate_ranks = [r for r in self.active_dp_ranks if self._has_worker_capacity(r)]
@@ -2297,7 +2489,22 @@ class EnvAffinityRouter(Router):
                         )
                 elif self.enable_resume_aware_routing and request_type == "resume":
                     previous_rank = self.src_rank2_dp_rank.get(src_rank)
-                    dp_rank = self._select_resume_dp_rank(src_rank=src_rank, route_meta=route_meta)
+                    if self.enable_system_cost_resume_scheduling:
+                        pending = PendingTrajectoryRequest(
+                            request_id=request_id,
+                            uid=src_rank,
+                            request_type=request_type,
+                            route_meta=route_meta,
+                            enqueue_ts=enqueue_ts,
+                            enqueue_seq=next(self.request_seq_counter),
+                            base_priority=base_priority,
+                        )
+                        selected_rank = self._select_worker_system_cost(pending)
+                        if selected_rank is None:
+                            raise RuntimeError("No active DP ranks with capacity")
+                        dp_rank = selected_rank
+                    else:
+                        dp_rank = self._select_resume_dp_rank(src_rank=src_rank, route_meta=route_meta)
                     self.src_rank2_dp_rank[src_rank] = dp_rank
                     self.request_id_2_src_rank[request_id] = src_rank
                     self.running_requests[dp_rank].add(request_id)
@@ -2340,10 +2547,17 @@ class EnvAffinityRouter(Router):
                     "max_steps",
                     "remaining_steps_ratio",
                     "trajectory_value",
+                    "order_score",
+                    "dispatch_score",
+                    "system_dispatch_score",
+                    "system_delay_regret",
+                    "expected_prefill_saved",
                     "belief_level",
                     "belief_p_hit",
                     "resume_lease_ttl_s",
                     "resume_lease_score",
+                    "kv_bytes_proxy",
+                    "memory_pressure",
                     "pending_resume_lease_ttl_s",
                     "pending_resume_lease_score",
                 ):
@@ -2974,7 +3188,7 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
             headers["X-ROLL-Request-Type"] = request_type
         if request_type == "resume":
             emit_preferred = True
-            if self.enable_trajectory_value_scheduling:
+            if self.enable_trajectory_value_scheduling or self.enable_system_cost_resume_scheduling:
                 level = self._belief_level_from_route_meta(route_meta)
                 emit_preferred = should_send_preferred_header(level, route_meta)
             last_backend_id = route_meta.get("last_backend_id")
@@ -3017,7 +3231,52 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
             out["selected_worker_url"] = selected_worker_url
         else:
             self._attach_selected_backend_id(chunks, out)
-        for key in ("resume_enqueue_ts", "resume_dispatch_ts", "resume_queue_wait_s"):
+        header_map = {
+            "x-roll-matched-prefix-tokens": "matched_prefix_tokens",
+            "x-roll-estimated-prefill-tokens": "estimated_prefill_tokens",
+            "x-roll-prefill-time-ms": "prefill_time_ms",
+            "x-roll-cache-confidence": "cache_confidence",
+            "x-roll-lease-remaining-s": "ttl_remaining_s",
+            "x-roll-memory-pressure": "memory_pressure",
+        }
+        for header_name, out_key in header_map.items():
+            raw_value = response.headers.get(header_name)
+            if raw_value is None:
+                continue
+            try:
+                out[out_key] = float(raw_value)
+            except ValueError:
+                out[out_key] = raw_value
+        if "matched_prefix_tokens" in out:
+            try:
+                matched_prefix_tokens = float(out["matched_prefix_tokens"])
+                out["actual_hit"] = 1.0 if matched_prefix_tokens > 0 else 0.0
+                history_len = float(route_meta.get("history_len_tokens", 0) or 0)
+                if "resume_prefill_tokens" not in out and history_len > 0:
+                    out["resume_prefill_tokens"] = max(0.0, history_len - matched_prefix_tokens)
+            except (TypeError, ValueError):
+                pass
+        for key in (
+            "resume_enqueue_ts",
+            "resume_dispatch_ts",
+            "resume_queue_wait_s",
+            "trajectory_value",
+            "order_score",
+            "dispatch_score",
+            "system_dispatch_score",
+            "system_delay_regret",
+            "expected_prefill_saved",
+            "belief_level",
+            "belief_p_hit",
+            "kv_bytes_proxy",
+            "memory_pressure",
+            "lookup_resume_found",
+            "lookup_hit_tokens",
+            "lookup_cache_confidence",
+            "lookup_estimated_prefill_tokens",
+            "lookup_lease_remaining_s",
+            "ttl_remaining_s",
+        ):
             if key in route_meta:
                 out[key] = route_meta[key]
         self._attach_selected_backend_affinity_info(route_meta, out)

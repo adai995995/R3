@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 import time
@@ -199,6 +200,7 @@ class TrajEnvManager(BaseEnvManager):
 
     def reset(self) -> RolloutCache:
         if self.trajectory_id:
+            self._delete_current_kv_lease()
             get_trajectory_scheduling_state().clear(self.trajectory_id)
         self.rollout_cache = RolloutCache(env_id=self.env_config['env_id'],
                                           group_id=self.env_config['group_id'],
@@ -244,6 +246,38 @@ class TrajEnvManager(BaseEnvManager):
             **info,
         })
         return self.rollout_cache
+
+    def _call_router_control_sync(self, method_name: str, *args, timeout_s: Optional[float] = None) -> Optional[Any]:
+        """Best-effort call into RouterManager control-plane methods from sync env code."""
+        try:
+            if isinstance(self.generate_scheduler, ray.actor.ActorHandle):
+                obj_ref = getattr(self.generate_scheduler, method_name).remote(*args)
+                return ray.get(obj_ref, timeout=timeout_s) if timeout_s is not None else ray.get(obj_ref)
+            method = getattr(self.generate_scheduler, method_name, None)
+            if method is None:
+                return None
+            result = method(*args)
+            if asyncio.iscoroutine(result):
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                if loop.is_running():
+                    self.logger.debug("Skip %s: event loop already running", method_name)
+                    return None
+                return loop.run_until_complete(result)
+            return result
+        except Exception as e:
+            self.logger.debug("Router control call %s failed: %s", method_name, e)
+            return None
+
+    def _delete_current_kv_lease(self) -> None:
+        if not self.trajectory_id:
+            return
+        result = self._call_router_control_sync("delete_kv_lease", self.trajectory_id, timeout_s=2.0)
+        if isinstance(result, dict):
+            self.logger.debug("delete_kv_lease result for %s: %s", self.trajectory_id, result)
 
     def _is_tool_return_resume_boundary(self, info: Optional[dict[str, Any]]) -> bool:
         """True only when this env step crossed an external tool-wait and returns tool observation (G1)."""
@@ -308,6 +342,7 @@ class TrajEnvManager(BaseEnvManager):
                 history_len_tokens += len(entry["response_ids"])
         route_meta = {
             "trajectory_id": self.trajectory_id,
+            "request_type": "resume",
             "last_backend_id": self._last_backend_id,
             "history_len_tokens": float(history_len_tokens),
             **traj_signals,
@@ -325,7 +360,11 @@ class TrajEnvManager(BaseEnvManager):
             t_tool_s=t_tool,
             p_hit_bias=bias,
             feedback_hot_downgrade_bias=snapshot.feedback_hot_downgrade_bias,
+            use_system_cost=snapshot.enable_system_cost_resume_scheduling,
+            system_cost_weights=snapshot.system_cost_weights,
         )
+        route_meta["resume_lease_ttl_s"] = ttl
+        route_meta["resume_lease_score"] = score
         state.set_pending_tool_lease(
             self.trajectory_id,
             ttl_s=ttl,
@@ -334,6 +373,9 @@ class TrajEnvManager(BaseEnvManager):
         )
         self._pending_resume_lease_ttl_s = ttl
         self._pending_resume_lease_score = score
+        result = self._call_router_control_sync("set_tool_suspend_lease", route_meta, timeout_s=2.0)
+        if isinstance(result, dict):
+            self.logger.debug("set_tool_suspend_lease result for %s: %s", self.trajectory_id, result)
 
     def _scheduling_fields_for_meta(self) -> Dict[str, float]:
         """Fields passed to Router via meta_info (cross Ray actor)."""
@@ -412,6 +454,8 @@ class TrajEnvManager(BaseEnvManager):
         else:
             self._pause_ts = None
             self._next_request_type = "normal"
+        if self.rollout_cache.terminated or self.rollout_cache.truncated:
+            self._delete_current_kv_lease()
         return self.rollout_cache
 
     def make_decision(self, rollout_cache: RolloutCache):
@@ -545,11 +589,30 @@ class TrajEnvManager(BaseEnvManager):
                 "max_steps",
                 "remaining_steps_ratio",
                 "trajectory_value",
+                "order_score",
+                "dispatch_score",
+                "system_dispatch_score",
+                "system_delay_regret",
+                "expected_prefill_saved",
                 "belief_p_hit",
                 "resume_lease_ttl_s",
                 "resume_lease_score",
+                "kv_bytes_proxy",
+                "memory_pressure",
                 "pending_resume_lease_ttl_s",
                 "pending_resume_lease_score",
+                "lookup_resume_found",
+                "lookup_hit_tokens",
+                "lookup_cache_confidence",
+                "lookup_estimated_prefill_tokens",
+                "lookup_lease_remaining_s",
+                "ttl_remaining_s",
+                "actual_hit",
+                "matched_prefix_tokens",
+                "resume_prefill_tokens",
+                "estimated_prefill_tokens",
+                "prefill_time_ms",
+                "cache_confidence",
             ):
                 if key in lm_output.meta_info:
                     value = lm_output.meta_info[key]
@@ -581,11 +644,29 @@ class TrajEnvManager(BaseEnvManager):
                 "max_steps": "last",
                 "remaining_steps_ratio": "mean",
                 "trajectory_value": "mean",
+                "order_score": "mean",
+                "dispatch_score": "mean",
+                "system_dispatch_score": "mean",
+                "system_delay_regret": "mean",
+                "expected_prefill_saved": "mean",
                 "belief_p_hit": "mean",
                 "resume_lease_ttl_s": "mean",
                 "resume_lease_score": "mean",
+                "kv_bytes_proxy": "mean",
+                "memory_pressure": "mean",
                 "pending_resume_lease_ttl_s": "mean",
                 "pending_resume_lease_score": "mean",
+                "lookup_resume_found": "mean",
+                "lookup_hit_tokens": "mean",
+                "lookup_cache_confidence": "mean",
+                "lookup_estimated_prefill_tokens": "mean",
+                "lookup_lease_remaining_s": "mean",
+                "ttl_remaining_s": "mean",
+                "actual_hit": "mean",
+                "matched_prefix_tokens": "mean",
+                "estimated_prefill_tokens": "mean",
+                "prefill_time_ms": "mean",
+                "cache_confidence": "mean",
             })
 
         lm_output.meta_info["stop_reason"] = GenerateStopReason.FINISH

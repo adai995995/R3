@@ -1,0 +1,43 @@
+defaults:
+  - gem_math_hotpotqa_search_ds_sglang
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+qa_agent_system_template: >-
+  You are a retrieval-using QA assistant. You MUST call the search tool exactly
+  once before answering. Use <search>your query</search>. After the search
+  result, answer with a single final line: FINAL: <answer>.
+
+qa_agent_template: >-
+  {observation}
+  First issue one useful <search>...</search> query. After receiving search
+  results, answer with FINAL: <answer>.
+
+checkpoint_config:
+  type: disabled
+
+router_args:
+  router_name: EnvAffinityRouter
+  router_config:
+    routing_policy: prefix_affinity
+    enable_resume_priority: false
+    enable_resume_aware_routing: false
+    enable_request_priority_queue: false
+    hybrid_load_skew_threshold: 2
+    length_priority_weight: 1.0
+    length_priority_age_weight: 0.1
+    resume_normal_quota: 1:1
+
+custom_envs:
+  HotpotQA_with_search:
+    tool_wrapper:
+      tool_configs:
+        - tool_id: search
+          tool_args:
+            search_url: http://127.0.0.1:8000/retrieve
+            timeout: 120
+            api_format: search_r1_json

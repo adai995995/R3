@@ -657,5 +657,25 @@ def postprocess_generate(chunks):
             output_data["finish_reasons"].append(finish_reason)
         else:
             output_data["finish_reasons"].append(finish_reason)
+    # SGLang 0.4.x already reports cached_tokens in meta_info. Surface it under
+    # ROLL's resume telemetry names so belief feedback can use real prefix reuse.
+    meta_infos = [chunk.get("meta_info", {}) for chunk in chunks if isinstance(chunk.get("meta_info"), dict)]
+    if meta_infos:
+        cached_tokens = meta_infos[0].get("matched_prefix_tokens", meta_infos[0].get("cached_tokens"))
+        prompt_tokens = meta_infos[0].get("prompt_tokens")
+        if cached_tokens is not None:
+            output_data["matched_prefix_tokens"] = cached_tokens
+            try:
+                output_data["actual_hit"] = 1.0 if float(cached_tokens or 0) > 0 else 0.0
+            except (TypeError, ValueError):
+                pass
+        if cached_tokens is not None and prompt_tokens is not None:
+            try:
+                output_data["resume_prefill_tokens"] = max(0.0, float(prompt_tokens) - float(cached_tokens))
+            except (TypeError, ValueError):
+                pass
+        for key in ("estimated_prefill_tokens", "prefill_time_ms", "cache_confidence", "worker_url", "selected_worker_url"):
+            if key in meta_infos[0]:
+                output_data[key] = meta_infos[0][key]
     assert len(output_data["finish_reasons"]) == len(output_data["output_token_ids"])
     return output_data
