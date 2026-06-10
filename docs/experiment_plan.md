@@ -47,7 +47,9 @@ router_args:
     enable_resume_priority: true
     enable_resume_aware_routing: true
     enable_request_priority_queue: true
-    resume_normal_quota: [3, 1]  # resume:normal = 3:1
+    enable_system_cost_resume_scheduling: true
+    enable_trajectory_value_scheduling: false
+    resume_normal_quota: "3:1"  # resume:normal = 3:1
     force_migrate_age_s: 30.0
     resume_score_weights:
       age: 1.0

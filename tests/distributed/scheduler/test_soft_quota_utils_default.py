@@ -9,6 +9,8 @@ from roll.distributed.scheduler.soft_quota_utils import (
 
 def test_parse_ratio():
     assert parse_ratio("3:1") == (3, 1)
+    assert parse_ratio([3, 1]) == (3, 1)
+    assert parse_ratio({"resume": 4, "normal": 2}) == (4, 2)
     assert parse_ratio("0:0") == (1, 1)
     assert parse_ratio("") == (1, 1)
     assert parse_ratio("bad") == (1, 1)

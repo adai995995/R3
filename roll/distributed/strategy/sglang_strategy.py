@@ -8,6 +8,7 @@ import pathlib
 import random
 import setproctitle
 import inspect
+from typing import Optional
 
 import ray
 import httpx
@@ -368,6 +369,35 @@ class SgLangStrategy(InferenceStrategy):
     async def flush_cache(self):
         await self.model.flush_cache()
 
+    async def set_kv_lease(
+        self,
+        trajectory_id: str,
+        ttl_s: float,
+        lease_score: float,
+        belief_level: Optional[str] = None,
+    ) -> dict:
+        fn = getattr(self.model, "set_kv_lease", None)
+        if fn is None:
+            return {"ok": False, "trajectory_id": trajectory_id}
+        return await fn(
+            trajectory_id=trajectory_id,
+            ttl_s=ttl_s,
+            lease_score=lease_score,
+            belief_level=belief_level,
+        )
+
+    async def lookup_kv_resume(self, trajectory_id: str) -> dict:
+        fn = getattr(self.model, "lookup_kv_resume", None)
+        if fn is None:
+            return {"found": False, "trajectory_id": trajectory_id}
+        return await fn(trajectory_id)
+
+    async def delete_kv_lease(self, trajectory_id: str) -> dict:
+        fn = getattr(self.model, "delete_kv_lease", None)
+        if fn is None:
+            return {"ok": False, "deleted": False, "trajectory_id": trajectory_id}
+        return await fn(trajectory_id)
+
     async def load_states(self, *args, **kwargs):
         await self.flush_cache()
         tags = []
@@ -460,6 +490,49 @@ class SglangEngine:
 
     async def flush_cache(self):
         await self.engine.tokenizer_manager.flush_cache()
+
+    async def set_kv_lease(
+        self,
+        trajectory_id: str,
+        ttl_s: float,
+        lease_score: float,
+        belief_level: Optional[str] = None,
+    ) -> dict:
+        ret = await self.engine.tokenizer_manager.set_kv_lease(
+            trajectory_id=trajectory_id,
+            ttl_s=float(ttl_s),
+            lease_score=float(lease_score),
+            belief_level=belief_level,
+        )
+        return {
+            "ok": bool(ret.ok),
+            "trajectory_id": ret.trajectory_id,
+            "expires_at_ms": int(ret.expires_at_ms),
+            "resident_blocks": int(ret.resident_blocks),
+            "lease_score": float(ret.lease_score),
+            "message": ret.message,
+        }
+
+    async def lookup_kv_resume(self, trajectory_id: str) -> dict:
+        ret = await self.engine.tokenizer_manager.lookup_kv_resume(trajectory_id)
+        return {
+            "found": bool(ret.found),
+            "trajectory_id": ret.trajectory_id,
+            "lease_remaining_s": float(ret.lease_remaining_s),
+            "hit_tokens": int(ret.hit_tokens),
+            "resident_blocks": int(ret.resident_blocks),
+            "estimated_prefill_tokens": int(ret.estimated_prefill_tokens),
+            "cache_confidence": float(ret.cache_confidence),
+            "memory_pressure": float(ret.memory_pressure),
+        }
+
+    async def delete_kv_lease(self, trajectory_id: str) -> dict:
+        ret = await self.engine.tokenizer_manager.delete_kv_lease(trajectory_id)
+        return {
+            "ok": bool(ret.ok),
+            "deleted": bool(ret.deleted),
+            "trajectory_id": ret.trajectory_id,
+        }
 
 def shutdown():
     kill_process_tree(os.getpid(), include_parent=False)
@@ -672,9 +745,20 @@ def postprocess_generate(chunks):
         if cached_tokens is not None and prompt_tokens is not None:
             try:
                 output_data["resume_prefill_tokens"] = max(0.0, float(prompt_tokens) - float(cached_tokens))
+                output_data["prefill_ratio"] = output_data["resume_prefill_tokens"] / max(
+                    float(prompt_tokens), 1.0
+                )
             except (TypeError, ValueError):
                 pass
-        for key in ("estimated_prefill_tokens", "prefill_time_ms", "cache_confidence", "worker_url", "selected_worker_url"):
+        for key in (
+            "estimated_prefill_tokens",
+            "prefill_time_ms",
+            "cache_confidence",
+            "memory_pressure",
+            "lease_remaining_s",
+            "worker_url",
+            "selected_worker_url",
+        ):
             if key in meta_infos[0]:
                 output_data[key] = meta_infos[0][key]
     assert len(output_data["finish_reasons"]) == len(output_data["output_token_ids"])

@@ -531,6 +531,35 @@ class InferWorker(Worker):
 
     async def abort_requests(self, request_ids):
         await self.strategy.abort_requests(request_ids)
+
+    async def set_kv_lease(
+        self,
+        trajectory_id: str,
+        ttl_s: float,
+        lease_score: float,
+        belief_level: Optional[str] = None,
+    ) -> dict:
+        fn = getattr(self.strategy, "set_kv_lease", None)
+        if fn is None:
+            return {"ok": False, "trajectory_id": trajectory_id}
+        return await fn(
+            trajectory_id=trajectory_id,
+            ttl_s=ttl_s,
+            lease_score=lease_score,
+            belief_level=belief_level,
+        )
+
+    async def lookup_kv_resume(self, trajectory_id: str) -> dict:
+        fn = getattr(self.strategy, "lookup_kv_resume", None)
+        if fn is None:
+            return {"found": False, "trajectory_id": trajectory_id}
+        return await fn(trajectory_id)
+
+    async def delete_kv_lease(self, trajectory_id: str) -> dict:
+        fn = getattr(self.strategy, "delete_kv_lease", None)
+        if fn is None:
+            return {"ok": False, "deleted": False, "trajectory_id": trajectory_id}
+        return await fn(trajectory_id)
     
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     async def process_weights_after_loading(self):

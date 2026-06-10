@@ -17,6 +17,7 @@
 ### 调度与价值
 
 - `roll/distributed/scheduler/trajectory_value.py` — `V_sys`、`V_learn_neg`、`compute_resume_priority`、`compute_lease_ttl`、`plan_tool_suspend_lease`
+- `roll/distributed/scheduler/trajectory_value.py` — `enable_system_cost_resume_scheduling` 路径新增 `dispatch_score` / `order_score` / system-cost lease，语义质量信号不进入核心 priority
 - `roll/pipeline/agentic/trajectory_signals.py` — invalid/loop/stall/term
 - `roll/distributed/scheduler/router.py` — `EnvAffinityRouter` / `SglangOrderingRouter` 集成
 - `roll/distributed/scheduler/resume_state.py` — `p_hit_bias`、`t_tool` EMA、`observe_resume_outcome`、`observe_lookup_resume`
@@ -34,16 +35,16 @@
   - `set_kv_lease()` → `POST {gateway}/kv/lease`
   - `delete_kv_lease()` → `DELETE {gateway}/kv/lease/{trajectory_id}`
 
-### Form B 下行
+### Gateway 可选下行（L2/L3 控制面）
 
-- HTTP headers：`X-ROLL-Resume-Lease-Ttl-S`、`Lease-Score`、`Belief-Level`、`Request-Type`、`Preferred-Worker-Url`（HOT）
-- `enable_gateway_kv_lease_push` 时额外 `POST /kv/lease`（引擎无接口则 debug 日志、不报错）
+- `enable_gateway_kv_lease_push` 时 `POST /kv/lease`；`enable_lookup_resume` 时 `GET /kv/resume/{tid}`（需 `gateway_url` 或 `gateway_status_url`）
+- 主路径 placement 在 **`EnvAffinityRouter` + `enable_system_cost_resume_scheduling`**，不依赖 gateway 选 worker
 
 ### 其它
 
 - `enable_refresh_resume_priority_on_dispatch` — 派发前刷新 resume `base_priority`
 - `gateway_inflight_load_weight` — placement 时融合 gateway `inflight`（可选）
-- 示例 yaml：`gem_math_hotpotqa_search_ds_sglang_router_trajectory_value.yaml`、`..._form_b_trajectory_value.yaml`
+- 示例 yaml：`toolcall_benchmark_resume_aware.yaml`、`gem_math_hotpotqa_search_ds_sglang_router_trajectory_value.yaml`
 - 单测：`test_trajectory_value.py`、`test_resume_state.py`
 
 ---
@@ -53,10 +54,11 @@
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `enable_trajectory_value_scheduling` | false | L1 主开关 |
+| `enable_system_cost_resume_scheduling` | false | 系统成本调度开关；启用时优先使用 dispatch/order/lease score，避免语义质量负反馈 |
 | `enable_belief_feedback` | false | `p_hit_bias` EWMA |
 | `enable_value_driven_lease` | false | 动态 TTL + lease header |
 | `enable_lookup_resume` | false | L2 调度前 GET（需 `gateway_url` 或 `gateway_status_url`） |
-| `enable_gateway_kv_lease_push` | false | L3 POST lease（Form B） |
+| `enable_gateway_kv_lease_push` | false | L3 POST lease（需 gateway 控制面） |
 | `enable_refresh_resume_priority_on_dispatch` | false | 队列派发前重算 priority |
 | `gateway_kv_lookup_path` | `/kv/resume/{trajectory_id}` | |
 | `gateway_kv_lease_path` | `/kv/lease` | |
@@ -100,6 +102,8 @@
 
 ## 相关文档
 
+- [system_cost_resume_scheduling_design.md](./system_cost_resume_scheduling_design.md)（替代设计：调度只优化系统成本，移除语义质量负反馈）
+- [real_hit_kv_pin_design.md](./real_hit_kv_pin_design.md)（Phase C：真实 prefix hit；Phase D：真实 KV pin）
 - [trajectory_value_scheduling.md](./trajectory_value_scheduling.md)
 - [idea_hierarchical.md](./idea_hierarchical.md)
 - [experiment_plan.md](./experiment_plan.md)（建议按 A0–A4 更新 Treatment 配置）

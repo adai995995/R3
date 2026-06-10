@@ -25,6 +25,10 @@ class TrajectorySchedulingRecord:
     pending_tool_lease_ttl_s: Optional[float] = None
     pending_tool_lease_score: Optional[float] = None
     pending_tool_lease_backend_id: Optional[int] = None
+    last_p_hit_measured: Optional[float] = None
+    last_matched_prefix_tokens: Optional[float] = None
+    last_context_class: Optional[str] = None
+    last_lease_backend_id: Optional[int] = None
 
 
 @dataclass
@@ -102,6 +106,33 @@ class TrajectorySchedulingState:
                 return self._default_t_tool_s
             return float(rec.t_tool_ema_s)
 
+    def get_pending_lease_backend_id(self, trajectory_id: Optional[str]) -> Optional[int]:
+        if not trajectory_id:
+            return None
+        with self._lock:
+            rec = self._records.get(trajectory_id)
+            if rec is None:
+                return None
+            return rec.pending_tool_lease_backend_id
+
+    def get_lease_backend_id(self, trajectory_id: Optional[str]) -> Optional[int]:
+        if not trajectory_id:
+            return None
+        with self._lock:
+            rec = self._records.get(trajectory_id)
+            if rec is None:
+                return None
+            if rec.pending_tool_lease_backend_id is not None:
+                return rec.pending_tool_lease_backend_id
+            return rec.last_lease_backend_id
+
+    def set_last_lease_backend_id(self, trajectory_id: str, backend_id: Optional[int]) -> None:
+        if not trajectory_id:
+            return
+        with self._lock:
+            rec = self._records.setdefault(trajectory_id, TrajectorySchedulingRecord())
+            rec.last_lease_backend_id = backend_id
+
     def sync_from_route_meta(self, trajectory_id: str, route_meta: Dict[str, Any]) -> None:
         """Apply scheduling fields from env meta (cross-process Router/Env)."""
         with self._lock:
@@ -125,6 +156,40 @@ class TrajectorySchedulingState:
                 a = self._tool_ema_alpha
                 rec.t_tool_ema_s = a * wait_s + (1.0 - a) * rec.t_tool_ema_s
 
+    def apply_last_engine_telemetry(self, trajectory_id: str, route_meta: Dict[str, Any]) -> None:
+        """Inject last resume engine telemetry for scoring the next resume."""
+        if not trajectory_id:
+            return
+        with self._lock:
+            rec = self._records.get(trajectory_id)
+            if rec is None:
+                return
+            if rec.last_p_hit_measured is not None:
+                route_meta["p_hit_measured"] = rec.last_p_hit_measured
+                route_meta["engine_cache_confidence"] = rec.last_p_hit_measured
+            if rec.last_matched_prefix_tokens is not None:
+                route_meta["matched_prefix_tokens"] = rec.last_matched_prefix_tokens
+            if rec.last_context_class:
+                route_meta["last_context_class"] = rec.last_context_class
+
+    def record_resume_engine_telemetry(
+        self,
+        trajectory_id: str,
+        *,
+        p_hit_measured: Optional[float],
+        matched_prefix_tokens: Optional[float],
+        context_class: str,
+    ) -> None:
+        if not trajectory_id:
+            return
+        with self._lock:
+            rec = self._records.setdefault(trajectory_id, TrajectorySchedulingRecord())
+            if p_hit_measured is not None:
+                rec.last_p_hit_measured = max(0.0, min(1.0, float(p_hit_measured)))
+            if matched_prefix_tokens is not None:
+                rec.last_matched_prefix_tokens = max(0.0, float(matched_prefix_tokens))
+            rec.last_context_class = context_class
+
     def observe_resume_outcome(
         self,
         trajectory_id: str,
@@ -136,7 +201,7 @@ class TrajectorySchedulingState:
     ) -> None:
         with self._lock:
             rec = self._records.setdefault(trajectory_id, TrajectorySchedulingRecord())
-            if affinity_hit and context_class == "gpu_hit":
+            if context_class == "gpu_hit":
                 rec.p_hit_bias = min(
                     feedback.bias_max,
                     rec.p_hit_bias + feedback.alpha_hit * (1.0 - rec.p_hit_bias),

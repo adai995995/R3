@@ -320,7 +320,17 @@ class TrajEnvManager(BaseEnvManager):
         text = response_text.strip()
         if not text:
             return False
-        return "<tool_call>" in text
+        if "<tool_call>" in text:
+            return True
+        # python_code_tool (GSM8K toolcall benchmark) uses <code>...</code>, not <tool_call>.
+        if "<code>" in text and "</code>" in text:
+            return True
+        if "```python" in text or "```\npython" in text.lower():
+            return True
+        # search_tool (HotpotQA + retrieval) uses <search>...</search>
+        if "<search>" in text and "</search>" in text:
+            return True
+        return False
 
     def _maybe_set_pending_tool_suspend_lease(self) -> None:
         """Register tool-wait KV lease before external tool blocks in env.step (L1 suspend)."""
@@ -343,7 +353,8 @@ class TrajEnvManager(BaseEnvManager):
         route_meta = {
             "trajectory_id": self.trajectory_id,
             "request_type": "resume",
-            "last_backend_id": self._last_backend_id,
+            "last_backend_id": int(self._last_backend_id) if self._last_backend_id is not None else None,
+            "env_id": self.env_config["env_id"],
             "history_len_tokens": float(history_len_tokens),
             **traj_signals,
         }
@@ -413,7 +424,20 @@ class TrajEnvManager(BaseEnvManager):
         self.rollout_cache.history[-1]['reward'] = reward
         self.rollout_cache.history[-1]['llm_response'] = responses[0]
         if info is not None:
+            info = dict(info)
+            step_metrics = info.pop("metrics", None)
+            step_metrics_agg_mode = info.pop("metrics_agg_mode", None)
             self.rollout_cache.history[-1].update(info)
+            if step_metrics is not None:
+                content = self.rollout_cache.history[-1]
+                if "metrics" not in content or not isinstance(content["metrics"], dict):
+                    content["metrics"] = {}
+                content["metrics"].update(step_metrics)
+            if step_metrics_agg_mode is not None:
+                content = self.rollout_cache.history[-1]
+                if "metrics_agg_mode" not in content or not isinstance(content["metrics_agg_mode"], dict):
+                    content["metrics_agg_mode"] = {}
+                content["metrics_agg_mode"].update(step_metrics_agg_mode)
         self.rollout_cache.history[-1]["use_tool"] = is_tool_return
 
         self._update_tool_use_counter_baseline(info)
@@ -505,6 +529,7 @@ class TrajEnvManager(BaseEnvManager):
         )
         lm_input.meta_info.update({
             "trajectory_id": self.trajectory_id,
+            "env_id": self.env_config["env_id"],
             "request_type": request_type,
             "resume_generation": self._resume_generation,
             "pause_ts": self._pause_ts,
@@ -536,7 +561,7 @@ class TrajEnvManager(BaseEnvManager):
             return DataProto(meta_info={"stop_reason": GenerateStopReason.ABORT})
         selected_backend_id = lm_output.meta_info.get("selected_backend_id")
         if selected_backend_id is not None:
-            self._last_backend_id = selected_backend_id
+            self._last_backend_id = int(selected_backend_id)
 
         response_ids = lm_output.batch['responses'][0]
         response_ids = response_ids.tolist()
@@ -584,7 +609,6 @@ class TrajEnvManager(BaseEnvManager):
                 "selected_backend_migration",
                 "worker_load_skew_at_dispatch",
                 "selected_worker_load_at_dispatch",
-                "routing_policy",
                 "remaining_steps",
                 "max_steps",
                 "remaining_steps_ratio",
@@ -613,6 +637,10 @@ class TrajEnvManager(BaseEnvManager):
                 "estimated_prefill_tokens",
                 "prefill_time_ms",
                 "cache_confidence",
+                "prefill_ratio",
+                "engine_cache_confidence",
+                "p_hit_measured",
+                "p_hit_effective",
             ):
                 if key in lm_output.meta_info:
                     value = lm_output.meta_info[key]
@@ -620,6 +648,9 @@ class TrajEnvManager(BaseEnvManager):
                         content["metrics"][key] = float(value)
                     except (TypeError, ValueError):
                         content["metrics"][key] = value
+            context_class = lm_output.meta_info.get("context_class")
+            if isinstance(context_class, str):
+                content["resume_context_class"] = context_class
             if "resume_queue_wait_s" in lm_output.meta_info:
                 self._resume_queue_wait_samples.append(float(lm_output.meta_info["resume_queue_wait_s"]))
             content["metrics_agg_mode"].update({
@@ -667,6 +698,10 @@ class TrajEnvManager(BaseEnvManager):
                 "estimated_prefill_tokens": "mean",
                 "prefill_time_ms": "mean",
                 "cache_confidence": "mean",
+                "prefill_ratio": "mean",
+                "engine_cache_confidence": "mean",
+                "p_hit_measured": "mean",
+                "p_hit_effective": "mean",
             })
 
         lm_output.meta_info["stop_reason"] = GenerateStopReason.FINISH
@@ -726,7 +761,10 @@ class TrajEnvManager(BaseEnvManager):
         """
 
         """
-        if 'observation' in rollout_cache.history[-1]:
+        # Drop only the trailing placeholder (tool-return observation before resume
+        # generate). Keep completed turns that already have llm_response/metrics.
+        last_hist = rollout_cache.history[-1]
+        if "observation" in last_hist and not last_hist.get("llm_response"):
             rollout_cache.history.pop(-1)
         history = rollout_cache.history[:-1]
         last_cache = copy.deepcopy(rollout_cache.history[-1])

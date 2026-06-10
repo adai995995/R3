@@ -31,7 +31,7 @@ tool-return
 1. **Resume Request**：仅在 tool-return 边界标注 `request_type=resume`（G1）。
 2. **Belief**：`p_hit` 是「低成本恢复的主观概率」，不是后端实测值（见主文档 §4）。
 3. **路由三分支**：
-   - **HOT**：直送 `last_worker`；Form B 发 preferred header。
+   - **HOT**：直送 `last_worker`（`EnvAffinityRouter` + system-cost placement）。
    - **WARM**：比较 `route_score(last)` vs 其它 worker。
    - **COLD**：放弃强亲和，load-aware。
 4. **轨迹价值**：`V_sys`（恢复收益−重算−负载）+ `V_learn_neg`（invalid/loop/stall/term 只减不加）。

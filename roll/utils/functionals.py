@@ -1010,13 +1010,17 @@ def aggregate_metrics(history_metrics: List[Dict], metrics_agg_mode: Dict[str, s
     Returns:
         Dictionary of aggregated metrics
     """
-    # Collect all metrics from history
+    # Collect all metrics from history (skip non-numeric values, e.g. routing_policy strings)
     all_metrics = {}
     for metrics in history_metrics:
         for k, v in metrics.items():
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
             if k not in all_metrics:
                 all_metrics[k] = []
-            all_metrics[k].append(float(v))
+            all_metrics[k].append(fv)
 
     # Aggregate metrics based on mode
     aggregated_metrics = {}

@@ -2,6 +2,8 @@
 
 本文档定义 ROLL 侧 **轨迹调度价值** `V_traj` 的计算、与 **Recoverability Belief** 的关系，以及如何与推理引擎（SGLang / sgl-model-gateway）的 **KV TTL / Lease** 协同。与分层路线见 [idea_hierarchical.md](./idea_hierarchical.md)；与 CacheTTL 对照见 [§8](#8-与-cachettl-的对照与扩展)。
 
+> 设计更新：本文保留当前已实现的 `V_traj = V_sys + V_learn_neg` 方案。若要将调度器严格限定为系统成本优化器，并移除 loop / stall / low-quality trajectory 等语义质量信号对 priority 的影响，见替代设计 [system_cost_resume_scheduling_design.md](./system_cost_resume_scheduling_design.md)。
+
 ---
 
 ## 1. 目标与边界
@@ -13,9 +15,8 @@
 | 决策层 | 当前/计划用途 |
 |---|---|
 | **Ordering** | resume/normal 谁先进入推理队列 |
-| **Placement** | resume 路由到哪台 worker（`EnvAffinityRouter`） |
-| **Gateway hint** | 是否发 `X-ROLL-Preferred-Worker-Url`（Form B，belief=HOT） |
-| **KV Lease / TTL**（计划） | 将 `V_traj` 透传引擎，指导 tool-wait 期间 KV 保留时长与淘汰优先级 |
+| **Placement** | resume 路由到哪台 worker（`EnvAffinityRouter` + system-cost `dispatch_score`） |
+| **KV Lease / TTL**（计划） | 将 lease/TTL 经 gateway 控制面或引擎 API 下发，指导 tool-wait 期间 KV 保留 |
 
 ### 1.2 非目标（硬边界）
 
@@ -100,8 +101,6 @@ V_traj = V_sys + V_learn_neg
 
 1. **离散策略**：HOT 直送 last_worker；COLD least-load；WARM 比较 `route_score`。
 2. **连续 `p_hit`**：进入 `V_sys` 的收益项 `+ w_p·p_hit·ñ_h` 与代价项 `- w_c·(1-p_hit)·ñ_h`。
-
-Form B：仅 **belief=HOT** 时发 `X-ROLL-Preferred-Worker-Url`。
 
 ### 4.5 反馈闭环（计划增强）
 
@@ -258,7 +257,7 @@ if belief == HOT and lease_score > θ:
 
 **时机**：LLM decode 结束、**进入 tool suspend** 时（等价 CacheTTL 的 tool-call handler on_leave）。
 
-**HTTP（Form B / gateway）**：
+**HTTP（gateway 控制面，可选）**：
 
 ```http
 X-ROLL-Trajectory-Id: <trajectory_id>
@@ -278,7 +277,7 @@ GET  /kv/lease/{rid}  -> { remaining_s, lease_score }
 
 ### 7.5 与 ROLL 控制面的关系
 
-当前 `ContextLifecycleManager`（`SglangOrderingRouter`）：
+当前 `ContextLifecycleManager`（可选，与 gateway 联调时）：
 
 - `pin_context` / `retain_context` / `offload_context` / `context_ttl_s`
 - **不保证** 真实 SGLang KV 被保留（见 `resume_aware_context_fix_changes.md`）
@@ -320,7 +319,7 @@ GET  /kv/lease/{rid}  -> { remaining_s, lease_score }
 - `compute_lease_ttl(route_meta, p_hit, v_traj, t_tool_s, belief_level)` 与 `V_traj` 同源。
 - `t_tool_s` 来自 `TrajectorySchedulingState` 的 `external_wait_s` EWMA。
 - `ContextLifecycleManager.retain/pin` 使用动态 `ttl_s`，不再固定 `context_ttl_s`（当 `enable_value_driven_lease=true`）。
-- Form B 下发 header：`X-ROLL-Resume-Lease-Ttl-S`、`X-ROLL-Resume-Lease-Score`、`X-ROLL-Belief-Level`（引擎消费为 P1/P2）。
+- 可选经 gateway 下发 header：`X-ROLL-Resume-Lease-Ttl-S`、`X-ROLL-Resume-Lease-Score`、`X-ROLL-Belief-Level`（引擎消费为 P1/P2）。
 
 配置：`enable_value_driven_lease: true`
 
@@ -343,8 +342,8 @@ GET  /kv/lease/{rid}  -> { remaining_s, lease_score }
 
 示例 yaml：
 
-- `examples/.../gem_math_hotpotqa_search_ds_sglang_router_trajectory_value.yaml`
-- `examples/.../gem_math_hotpotqa_search_ds_sglang_router_form_b_trajectory_value.yaml`
+- `examples/toolcall_benchmark/toolcall_benchmark_resume_aware.yaml`
+- `examples/qwen3_agentic_gem/gem_math_hotpotqa_search_ds_sglang_router_trajectory_value.yaml`
 
 ### 10.2 计划配置（引擎侧）
 
@@ -376,7 +375,7 @@ GET  /kv/lease/{rid}  -> { remaining_s, lease_score }
 **Resume 效果**（见 `key_indicator.md`）：
 
 - `resume_latency_e2e_s`、`resume_prefill_tokens`
-- `selected_backend_affinity_hit_rate`（Form B 用 gateway 闭环指标）
+- `scheduler/router/resume_affinity_hit_rate`（ROLL 选 worker 闭环）
 
 **Lease（计划）**：
 

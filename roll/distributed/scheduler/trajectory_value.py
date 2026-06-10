@@ -260,9 +260,10 @@ def p_hit_for_worker(
     *,
     belief_level: BeliefLevel,
     belief: BeliefConfig,
+    p_hit_base: Optional[float] = None,
 ) -> float:
     last_backend_id = route_meta.get("last_backend_id")
-    base = belief_to_p_hit(belief_level, belief)
+    base = p_hit_base if p_hit_base is not None else belief_to_p_hit(belief_level, belief)
     if isinstance(last_backend_id, int) and last_backend_id == dp_rank:
         return base
     if belief_level == BeliefLevel.HOT:
@@ -382,6 +383,121 @@ def classify_system_cost_belief(
     return BeliefLevel.WARM
 
 
+@dataclass
+class EngineTelemetryConfig:
+    """Phase C: engine-measured prefix hit for system-cost scoring."""
+
+    measured_weight: float = 0.7
+    hit_ratio_threshold: float = 0.3
+    full_prefill_ratio: float = 0.85
+
+    @classmethod
+    def from_config(cls, cfg: Optional[Dict]) -> "EngineTelemetryConfig":
+        cfg = cfg or {}
+        return cls(
+            measured_weight=float(cfg.get("engine_telemetry_measured_weight", cfg.get("measured_weight", cls.measured_weight))),
+            hit_ratio_threshold=float(
+                cfg.get("engine_telemetry_hit_ratio_threshold", cfg.get("hit_ratio_threshold", cls.hit_ratio_threshold))
+            ),
+            full_prefill_ratio=float(
+                cfg.get("engine_telemetry_full_prefill_ratio", cfg.get("full_prefill_ratio", cls.full_prefill_ratio))
+            ),
+        )
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def apply_resume_engine_telemetry(
+    route_meta: Dict[str, Any],
+    out: Dict[str, Any],
+    *,
+    config: EngineTelemetryConfig,
+) -> bool:
+    """Copy worker prefix-cache telemetry into route_meta/out. Returns True if measured."""
+    matched = _float_or_none(out.get("matched_prefix_tokens"))
+    if matched is None:
+        return False
+    history_len = max(1.0, _float_meta(route_meta, "history_len_tokens"))
+    prefill = _float_or_none(out.get("resume_prefill_tokens"))
+    if prefill is None:
+        prompt_tokens = _float_or_none(out.get("prompt_tokens"))
+        if prompt_tokens is not None:
+            prefill = max(0.0, prompt_tokens - matched)
+        else:
+            prefill = max(0.0, history_len - matched)
+    prefill_ratio = prefill / history_len
+    hit_ratio = max(0.0, min(1.0, matched / history_len))
+    out["matched_prefix_tokens"] = matched
+    out["resume_prefill_tokens"] = prefill
+    out["prefill_ratio"] = prefill_ratio
+    out["actual_hit"] = 1.0 if matched > 0 else 0.0
+    out["engine_cache_confidence"] = hit_ratio
+    route_meta["matched_prefix_tokens"] = matched
+    route_meta["resume_prefill_tokens"] = prefill
+    route_meta["prefill_ratio"] = prefill_ratio
+    route_meta["actual_hit"] = out["actual_hit"]
+    route_meta["engine_cache_confidence"] = hit_ratio
+    route_meta["p_hit_measured"] = hit_ratio
+    out["p_hit_measured"] = hit_ratio
+    return True
+
+
+def compute_p_hit_measured(route_meta: Dict[str, Any]) -> Optional[float]:
+    raw = route_meta.get("p_hit_measured")
+    if raw is None:
+        raw = route_meta.get("engine_cache_confidence")
+    return _float_or_none(raw)
+
+
+def classify_resume_context_class(
+    route_meta: Dict[str, Any],
+    *,
+    affinity_hit: bool,
+    config: EngineTelemetryConfig,
+) -> str:
+    """Classify resume cache outcome from engine telemetry (not bare affinity)."""
+    history_len = max(1.0, _float_meta(route_meta, "history_len_tokens"))
+    matched = _float_or_none(route_meta.get("matched_prefix_tokens"))
+    prefill_ratio = _float_or_none(route_meta.get("prefill_ratio"))
+    if prefill_ratio is None and matched is not None:
+        prefill_ratio = max(0.0, history_len - matched) / history_len
+    if prefill_ratio is None:
+        prefill_ratio = 1.0
+    if matched is not None:
+        hit_ratio = matched / history_len
+    else:
+        measured = compute_p_hit_measured(route_meta)
+        hit_ratio = measured if measured is not None else 0.0
+    if hit_ratio >= config.hit_ratio_threshold:
+        return "gpu_hit"
+    if prefill_ratio >= config.full_prefill_ratio:
+        return "full_prefill"
+    if affinity_hit and hit_ratio > 0:
+        return "cpu_reload"
+    return "full_prefill"
+
+
+def merge_effective_p_hit(
+    p_hit_belief: float,
+    route_meta: Dict[str, Any],
+    *,
+    measured_weight: float,
+    enabled: bool,
+) -> float:
+    measured = compute_p_hit_measured(route_meta)
+    if not enabled or measured is None:
+        return p_hit_belief
+    w_m = max(0.0, min(1.0, float(measured_weight)))
+    return w_m * measured + (1.0 - w_m) * p_hit_belief
+
+
 def compute_history_prefill_cost(route_meta: Dict[str, Any], *, weights: SystemCostWeights) -> float:
     """Normalized proxy for the prefill cost saved by a KV/prefix hit."""
     return _norm_log(_float_meta(route_meta, "history_len_tokens"), weights.prefill_h_max)
@@ -418,6 +534,8 @@ def compute_system_order_score(
     last_worker_overloaded: bool = False,
     p_hit_bias: float = 0.0,
     feedback_hot_downgrade_bias: float = -0.15,
+    enable_engine_telemetry: bool = False,
+    engine_telemetry_measured_weight: float = 0.7,
 ) -> tuple[float, BeliefLevel, float, float]:
     """Ordering score for resume requests under system-cost design.
 
@@ -431,7 +549,15 @@ def compute_system_order_score(
     )
     if level == BeliefLevel.HOT and p_hit_bias <= feedback_hot_downgrade_bias:
         level = BeliefLevel.WARM
-    p_hit = apply_p_hit_bias(belief_to_p_hit(level, belief), p_hit_bias, belief=belief)
+    p_hit_belief = apply_p_hit_bias(belief_to_p_hit(level, belief), p_hit_bias, belief=belief)
+    p_hit = merge_effective_p_hit(
+        p_hit_belief,
+        route_meta,
+        measured_weight=engine_telemetry_measured_weight,
+        enabled=enable_engine_telemetry,
+    )
+    route_meta["p_hit_belief"] = p_hit_belief
+    route_meta["p_hit_effective"] = p_hit
     dispatch_score, expected_saved = compute_system_dispatch_score(
         route_meta,
         p_hit=p_hit,
@@ -468,8 +594,16 @@ def compute_system_worker_route_score(
     belief: BeliefConfig,
     worker_load: float,
     weights: SystemCostWeights,
+    p_hit_base: Optional[float] = None,
 ) -> float:
-    p_w = p_hit_for_worker(dp_rank, route_meta, belief_level=belief_level, belief=belief)
+    base = p_hit_base if p_hit_base is not None else _float_or_none(route_meta.get("p_hit_effective"))
+    p_w = p_hit_for_worker(
+        dp_rank,
+        route_meta,
+        belief_level=belief_level,
+        belief=belief,
+        p_hit_base=base,
+    )
     score, expected_saved = compute_system_dispatch_score(
         route_meta,
         p_hit=p_w,
@@ -493,7 +627,8 @@ def compute_system_lease_ttl(
     """System-cost TTL/lease score from prefill benefit minus memory byte-seconds."""
     t_min = max(0.0, lease_weights.t_tool_min)
     t_max = max(t_min, lease_weights.t_tool_max)
-    t_tool = max(0.1, float(t_tool_s))
+    # Do not let tiny t_tool_ema (e.g. local BM25 ms waits) drive TTL below t_tool_min.
+    t_tool = max(t_min, max(0.1, float(t_tool_s)))
     candidates = sorted({
         t_min,
         min(t_max, t_tool),

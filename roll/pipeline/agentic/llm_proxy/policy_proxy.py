@@ -11,6 +11,59 @@ from roll.utils.functionals import (
     concatenate_input_and_output,
 )
 
+# RouterClient._postprocess_generate copies these from worker response; must not
+# be dropped when rebuilding lm_output from the original request meta_info.
+_ROUTER_RESPONSE_META_KEYS = (
+    "selected_backend_id",
+    "selected_worker_url",
+    "resume_enqueue_ts",
+    "resume_dispatch_ts",
+    "resume_queue_wait_s",
+    "context_class_gpu_hit",
+    "context_class_cpu_reload",
+    "context_class_full_prefill",
+    "selected_backend_affinity_hit",
+    "selected_backend_migration",
+    "worker_load_skew_at_dispatch",
+    "selected_worker_load_at_dispatch",
+    "routing_policy",
+    "remaining_steps",
+    "max_steps",
+    "remaining_steps_ratio",
+    "trajectory_value",
+    "order_score",
+    "dispatch_score",
+    "system_dispatch_score",
+    "system_delay_regret",
+    "expected_prefill_saved",
+    "belief_level",
+    "belief_p_hit",
+    "resume_lease_ttl_s",
+    "resume_lease_score",
+    "kv_bytes_proxy",
+    "memory_pressure",
+    "pending_resume_lease_ttl_s",
+    "pending_resume_lease_score",
+    "lookup_resume_found",
+    "lookup_hit_tokens",
+    "lookup_cache_confidence",
+    "lookup_estimated_prefill_tokens",
+    "lookup_lease_remaining_s",
+    "ttl_remaining_s",
+    "actual_hit",
+    "matched_prefix_tokens",
+    "resume_prefill_tokens",
+    "estimated_prefill_tokens",
+    "prefill_time_ms",
+    "cache_confidence",
+    "context_class",
+    "prefill_ratio",
+    "engine_cache_confidence",
+    "p_hit_measured",
+    "p_hit_effective",
+    "p_hit_belief",
+)
+
 
 @register_llm_proxy("policy")
 class PolicyProxy(BaseLLMProxy):
@@ -62,6 +115,9 @@ class PolicyProxy(BaseLLMProxy):
         )
         request_repeat = lm_input.repeat(repeat_times=len(output_tokens))
         lm_output.non_tensor_batch = request_repeat.non_tensor_batch
-        lm_output.meta_info = request_repeat.meta_info
+        lm_output.meta_info = dict(request_repeat.meta_info)
+        for key in _ROUTER_RESPONSE_META_KEYS:
+            if key in response_data.meta_info:
+                lm_output.meta_info[key] = response_data.meta_info[key]
         lm_output.meta_info.pop("generation_config", None)
         return lm_output
