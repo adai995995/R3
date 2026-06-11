@@ -97,6 +97,8 @@ _LOOKUP_ROUTE_META_RESPONSE_KEYS = (
     "lookup_estimated_prefill_tokens",
     "lookup_lease_remaining_s",
     "ttl_remaining_s",
+    "lookup_source",
+    "lookup_worker_confirmed",
 )
 
 def _norm_url(url: str) -> str:
@@ -1846,12 +1848,18 @@ class EnvAffinityRouter(Router):
         route_meta["lookup_hit_tokens"] = float(result.hit_tokens)
         route_meta["lookup_cache_confidence"] = float(result.cache_confidence)
         route_meta["lookup_estimated_prefill_tokens"] = float(result.estimated_prefill_tokens)
+        route_meta["lookup_source"] = result.lookup_source
+        route_meta["lookup_worker_confirmed"] = 1.0 if result.worker_confirmed else 0.0
         if result.lease_remaining_s is not None:
             route_meta["lookup_lease_remaining_s"] = float(result.lease_remaining_s)
             route_meta["ttl_remaining_s"] = float(result.lease_remaining_s)
         if result.memory_pressure is not None:
             route_meta["memory_pressure"] = float(result.memory_pressure)
-        if result.worker_url and result.worker_url in self.worker_urls:
+        if (
+            result.lookup_source != "gateway_local_unconfirmed"
+            and result.worker_url
+            and result.worker_url in self.worker_urls
+        ):
             route_meta["preferred_worker_url"] = result.worker_url
             route_meta["last_backend_id"] = self.worker_urls.index(result.worker_url)
         if self.enable_belief_feedback:
@@ -2104,7 +2112,7 @@ class EnvAffinityRouter(Router):
         self, route_meta: Dict[str, Any]
     ) -> tuple[Optional[float], Optional[float], bool]:
         tid = self._trajectory_id_from_route_meta(route_meta)
-        store_ttl, store_score, _ = self.scheduling_state.pop_pending_tool_lease(tid)
+        store_ttl, store_score, _ = self.scheduling_state.peek_pending_tool_lease(tid)
         return merge_resume_lease_ttl_score(
             route_meta,
             store_pending_ttl=store_ttl,
@@ -2127,6 +2135,7 @@ class EnvAffinityRouter(Router):
             headers["X-ROLL-Belief-Level"] = level
         if used_pending:
             headers["X-ROLL-Lease-Phase"] = "tool_suspend"
+            route_meta["_roll_used_pending_tool_lease"] = True
 
     def _observe_resume_outcome(self, route_meta: Dict[str, Any], out: Dict[str, Any]) -> None:
         if route_meta.get("request_type") != "resume":
@@ -3554,6 +3563,10 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
             await asyncio.sleep(self.gateway_generate_retry_backoff_s * (1.5 ** min(attempt, 8)))
         assert response is not None
         raise_for_status(response)
+        if route_meta.pop("_roll_used_pending_tool_lease", False):
+            self.scheduling_state.consume_pending_tool_lease(
+                self._trajectory_id_from_route_meta(route_meta)
+            )
         raw = response.json()
         chunks = raw if isinstance(raw, list) else [raw]
         out = postprocess_generate(chunks)

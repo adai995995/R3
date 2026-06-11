@@ -37,6 +37,8 @@ class LookupResumeResult:
     lease_remaining_s: Optional[float] = None
     worker_url: Optional[str] = None
     memory_pressure: Optional[float] = None
+    worker_confirmed: bool = False
+    lookup_source: str = "miss"
 
     @classmethod
     def from_json(cls, data: Dict[str, Any]) -> "LookupResumeResult":
@@ -47,6 +49,8 @@ class LookupResumeResult:
         conf = data.get("cache_confidence") or data.get("confidence")
         remaining = data.get("lease_remaining_s") or data.get("remaining_s")
         mem = data.get("memory_pressure")
+        worker_confirmed = data.get("worker_confirmed")
+        lookup_source = data.get("lookup_source")
         return cls(
             found=bool(data.get("found", False)),
             hit_tokens=int(hit) if hit is not None else 0,
@@ -56,6 +60,8 @@ class LookupResumeResult:
             lease_remaining_s=float(remaining) if remaining is not None else None,
             worker_url=data.get("worker_url") if isinstance(data.get("worker_url"), str) else None,
             memory_pressure=float(mem) if mem is not None else None,
+            worker_confirmed=bool(worker_confirmed) if worker_confirmed is not None else False,
+            lookup_source=lookup_source if isinstance(lookup_source, str) and lookup_source else "miss",
         )
 
 
@@ -116,7 +122,11 @@ async def lookup_resume_worker(
             return LookupResumeResult(found=False)
         resp.raise_for_status()
         data = resp.json()
-        return LookupResumeResult.from_json(data if isinstance(data, dict) else {})
+        result = LookupResumeResult.from_json(data if isinstance(data, dict) else {})
+        if result.lookup_source == "miss":
+            result.lookup_source = "worker" if result.found else "miss"
+        result.worker_confirmed = True
+        return result
     except Exception as e:
         logger.debug("lookup_resume_worker failed for %s: %s", trajectory_id, e)
         return LookupResumeResult(found=False)

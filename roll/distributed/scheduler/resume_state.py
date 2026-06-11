@@ -263,7 +263,22 @@ class TrajectorySchedulingState:
             rec.pending_tool_lease_score = max(0.0, min(1.0, float(lease_score)))
             rec.pending_tool_lease_backend_id = backend_id
 
-    def pop_pending_tool_lease(
+    def peek_pending_tool_lease(
+        self, trajectory_id: Optional[str]
+    ) -> tuple[Optional[float], Optional[float], Optional[int]]:
+        if not trajectory_id:
+            return None, None, None
+        with self._lock:
+            rec = self._records.get(trajectory_id)
+            if rec is None:
+                return None, None, None
+            return (
+                rec.pending_tool_lease_ttl_s,
+                rec.pending_tool_lease_score,
+                rec.pending_tool_lease_backend_id,
+            )
+
+    def consume_pending_tool_lease(
         self, trajectory_id: Optional[str]
     ) -> tuple[Optional[float], Optional[float], Optional[int]]:
         if not trajectory_id:
@@ -279,6 +294,11 @@ class TrajectorySchedulingState:
             rec.pending_tool_lease_score = None
             rec.pending_tool_lease_backend_id = None
             return ttl, score, backend
+
+    def pop_pending_tool_lease(
+        self, trajectory_id: Optional[str]
+    ) -> tuple[Optional[float], Optional[float], Optional[int]]:
+        return self.consume_pending_tool_lease(trajectory_id)
 
 
 _GLOBAL_STATE: Optional[TrajectorySchedulingState] = None
