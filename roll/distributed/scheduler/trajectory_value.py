@@ -659,6 +659,141 @@ def compute_system_lease_ttl(
     return best_ttl, lease_score
 
 
+RESUME_WASTE_METRIC_KEYS = (
+    "saved_prefill_tokens",
+    "saved_prefill_ms",
+    "saved_prefill_ms_per_gb_second",
+    "pinned_kv_gb_seconds",
+    "avoidable_reprefill_tokens",
+    "dead_pinned_kv_gb_seconds",
+    "hot_resume_miss_ratio",
+    "locality_mismatch_count",
+    "queue_decay_loss_ms",
+    "queue_decay_loss_proxy",
+    "kv_lease_effective_ttl_s",
+)
+
+
+def _first_float(source: Dict[str, Any], *keys: str) -> Optional[float]:
+    for key in keys:
+        value = _float_or_none(source.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def annotate_resume_waste_metrics(route_meta: Dict[str, Any], out: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach resume-boundary waste metrics to route_meta and output.
+
+    These metrics are intentionally conservative and observation-friendly:
+    they do not change routing decisions, but make the four target wastes
+    measurable from rollout logs.
+    """
+    if not isinstance(route_meta, dict) or not isinstance(out, dict):
+        return {}
+
+    merged: Dict[str, Any] = dict(route_meta)
+    merged.update(out)
+
+    history_len = _first_float(merged, "history_len_tokens", "resume_history_len_tokens")
+    matched_tokens = _first_float(merged, "matched_prefix_tokens", "lookup_hit_tokens")
+    prefill_tokens = _first_float(merged, "resume_prefill_tokens", "estimated_prefill_tokens")
+    if prefill_tokens is None and history_len is not None and matched_tokens is not None:
+        prefill_tokens = max(0.0, history_len - matched_tokens)
+
+    p_hit_effective = _first_float(
+        merged,
+        "p_hit_effective",
+        "p_hit_measured",
+        "belief_p_hit",
+        "lookup_cache_confidence",
+        "cache_confidence",
+    )
+    kv_bytes = _first_float(merged, "kv_bytes", "kv_bytes_proxy")
+    if kv_bytes is None and history_len is not None:
+        kv_bytes_per_token = _first_float(merged, "kv_bytes_per_token")
+        if kv_bytes_per_token is None:
+            kv_bytes_per_token = 2048.0
+        kv_bytes = max(0.0, history_len) * max(0.0, kv_bytes_per_token)
+        metrics_kv_bytes_proxy = kv_bytes
+    else:
+        metrics_kv_bytes_proxy = None
+    lease_ttl = _first_float(
+        merged,
+        "resume_lease_ttl_s",
+        "pending_resume_lease_ttl_s",
+        "ttl_remaining_s",
+        "lookup_lease_remaining_s",
+    )
+    pause_age = _first_float(merged, "pause_age_s")
+    prefill_time_ms = _first_float(merged, "prefill_time_ms")
+    prefill_ms_per_token = _first_float(merged, "prefill_ms_per_token")
+    if prefill_ms_per_token is None and prefill_time_ms is not None and prefill_tokens and prefill_tokens > 0:
+        prefill_ms_per_token = max(0.0, prefill_time_ms / prefill_tokens)
+    if prefill_ms_per_token is None and prefill_tokens and prefill_tokens > 0:
+        engine_start_ts = _first_float(merged, "engine_start_ts")
+        engine_first_token_ts = _first_float(merged, "engine_first_token_ts", "resume_first_token_ts")
+        if engine_start_ts is not None and engine_first_token_ts is not None:
+            ttft_ms = max(0.0, engine_first_token_ts - engine_start_ts) * 1000.0
+            prefill_ms_per_token = ttft_ms / max(1.0, prefill_tokens)
+
+    metrics: Dict[str, Any] = {}
+    if metrics_kv_bytes_proxy is not None:
+        metrics["kv_bytes_proxy"] = metrics_kv_bytes_proxy
+    if matched_tokens is not None:
+        metrics["saved_prefill_tokens"] = max(0.0, matched_tokens)
+    if matched_tokens is not None and prefill_ms_per_token is not None:
+        metrics["saved_prefill_ms"] = max(0.0, matched_tokens) * max(0.0, prefill_ms_per_token)
+
+    effective_ttl = None
+    if lease_ttl is not None and pause_age is not None:
+        effective_ttl = max(0.0, min(lease_ttl, pause_age))
+    elif lease_ttl is not None:
+        effective_ttl = max(0.0, lease_ttl)
+    elif pause_age is not None:
+        effective_ttl = max(0.0, pause_age)
+    if effective_ttl is not None:
+        metrics["kv_lease_effective_ttl_s"] = effective_ttl
+    if kv_bytes is not None and effective_ttl is not None:
+        pinned_gb_seconds = max(0.0, kv_bytes) * max(0.0, effective_ttl) / (1024.0 ** 3)
+        metrics["pinned_kv_gb_seconds"] = pinned_gb_seconds
+        saved_prefill_ms = _float_or_none(metrics.get("saved_prefill_ms"))
+        if saved_prefill_ms is not None and pinned_gb_seconds > 0:
+            metrics["saved_prefill_ms_per_gb_second"] = saved_prefill_ms / pinned_gb_seconds
+
+    if history_len is not None and p_hit_effective is not None and matched_tokens is not None:
+        expected_hit_tokens = max(0.0, min(1.0, p_hit_effective)) * max(0.0, history_len)
+        metrics["avoidable_reprefill_tokens"] = max(0.0, expected_hit_tokens - max(0.0, matched_tokens))
+
+    actual_hit = _first_float(merged, "actual_hit")
+    if actual_hit is None and matched_tokens is not None:
+        actual_hit = 1.0 if matched_tokens > 0 else 0.0
+    pinned_gb_seconds_value = _float_or_none(metrics.get("pinned_kv_gb_seconds"))
+    if actual_hit is not None and actual_hit <= 0.0 and pinned_gb_seconds_value is not None:
+        metrics["dead_pinned_kv_gb_seconds"] = pinned_gb_seconds_value
+
+    belief_level = str(merged.get("belief_level", "")).lower()
+    is_hot_resume = belief_level == "hot" or (pause_age is not None and pause_age <= 5.0)
+    if is_hot_resume:
+        metrics["hot_resume_miss_ratio"] = 0.0 if (actual_hit is not None and actual_hit > 0.0) else 1.0
+
+    last_backend_id = merged.get("last_backend_id")
+    selected_backend_id = merged.get("selected_backend_id")
+    if isinstance(last_backend_id, int) and isinstance(selected_backend_id, int):
+        metrics["locality_mismatch_count"] = 0.0 if last_backend_id == selected_backend_id else 1.0
+
+    delay_regret = _first_float(merged, "system_delay_regret")
+    if delay_regret is not None:
+        metrics["queue_decay_loss_proxy"] = max(0.0, delay_regret)
+        if history_len is not None and prefill_ms_per_token is not None:
+            metrics["queue_decay_loss_ms"] = max(0.0, delay_regret) * max(0.0, history_len) * max(0.0, prefill_ms_per_token)
+
+    for key, value in metrics.items():
+        route_meta[key] = value
+        out[key] = value
+    return metrics
+
+
 def compute_worker_route_score(
     dp_rank: int,
     route_meta: Dict[str, Any],

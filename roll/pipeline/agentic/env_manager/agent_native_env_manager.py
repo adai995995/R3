@@ -15,6 +15,8 @@ from roll.pipeline.agentic.env_manager.base_env_manager import RolloutCache
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.env_manager.token_mask_utils import convert_list_content_str
 from roll.pipeline.agentic.env_manager.traj_env_manager import TrajEnvManager
+from roll.pipeline.agentic.trajectory_signals import compute_trajectory_signals
+from roll.distributed.scheduler.resume_state import get_trajectory_scheduling_state
 from roll.utils.constants import GenerateStopReason, EpisodeStopReason
 from roll.utils.functionals import pad_to_length, aggregate_metrics
 from roll.utils.hash_utils import compute_object_hash
@@ -95,6 +97,9 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         ray.get(self.output_queue.put.remote(self.env_config['group_id'], self.episode_id, start_step, None, self.env_config['env_id']))
 
     def reset(self) -> Optional[RolloutCache]:
+        if getattr(self, "trajectory_id", None):
+            self._delete_current_kv_lease()
+            get_trajectory_scheduling_state().clear(self.trajectory_id)
         self.log_stats = {"generate_time": [], "step_time": [], "current_step": [], "reset_time": 0.0, "response_length": [], "tokens_per_second": []}
         self.stop_reason = EpisodeStopReason.FINISH
         self.rollout_cache = RolloutCache(env_id=self.env_config['env_id'],
@@ -110,6 +115,10 @@ class AgentNativeStepEnvManager(TrajEnvManager):
             return None
 
         seed = self.group_seed + self.episode_id
+        self.trajectory_id = (
+            f"{self.env_config['tag']}_{self.env_config['group_id']}_"
+            f"{self.episode_id}_{self.group_seed}_{self.env_config['env_id']}"
+        )
         self.traj_start_time = time.time()
 
         # Resume-aware runtime state (align with TrajEnvManager).
@@ -120,6 +129,8 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         self._prev_tool_use_counter = None
         self._resume_request_count = 0
         self._resume_mismatch_count = 0
+        self._pending_resume_lease_ttl_s = None
+        self._pending_resume_lease_score = None
 
         observation, info = self.env.reset(seed=seed)
         if observation is None:
@@ -146,7 +157,12 @@ class AgentNativeStepEnvManager(TrajEnvManager):
             response = self.tokenizer.batch_decode(llm_output.batch['responses'], skip_special_tokens=False)[0]
         else:
             response = self.stop_reason
+
+        tool_call_start_ts = time.time()
+        if self._llm_response_may_invoke_tool(response):
+            self._maybe_set_pending_tool_suspend_lease()
         observation, reward, terminated, truncated, info = self.env.step(action=response)
+        tool_return_ts = time.time()
 
         is_tool_return = self._is_tool_return_resume_boundary(info)
 
@@ -173,11 +189,34 @@ class AgentNativeStepEnvManager(TrajEnvManager):
 
         # Resume only after external tool wait + tool-return observation (G1).
         if is_tool_return:
-            self._pause_ts = time.time()
+            external_wait_s = max(0.0, tool_return_ts - tool_call_start_ts)
+            self._external_wait_samples.append(external_wait_s)
+            content = self.rollout_cache.history[-2]
+            if "metrics" not in content or not isinstance(content["metrics"], dict):
+                content["metrics"] = {}
+            if "metrics_agg_mode" not in content or not isinstance(content["metrics_agg_mode"], dict):
+                content["metrics_agg_mode"] = {}
+            content["metrics"].update({
+                "tool_call_start_ts": tool_call_start_ts,
+                "tool_return_ts": tool_return_ts,
+                "external_wait_s": external_wait_s,
+            })
+            content["metrics_agg_mode"].update({
+                "tool_call_start_ts": "last",
+                "tool_return_ts": "last",
+                "external_wait_s": "mean",
+            })
+            self._pause_ts = tool_return_ts
             self._next_request_type = "resume"
+            if self.trajectory_id:
+                get_trajectory_scheduling_state().update_tool_wait(
+                    self.trajectory_id, external_wait_s
+                )
         else:
             self._pause_ts = None
             self._next_request_type = "normal"
+        if self.rollout_cache.terminated or self.rollout_cache.truncated:
+            self._delete_current_kv_lease()
         return self.rollout_cache
 
     def make_decision(self, rollout_cache: RolloutCache):
@@ -216,8 +255,20 @@ class AgentNativeStepEnvManager(TrajEnvManager):
                     self.env_config.get("env_id"),
                     self.rollout_cache.step,
                 )
+        traj_signals = compute_trajectory_signals(
+            history=self.rollout_cache.history,
+            step=self.rollout_cache.step,
+            max_steps=self.env_config.max_steps,
+            terminated=bool(self.rollout_cache.terminated),
+            truncated=bool(self.rollout_cache.truncated),
+        )
         lm_input.meta_info.update({
             "trajectory_id": self.trajectory_id,
+            "global_step": int(self.current_step),
+            "model_version": int(self.current_step),
+            "weight_version": int(self.current_step),
+            "kv_lease_model_version": int(self.current_step),
+            "env_id": self.env_config["env_id"],
             "request_type": request_type,
             "resume_generation": self._resume_generation,
             "pause_ts": self._pause_ts,
@@ -227,7 +278,12 @@ class AgentNativeStepEnvManager(TrajEnvManager):
             "resume_expected_tool_return": expected_tool_return,
             "resume_request_count": self._resume_request_count,
             "resume_mismatch_count": self._resume_mismatch_count,
+            **traj_signals,
+            **self._scheduling_fields_for_meta(),
         })
+        if request_type == "resume":
+            self._pending_resume_lease_ttl_s = None
+            self._pending_resume_lease_score = None
         self._next_request_type = "normal"
 
         content = self.rollout_cache.history[-1]

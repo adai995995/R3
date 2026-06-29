@@ -1,5 +1,7 @@
 from typing import List, Dict, Any, Optional
 
+import time
+
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
@@ -16,6 +18,106 @@ from roll.utils.functionals import (
 _ROUTER_RESPONSE_META_KEYS = (
     "selected_backend_id",
     "selected_worker_url",
+    "client_submit_ts",
+    "router_handle_start_ts",
+    "gateway_post_start_ts",
+    "gateway_response_headers_ts",
+    "gateway_body_done_ts",
+    "router_return_ts",
+    "direct_worker_data_path",
+    "policy_route_submit_ts",
+    "policy_route_submit_done_ts",
+    "policy_route_return_ts",
+    "policy_slim_route_request",
+    "resume_dispatch_value",
+    "resume_dispatch_expected_saved_tokens",
+    "resume_dispatch_queue_cost_tokens",
+    "resume_dispatch_memory_pressure_cost_tokens",
+    "resume_dispatch_inflight",
+    "resume_dispatch_inflight_ratio",
+    "resume_dispatch_memory_pressure",
+    "resume_dispatch_history_len_for_value",
+    "resume_dispatch_matched_tokens_for_value",
+    "resume_dispatch_p_hit_for_value",
+    "resume_dispatch_value_source_matched",
+    "resume_dispatch_value_source_p_hit",
+    "resume_dispatch_value_source_prior",
+    "resume_dispatch_value_min",
+    "resume_admission_admitted",
+    "route_model_version",
+    "kv_lease_model_version",
+    "kv_lease_model_version_match",
+    "kv_lease_stale_version_blocked",
+    "kv_hit_same_version",
+    "kv_hit_stale_version_blocked",
+    "engine_kv_pinned_tokens",
+    "engine_kv_evicted_tokens",
+    "engine_kv_evicted_pinned_tokens",
+    "engine_kv_lease_hit",
+    "engine_kv_lease_miss",
+    "engine_kv_lease_stale_version_blocked",
+    "kv_lease_state_code",
+    "kv_lease_state_created",
+    "kv_lease_state_active",
+    "kv_lease_state_renewed",
+    "kv_lease_state_expired",
+    "kv_lease_state_released",
+    "kv_lease_state_evicted",
+    "kv_lease_version",
+    "kv_lease_record_ttl_s",
+    "kv_lease_record_score",
+    "kv_lease_remaining_s",
+    "kv_lease_backend_id",
+    "policy_local_route_hint",
+    "policy_local_route_hint_hit",
+    "policy_local_route_hint_reason",
+    "policy_local_route_hint_lease_remaining_s",
+    "policy_local_route_hint_lease_score",
+    "policy_local_route_hint_p_hit",
+    "policy_local_route_hint_cache_age_s",
+    "policy_local_route_hint_use_dispatch_value",
+    "policy_local_route_hint_dispatch_value",
+    "policy_local_route_hint_expected_saved_tokens",
+    "policy_local_route_hint_expected_source_matched",
+    "policy_local_route_hint_expected_source_p_hit",
+    "policy_local_route_hint_expected_source_prior",
+    "policy_local_route_hint_history_len_for_value",
+    "policy_local_route_hint_matched_tokens_for_value",
+    "policy_local_route_hint_p_hit_for_value",
+    "policy_local_route_hint_default_p_hit",
+    "policy_local_route_hint_queue_cost_tokens",
+    "policy_local_route_hint_memory_pressure_cost_tokens",
+    "policy_local_route_hint_inflight",
+    "policy_local_route_hint_inflight_ratio",
+    "policy_local_route_hint_memory_pressure",
+    "policy_worker_submit_ts",
+    "policy_worker_submit_done_ts",
+    "policy_worker_return_ts",
+    "policy_observe_submit_ts",
+    "policy_observe_submit_done_ts",
+    "policy_observe_return_ts",
+    "policy_observe_async",
+    "observe_in_critical_path",
+    "observe_pending_count",
+    "observe_drain_count",
+    "router_route_decision_done_ts",
+    "router_route_return_ts",
+    "router_slim_route_request",
+    "router_fast_route_path",
+    "router_fast_route_reason",
+    "router_observe_recv_ts",
+    "engine_start_ts",
+    "engine_first_token_ts",
+    "engine_finish_ts",
+    "worker_generator_done_ts",
+    "worker_postprocess_done_ts",
+    "worker_log_done_ts",
+    "worker_log_skipped",
+    "router_worker_response_ts",
+    "router_observe_done_ts",
+    "policy_ray_submit_done_ts",
+    "resume_fast_path",
+    "resume_fast_path_reason",
     "resume_enqueue_ts",
     "resume_dispatch_ts",
     "resume_queue_wait_s",
@@ -44,6 +146,8 @@ _ROUTER_RESPONSE_META_KEYS = (
     "memory_pressure",
     "pending_resume_lease_ttl_s",
     "pending_resume_lease_score",
+    "belief_estimated_hit_tokens",
+    "belief_estimated_prefill_tokens",
     "lookup_resume_found",
     "lookup_hit_tokens",
     "lookup_cache_confidence",
@@ -62,6 +166,17 @@ _ROUTER_RESPONSE_META_KEYS = (
     "p_hit_measured",
     "p_hit_effective",
     "p_hit_belief",
+    "saved_prefill_tokens",
+    "saved_prefill_ms",
+    "saved_prefill_ms_per_gb_second",
+    "pinned_kv_gb_seconds",
+    "avoidable_reprefill_tokens",
+    "dead_pinned_kv_gb_seconds",
+    "hot_resume_miss_ratio",
+    "locality_mismatch_count",
+    "queue_decay_loss_ms",
+    "queue_decay_loss_proxy",
+    "kv_lease_effective_ttl_s",
 )
 
 
@@ -82,7 +197,9 @@ class PolicyProxy(BaseLLMProxy):
         lm_input.meta_info["generation_config"] = generation_config
         lm_input.meta_info["pad_to_seq_len"] = False
         src_rank = lm_input.meta_info.pop("src_rank")
+        client_submit_ts = time.time()
         response_data: Optional[DataProto] = self.router_client.generate_request_sync(req=lm_input, request_id=None, uid=src_rank)
+        router_return_ts = time.time()
 
         if response_data is None or not is_report_data_finished(response_data):
             return None
@@ -116,6 +233,8 @@ class PolicyProxy(BaseLLMProxy):
         request_repeat = lm_input.repeat(repeat_times=len(output_tokens))
         lm_output.non_tensor_batch = request_repeat.non_tensor_batch
         lm_output.meta_info = dict(request_repeat.meta_info)
+        lm_output.meta_info["client_submit_ts"] = client_submit_ts
+        lm_output.meta_info.setdefault("router_return_ts", router_return_ts)
         for key in _ROUTER_RESPONSE_META_KEYS:
             if key in response_data.meta_info:
                 lm_output.meta_info[key] = response_data.meta_info[key]

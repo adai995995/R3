@@ -6,6 +6,7 @@ import io
 import os
 import pathlib
 import random
+import time
 import setproctitle
 import inspect
 from typing import Optional
@@ -244,6 +245,7 @@ class SgLangStrategy(InferenceStrategy):
             )
             if any(len(chunk.get("output_ids", []) or []) > 0 for chunk in chunk_list):
                 last_non_empty_chunks = chunks
+        worker_generator_done_ts = time.time()
         assert chunks is not None
         chunks = chunks if isinstance(chunks, list) else [chunks]
         selected_chunks = last_non_empty_chunks if last_non_empty_chunks is not None else chunks
@@ -257,19 +259,26 @@ class SgLangStrategy(InferenceStrategy):
                 )
 
         output_data = postprocess_generate(selected_chunks)
-        logger.info(
-            "[sglang_generate_request] rid=%s input_len=%s max_new_tokens=%s stop=%s "
-            "chunk_count=%s used_last_non_empty=%s chunk_summaries=%s final_output_lens=%s finish_reasons=%s",
-            payload.get("rid"),
-            len(payload.get("input_ids", []) or []),
-            payload.get("sampling_params", {}).get("max_new_tokens"),
-            payload.get("sampling_params", {}).get("stop"),
-            chunk_count,
-            last_non_empty_chunks is not None,
-            chunk_summaries[-5:],
-            [len(ids) for ids in output_data.get("output_token_ids", [])],
-            output_data.get("finish_reasons"),
-        )
+        output_data["worker_generator_done_ts"] = worker_generator_done_ts
+        output_data["worker_postprocess_done_ts"] = time.time()
+        if os.environ.get("ROLL_DISABLE_SGLANG_REQUEST_LOG", "0").lower() not in ("1", "true", "yes", "on"):
+            logger.info(
+                "[sglang_generate_request] rid=%s input_len=%s max_new_tokens=%s stop=%s "
+                "chunk_count=%s used_last_non_empty=%s chunk_summaries=%s final_output_lens=%s finish_reasons=%s",
+                payload.get("rid"),
+                len(payload.get("input_ids", []) or []),
+                payload.get("sampling_params", {}).get("max_new_tokens"),
+                payload.get("sampling_params", {}).get("stop"),
+                chunk_count,
+                last_non_empty_chunks is not None,
+                chunk_summaries[-5:],
+                [len(ids) for ids in output_data.get("output_token_ids", [])],
+                output_data.get("finish_reasons"),
+            )
+            output_data["worker_log_skipped"] = 0.0
+        else:
+            output_data["worker_log_skipped"] = 1.0
+        output_data["worker_log_done_ts"] = time.time()
         return output_data
 
     async def generate(self, batch: DataProto, generation_config):
@@ -375,6 +384,7 @@ class SgLangStrategy(InferenceStrategy):
         ttl_s: float,
         lease_score: float,
         belief_level: Optional[str] = None,
+        model_version: Optional[int] = None,
     ) -> dict:
         fn = getattr(self.model, "set_kv_lease", None)
         if fn is None:
@@ -384,13 +394,14 @@ class SgLangStrategy(InferenceStrategy):
             ttl_s=ttl_s,
             lease_score=lease_score,
             belief_level=belief_level,
+            model_version=model_version,
         )
 
-    async def lookup_kv_resume(self, trajectory_id: str) -> dict:
+    async def lookup_kv_resume(self, trajectory_id: str, model_version: Optional[int] = None) -> dict:
         fn = getattr(self.model, "lookup_kv_resume", None)
         if fn is None:
             return {"found": False, "trajectory_id": trajectory_id}
-        return await fn(trajectory_id)
+        return await fn(trajectory_id, model_version=model_version)
 
     async def delete_kv_lease(self, trajectory_id: str) -> dict:
         fn = getattr(self.model, "delete_kv_lease", None)
@@ -497,12 +508,14 @@ class SglangEngine:
         ttl_s: float,
         lease_score: float,
         belief_level: Optional[str] = None,
+        model_version: Optional[int] = None,
     ) -> dict:
         ret = await self.engine.tokenizer_manager.set_kv_lease(
             trajectory_id=trajectory_id,
             ttl_s=float(ttl_s),
             lease_score=float(lease_score),
             belief_level=belief_level,
+            model_version=model_version,
         )
         return {
             "ok": bool(ret.ok),
@@ -510,11 +523,12 @@ class SglangEngine:
             "expires_at_ms": int(ret.expires_at_ms),
             "resident_blocks": int(ret.resident_blocks),
             "lease_score": float(ret.lease_score),
+            "model_version": getattr(ret, "model_version", None),
             "message": ret.message,
         }
 
-    async def lookup_kv_resume(self, trajectory_id: str) -> dict:
-        ret = await self.engine.tokenizer_manager.lookup_kv_resume(trajectory_id)
+    async def lookup_kv_resume(self, trajectory_id: str, model_version: Optional[int] = None) -> dict:
+        ret = await self.engine.tokenizer_manager.lookup_kv_resume(trajectory_id, model_version=model_version)
         return {
             "found": bool(ret.found),
             "trajectory_id": ret.trajectory_id,
@@ -524,6 +538,16 @@ class SglangEngine:
             "estimated_prefill_tokens": int(ret.estimated_prefill_tokens),
             "cache_confidence": float(ret.cache_confidence),
             "memory_pressure": float(ret.memory_pressure),
+            "lease_model_version": getattr(ret, "lease_model_version", None),
+            "request_model_version": getattr(ret, "request_model_version", None),
+            "model_version_match": bool(getattr(ret, "model_version_match", True)),
+            "stale_version_blocked": bool(getattr(ret, "stale_version_blocked", False)),
+            "engine_kv_pinned_tokens": int(getattr(ret, "engine_kv_pinned_tokens", 0)),
+            "engine_kv_evicted_tokens": int(getattr(ret, "engine_kv_evicted_tokens", 0)),
+            "engine_kv_evicted_pinned_tokens": int(getattr(ret, "engine_kv_evicted_pinned_tokens", 0)),
+            "engine_kv_lease_hit": int(getattr(ret, "engine_kv_lease_hit", 0)),
+            "engine_kv_lease_miss": int(getattr(ret, "engine_kv_lease_miss", 0)),
+            "engine_kv_lease_stale_version_blocked": int(getattr(ret, "engine_kv_lease_stale_version_blocked", 0)),
         }
 
     async def delete_kv_lease(self, trajectory_id: str) -> dict:
@@ -758,6 +782,15 @@ def postprocess_generate(chunks):
             "lease_remaining_s",
             "worker_url",
             "selected_worker_url",
+            "engine_start_ts",
+            "engine_first_token_ts",
+            "engine_finish_ts",
+            "engine_kv_pinned_tokens",
+            "engine_kv_evicted_tokens",
+            "engine_kv_evicted_pinned_tokens",
+            "engine_kv_lease_hit",
+            "engine_kv_lease_miss",
+            "engine_kv_lease_stale_version_blocked",
         ):
             if key in meta_infos[0]:
                 output_data[key] = meta_infos[0][key]

@@ -1,4 +1,5 @@
 import asyncio
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -580,13 +581,14 @@ class RolloutScheduler(RolloutMockMixin):
             mode
         )
 
+        router_concurrency_factor = max(1, int(os.environ.get("ROLL_ROUTER_MAX_CONCURRENCY_FACTOR", "1")))
         self.router_manager = ray.remote(RouterManager).options(
                 name=f"RouterManager-{self.env_manager_config.name}-{mode}",
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=ray.get_runtime_context().get_node_id(),
                     soft=False,
                 ),
-                max_concurrency = env_num + 1 # reserve extra one for suspend/resume
+                max_concurrency = (env_num + 1) * router_concurrency_factor # reserve extra one for suspend/resume
             ).remote(actor_cluster=self.infer_cluster, router_args=config.router_args, num_gpus_per_node=config.num_gpus_per_node)
 
         self.es_manager: Any = Cluster(

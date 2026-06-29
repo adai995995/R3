@@ -228,3 +228,37 @@ class Worker:
         else:
             metrics = {}
         return DataProto(meta_info={"metrics": metrics})
+
+    async def set_kv_lease(
+        self,
+        trajectory_id: str,
+        ttl_s: float,
+        lease_score: float,
+        belief_level: Optional[str] = None,
+        model_version: Optional[int] = None,
+    ) -> dict:
+        strategy = getattr(self, "strategy", None)
+        fn = getattr(strategy, "set_kv_lease", None) if strategy is not None else None
+        if fn is None:
+            return {"ok": False, "trajectory_id": trajectory_id}
+        return await fn(
+            trajectory_id=trajectory_id,
+            ttl_s=ttl_s,
+            lease_score=lease_score,
+            belief_level=belief_level,
+            model_version=model_version,
+        )
+
+    async def lookup_kv_resume(self, trajectory_id: str, model_version: Optional[int] = None) -> dict:
+        strategy = getattr(self, "strategy", None)
+        fn = getattr(strategy, "lookup_kv_resume", None) if strategy is not None else None
+        if fn is None:
+            return {"found": False, "trajectory_id": trajectory_id}
+        return await fn(trajectory_id=trajectory_id, model_version=model_version)
+
+    async def delete_kv_lease(self, trajectory_id: str) -> dict:
+        strategy = getattr(self, "strategy", None)
+        fn = getattr(strategy, "delete_kv_lease", None) if strategy is not None else None
+        if fn is None:
+            return {"ok": False, "deleted": False, "trajectory_id": trajectory_id}
+        return await fn(trajectory_id=trajectory_id)

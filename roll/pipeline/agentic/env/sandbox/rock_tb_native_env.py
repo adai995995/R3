@@ -388,7 +388,14 @@ class RockTBNativeEnv(Env):
             # Check if we should start a new session or terminate completely
             if self.session_num < self.max_multi_session_num and not step_limit_reached and not force_terminated:
                 # Start new session with test output as prompt
-                prompt_with_test = f"{test_output}"
+                prompt_with_test = (
+                    "The previous attempt finished, but the regression tests below did not pass.\\n"
+                    "Continue working in the same repository. Use the test output to inspect, patch, and rerun tests.\\n"
+                    "Original task:\\n"
+                    f"{self.prompt}\\n\\n"
+                    "Latest test output:\\n"
+                    f"{test_output}"
+                )
                 observation, tools, error_msg = self.reset_agent_status(prompt=prompt_with_test)
                 # Reset termination flags since we're starting a new session
                 self.terminated = False

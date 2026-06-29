@@ -39,6 +39,16 @@ class LookupResumeResult:
     memory_pressure: Optional[float] = None
     worker_confirmed: bool = False
     lookup_source: str = "miss"
+    lease_model_version: Optional[int] = None
+    request_model_version: Optional[int] = None
+    model_version_match: Optional[bool] = None
+    stale_version_blocked: bool = False
+    engine_kv_pinned_tokens: Optional[int] = None
+    engine_kv_evicted_tokens: Optional[int] = None
+    engine_kv_evicted_pinned_tokens: Optional[int] = None
+    engine_kv_lease_hit: Optional[int] = None
+    engine_kv_lease_miss: Optional[int] = None
+    engine_kv_lease_stale_version_blocked: Optional[int] = None
 
     @classmethod
     def from_json(cls, data: Dict[str, Any]) -> "LookupResumeResult":
@@ -51,6 +61,18 @@ class LookupResumeResult:
         mem = data.get("memory_pressure")
         worker_confirmed = data.get("worker_confirmed")
         lookup_source = data.get("lookup_source")
+        def _opt_int(key: str) -> Optional[int]:
+            value = data.get(key)
+            if value is None:
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        model_match = data.get("model_version_match")
+        if model_match is not None:
+            model_match = bool(model_match)
         return cls(
             found=bool(data.get("found", False)),
             hit_tokens=int(hit) if hit is not None else 0,
@@ -62,6 +84,16 @@ class LookupResumeResult:
             memory_pressure=float(mem) if mem is not None else None,
             worker_confirmed=bool(worker_confirmed) if worker_confirmed is not None else False,
             lookup_source=lookup_source if isinstance(lookup_source, str) and lookup_source else "miss",
+            lease_model_version=_opt_int("lease_model_version") or _opt_int("kv_lease_model_version") or _opt_int("model_version"),
+            request_model_version=_opt_int("request_model_version") or _opt_int("route_model_version"),
+            model_version_match=model_match,
+            stale_version_blocked=bool(data.get("stale_version_blocked", False)),
+            engine_kv_pinned_tokens=_opt_int("engine_kv_pinned_tokens"),
+            engine_kv_evicted_tokens=_opt_int("engine_kv_evicted_tokens"),
+            engine_kv_evicted_pinned_tokens=_opt_int("engine_kv_evicted_pinned_tokens"),
+            engine_kv_lease_hit=_opt_int("engine_kv_lease_hit"),
+            engine_kv_lease_miss=_opt_int("engine_kv_lease_miss"),
+            engine_kv_lease_stale_version_blocked=_opt_int("engine_kv_lease_stale_version_blocked"),
         )
 
 
@@ -78,6 +110,7 @@ async def lookup_resume(
     worker_url: Optional[str] = None,
     headers: Optional[Dict[str, str]] = None,
     timeout_s: float = 2.0,
+    model_version: Optional[int] = None,
 ) -> LookupResumeResult:
     """GET resume/KV state before dispatch. Returns empty result if API missing."""
     gw = _norm_url(gateway_url)
@@ -88,6 +121,8 @@ async def lookup_resume(
     params: Dict[str, str] = {}
     if worker_url:
         params["worker_url"] = worker_url
+    if model_version is not None:
+        params["model_version"] = str(int(model_version))
     try:
         resp = await client.get(url, params=params or None, headers=headers, timeout=timeout_s)
         if resp.status_code == 404:
@@ -110,6 +145,7 @@ async def lookup_resume_worker(
     lookup_path_template: str = "/internal/kv/resume/{trajectory_id}",
     headers: Optional[Dict[str, str]] = None,
     timeout_s: float = 2.0,
+    model_version: Optional[int] = None,
 ) -> LookupResumeResult:
     """GET engine-authoritative resume state from a single worker."""
     base = _norm_url(worker_url)
@@ -117,7 +153,8 @@ async def lookup_resume_worker(
         return LookupResumeResult()
     path = lookup_path_template.format(trajectory_id=quote(trajectory_id, safe=""))
     try:
-        resp = await client.get(f"{base}{path}", headers=headers, timeout=timeout_s)
+        params = {"model_version": str(int(model_version))} if model_version is not None else None
+        resp = await client.get(f"{base}{path}", params=params, headers=headers, timeout=timeout_s)
         if resp.status_code == 404:
             return LookupResumeResult(found=False)
         resp.raise_for_status()
@@ -141,6 +178,7 @@ async def set_kv_lease(
     lease_score: float,
     worker_url: Optional[str] = None,
     belief_level: Optional[str] = None,
+    model_version: Optional[int] = None,
     lease_path: str = "/kv/lease",
     headers: Optional[Dict[str, str]] = None,
     timeout_s: float = 2.0,
@@ -158,6 +196,10 @@ async def set_kv_lease(
         body["worker_url"] = worker_url
     if belief_level:
         body["belief_level"] = belief_level
+    if model_version is not None:
+        body["model_version"] = int(model_version)
+    if model_version is not None:
+        body["model_version"] = int(model_version)
     try:
         resp = await client.post(
             f"{gw}{lease_path}",
@@ -185,6 +227,7 @@ async def set_kv_lease_worker(
     ttl_s: float,
     lease_score: float,
     belief_level: Optional[str] = None,
+    model_version: Optional[int] = None,
     lease_path: str = "/internal/kv/lease",
     headers: Optional[Dict[str, str]] = None,
     timeout_s: float = 2.0,

@@ -41,6 +41,13 @@ class Qwen3CoderActionParser(ActionParser):
                 function_matches = re.findall(function_pattern, response, flags=re.DOTALL)
 
                 if not function_matches:
+                    function_matches = self._extract_unclosed_function_tool_calls(response)
+                    if function_matches:
+                        self.logger.info(
+                            f"[ACTION_PARSE] Recovered {len(function_matches)} <function=...> blocks closed by </tool_call>."
+                        )
+
+                if not function_matches:
                     self.logger.info("[ACTION_PARSE] No complete <function=...></function> blocks found.")
                 else:
                     for i, (function_name, function_body) in enumerate(function_matches):
@@ -149,6 +156,30 @@ class Qwen3CoderActionParser(ActionParser):
         except Exception as e:
             self.logger.error(f"[ACTION_PARSE] Failed! - Error parsing action: {e}")
             return False, "工具调用格式错误"
+
+    def _extract_unclosed_function_tool_calls(self, response: str):
+        """
+        Recover Qwen3-Coder style tool calls where </tool_call> is emitted
+        but the inner </function> tag is missing.
+        """
+        recovered = []
+        tool_call_pattern = r"<tool_call>(.*?)</tool_call>"
+        param_pattern = r"<parameter\s*=\s*([^>]+)>(.*?)</parameter>"
+
+        for tool_call_body in re.findall(tool_call_pattern, response, flags=re.DOTALL):
+            function_match = re.search(r"<function\s*=\s*([^>]+)>(.*)", tool_call_body, flags=re.DOTALL)
+            if not function_match:
+                continue
+
+            function_name = function_match.group(1)
+            function_body = function_match.group(2)
+            if "</function>" in function_body:
+                continue
+            if not re.search(param_pattern, function_body, flags=re.DOTALL):
+                continue
+            recovered.append((function_name, function_body))
+
+        return recovered
 
     def _is_incomplete_tool_call(self, response: str) -> bool:
         """

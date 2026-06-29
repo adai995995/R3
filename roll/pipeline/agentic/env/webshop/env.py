@@ -1,5 +1,6 @@
 import random
 import string
+import time
 from typing import Optional, Union, Any
 
 from gem import Env
@@ -22,6 +23,7 @@ class WebShopEnv(Env, WebAgentTextEnv):
                  human_goals: bool=False,
                  show_attrs: bool=False,
                  max_steps: int=10,
+                 tool_sleep_s: float=0.0,
                  env_instruction: str=None,
                  format_penalty=0.0,
                  action_pattern: str=r"<answer>(.*?)</answer>",
@@ -51,6 +53,7 @@ class WebShopEnv(Env, WebAgentTextEnv):
         self.show_attrs = show_attrs
         self.render_cache = None
         self.max_steps = max_steps
+        self.tool_sleep_s = float(tool_sleep_s or 0.0)
         self.action_pattern = action_pattern
         self.special_token_list = special_token_list
         self.format_penalty = format_penalty
@@ -108,6 +111,9 @@ class WebShopEnv(Env, WebAgentTextEnv):
             info.update(action_info)
             truncated = self.step_count >= self.max_steps
             return self.render(), self.format_penalty, truncated, truncated, info
+
+        if self.tool_sleep_s > 0:
+            time.sleep(self.tool_sleep_s)
 
         state, reward, done, info = WebAgentTextEnv.step(self, action_info["action"])
         self.prepare_render_cache(self.observation)

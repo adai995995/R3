@@ -1091,6 +1091,14 @@ nohup {command} < /dev/null > {temp_output_file} 2>&1 &
                     task_dir = task_test_dir
                     break
 
+        if task_dir is None:
+            error_msg = f"No test directory found for task {task_name}; searched: {test_files}"
+            self.logger.warning(f"[TEST_SESSION] Skipped! - {error_msg}")
+            self.failure_mode = FailureMode.TEST_FILE_UPLOAD_FAILED
+            self.error_messages.append(error_msg)
+            test_output = error_msg
+            return False, FailureMode.TEST_FILE_UPLOAD_FAILED, test_output, ""
+
         tests_dir = task_dir / "tests"
         if tests_dir.exists():
             with tempfile.TemporaryDirectory() as temp_dir:

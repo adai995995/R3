@@ -58,6 +58,7 @@ from roll.distributed.scheduler.trajectory_value import (
     compute_system_order_score,
     compute_system_worker_route_score,
     compute_trajectory_value,
+    annotate_resume_waste_metrics,
     compute_worker_route_score,
     merge_resume_lease_ttl_score,
     should_send_preferred_header,
@@ -101,6 +102,11 @@ _LOOKUP_ROUTE_META_RESPONSE_KEYS = (
     "lookup_worker_confirmed",
 )
 
+_HEURISTIC_ROUTE_META_RESPONSE_KEYS = (
+    "belief_estimated_hit_tokens",
+    "belief_estimated_prefill_tokens",
+)
+
 def _norm_url(url: str) -> str:
     u = str(url or "").strip()
     return u.rstrip("/") if u else u
@@ -115,6 +121,26 @@ class PendingTrajectoryRequest:
     enqueue_ts: float
     enqueue_seq: int
     base_priority: float
+
+
+KV_LEASE_STATES = ("created", "active", "renewed", "expired", "released", "evicted")
+KV_LEASE_STATE_CODES = {state: idx + 1 for idx, state in enumerate(KV_LEASE_STATES)}
+
+
+@dataclass
+class KvLeaseRecord:
+    trajectory_id: str
+    state: str
+    backend_id: Optional[int] = None
+    ttl_s: float = 0.0
+    lease_score: float = 0.0
+    created_ts: float = 0.0
+    updated_ts: float = 0.0
+    expires_at: float = 0.0
+    version: int = 0
+    model_version: Optional[int] = None
+    phase: str = ""
+    last_transition_reason: str = ""
 
 
 def extract_roll_route_meta(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -225,6 +251,23 @@ class RouterManager:
             "router_port": self.router.router_port if self.router_cls is SglangRouter else None,
             "worker_urls": self.router.worker_urls if self.router_cls in (SglangRouter, SglangOrderingRouter) else None,
             "gateway_url": getattr(self.router, "gateway_url", None) if self.router_cls is SglangOrderingRouter else None,
+            "enable_direct_worker_data_path": bool(getattr(self.router, "enable_direct_worker_data_path", False)),
+            "enable_async_observe_result": bool(getattr(self.router, "enable_async_observe_result", False)),
+            "enable_slim_route_request": bool(getattr(self.router, "enable_slim_route_request", False)),
+            "enable_router_fast_route_path": bool(getattr(self.router, "enable_router_fast_route_path", False)),
+            "enable_policy_local_route_hint": bool(getattr(self.router, "enable_policy_local_route_hint", False)),
+            "policy_local_route_hint_max_pause_age_s": float(getattr(self.router, "policy_local_route_hint_max_pause_age_s", 300.0)),
+            "policy_local_route_hint_max_inflight_per_worker": int(getattr(self.router, "policy_local_route_hint_max_inflight_per_worker", 64)),
+            "policy_local_route_hint_min_lease_score": float(getattr(self.router, "policy_local_route_hint_min_lease_score", 0.0)),
+            "policy_local_route_hint_min_p_hit": float(getattr(self.router, "policy_local_route_hint_min_p_hit", 0.0)),
+            "policy_local_route_hint_require_lease_alive": bool(getattr(self.router, "policy_local_route_hint_require_lease_alive", False)),
+            "policy_local_route_hint_use_dispatch_value": bool(getattr(self.router, "policy_local_route_hint_use_dispatch_value", False)),
+            "policy_local_route_hint_min_dispatch_value": float(getattr(self.router, "policy_local_route_hint_min_dispatch_value", 0.0)),
+            "policy_local_route_hint_queue_cost_tokens": float(getattr(self.router, "policy_local_route_hint_queue_cost_tokens", 128.0)),
+            "policy_local_route_hint_memory_pressure_cost_tokens": float(getattr(self.router, "policy_local_route_hint_memory_pressure_cost_tokens", 0.0)),
+            "policy_local_route_hint_default_p_hit": float(getattr(self.router, "policy_local_route_hint_default_p_hit", 0.5)),
+            "observe_pending_max": int(getattr(self.router, "observe_pending_max", 4096)),
+            "observe_drain_interval_s": float(getattr(self.router, "observe_drain_interval_s", 0.1)),
         }
 
     @classmethod
@@ -264,6 +307,48 @@ class RouterManager:
 
     async def generate_request(self, payload, request_id, uid):
         return await self.router.generate_request(payload=payload, request_id=request_id, uid=uid)
+
+    async def route_request(self, payload, request_id, uid):
+        return await self.router.route_request(payload=payload, request_id=request_id, uid=uid)
+
+    async def route_request_slim(self, route_meta: Dict[str, Any], request_id, uid):
+        return await self.router.route_request_slim(route_meta=route_meta, request_id=request_id, uid=uid)
+
+
+    async def observe_result(self, route_decision: Dict[str, Any], response: Dict[str, Any]):
+        return await self.router.observe_result(route_decision=route_decision, response=response)
+
+    async def observe_error(self, route_decision: Dict[str, Any], error_summary: Dict[str, Any]):
+        return await self.router.observe_error(route_decision=route_decision, error_summary=error_summary)
+
+    def worker_handles(self):
+        return self.workers
+
+    def direct_worker_data_path_enabled(self) -> bool:
+        return bool(getattr(self.router, "enable_direct_worker_data_path", False))
+
+    def async_observe_result_enabled(self) -> bool:
+        return bool(getattr(self.router, "enable_async_observe_result", False))
+
+    def async_observe_config(self) -> Dict[str, Any]:
+        return {
+            "enable_async_observe_result": bool(getattr(self.router, "enable_async_observe_result", False)),
+            "enable_slim_route_request": bool(getattr(self.router, "enable_slim_route_request", False)),
+            "enable_router_fast_route_path": bool(getattr(self.router, "enable_router_fast_route_path", False)),
+            "enable_policy_local_route_hint": bool(getattr(self.router, "enable_policy_local_route_hint", False)),
+            "policy_local_route_hint_max_pause_age_s": float(getattr(self.router, "policy_local_route_hint_max_pause_age_s", 300.0)),
+            "policy_local_route_hint_max_inflight_per_worker": int(getattr(self.router, "policy_local_route_hint_max_inflight_per_worker", 64)),
+            "policy_local_route_hint_min_lease_score": float(getattr(self.router, "policy_local_route_hint_min_lease_score", 0.0)),
+            "policy_local_route_hint_min_p_hit": float(getattr(self.router, "policy_local_route_hint_min_p_hit", 0.0)),
+            "policy_local_route_hint_require_lease_alive": bool(getattr(self.router, "policy_local_route_hint_require_lease_alive", False)),
+            "policy_local_route_hint_use_dispatch_value": bool(getattr(self.router, "policy_local_route_hint_use_dispatch_value", False)),
+            "policy_local_route_hint_min_dispatch_value": float(getattr(self.router, "policy_local_route_hint_min_dispatch_value", 0.0)),
+            "policy_local_route_hint_queue_cost_tokens": float(getattr(self.router, "policy_local_route_hint_queue_cost_tokens", 128.0)),
+            "policy_local_route_hint_memory_pressure_cost_tokens": float(getattr(self.router, "policy_local_route_hint_memory_pressure_cost_tokens", 0.0)),
+            "policy_local_route_hint_default_p_hit": float(getattr(self.router, "policy_local_route_hint_default_p_hit", 0.5)),
+            "observe_pending_max": int(getattr(self.router, "observe_pending_max", 4096)),
+            "observe_drain_interval_s": float(getattr(self.router, "observe_drain_interval_s", 0.1)),
+        }
 
     async def set_tool_suspend_lease(self, route_meta: Dict[str, Any]):
         return await self.router.set_tool_suspend_lease(route_meta=route_meta)
@@ -610,8 +695,427 @@ class InprocProxy(RouterProxy):
         return await self.router_manager.on_request_routed(request_id)
 
 class RayProxy(RouterProxy):
+    _OBSERVE_RESPONSE_KEYS = (
+        "selected_backend_id",
+        "actual_hit",
+        "matched_prefix_tokens",
+        "resume_prefill_tokens",
+        "estimated_prefill_tokens",
+        "prefill_time_ms",
+        "cache_confidence",
+        "context_class",
+        "context_class_gpu_hit",
+        "context_class_cpu_reload",
+        "context_class_full_prefill",
+        "prefill_ratio",
+        "engine_cache_confidence",
+        "p_hit_measured",
+        "p_hit_effective",
+        "engine_start_ts",
+        "engine_first_token_ts",
+        "engine_finish_ts",
+        "worker_generator_done_ts",
+        "worker_postprocess_done_ts",
+        "worker_log_done_ts",
+        "worker_log_skipped",
+    )
+
     def __init__(self, router_manager: RouterManager):
         self.router_manager = router_manager
+        self._workers = None
+        self._direct_worker_data_path = None
+        self._async_observe_result = None
+        self._observe_pending = []
+        self._observe_pending_max = 4096
+        self._observe_drain_interval_s = 0.1
+        self._last_observe_drain_ts = 0.0
+        self._slim_route_request = None
+        self._policy_local_route_hint = None
+        self._policy_local_route_hint_max_pause_age_s = 300.0
+        self._policy_local_route_hint_max_inflight_per_worker = 64
+        self._policy_local_route_hint_min_lease_score = 0.0
+        self._policy_local_route_hint_min_p_hit = 0.0
+        self._policy_local_route_hint_require_lease_alive = False
+        self._policy_local_route_hint_use_dispatch_value = False
+        self._policy_local_route_hint_min_dispatch_value = 0.0
+        self._policy_local_route_hint_queue_cost_tokens = 128.0
+        self._policy_local_route_hint_memory_pressure_cost_tokens = 0.0
+        self._policy_local_route_hint_default_p_hit = 0.5
+        self._local_route_hint_cache: Dict[str, Dict[str, Any]] = {}
+        self._local_route_hint_inflight = defaultdict(int)
+
+    def _is_direct_worker_data_path_enabled(self) -> bool:
+        if self._direct_worker_data_path is None:
+            try:
+                self._direct_worker_data_path = bool(ray.get(self.router_manager.direct_worker_data_path_enabled.remote()))
+            except Exception:
+                self._direct_worker_data_path = False
+        return self._direct_worker_data_path
+
+    def _worker_handles(self):
+        if self._workers is None:
+            self._workers = ray.get(self.router_manager.worker_handles.remote())
+        return self._workers
+
+    def _is_async_observe_result_enabled(self) -> bool:
+        if self._async_observe_result is None:
+            try:
+                config = ray.get(self.router_manager.async_observe_config.remote())
+                self._async_observe_result = bool(config.get("enable_async_observe_result", False))
+                self._observe_pending_max = max(1, int(config.get("observe_pending_max", 4096)))
+                self._observe_drain_interval_s = max(0.0, float(config.get("observe_drain_interval_s", 0.1)))
+                self._slim_route_request = bool(config.get("enable_slim_route_request", False))
+                self._policy_local_route_hint = bool(config.get("enable_policy_local_route_hint", False))
+                self._policy_local_route_hint_max_pause_age_s = float(
+                    config.get("policy_local_route_hint_max_pause_age_s", 300.0)
+                )
+                self._policy_local_route_hint_max_inflight_per_worker = max(
+                    1, int(config.get("policy_local_route_hint_max_inflight_per_worker", 64))
+                )
+                self._policy_local_route_hint_min_lease_score = max(
+                    0.0, float(config.get("policy_local_route_hint_min_lease_score", 0.0))
+                )
+                self._policy_local_route_hint_min_p_hit = max(
+                    0.0, float(config.get("policy_local_route_hint_min_p_hit", 0.0))
+                )
+                self._policy_local_route_hint_require_lease_alive = bool(
+                    config.get("policy_local_route_hint_require_lease_alive", False)
+                )
+                self._policy_local_route_hint_use_dispatch_value = bool(
+                    config.get("policy_local_route_hint_use_dispatch_value", False)
+                )
+                self._policy_local_route_hint_min_dispatch_value = float(
+                    config.get("policy_local_route_hint_min_dispatch_value", 0.0)
+                )
+                self._policy_local_route_hint_queue_cost_tokens = max(
+                    0.0, float(config.get("policy_local_route_hint_queue_cost_tokens", 128.0))
+                )
+                self._policy_local_route_hint_memory_pressure_cost_tokens = max(
+                    0.0, float(config.get("policy_local_route_hint_memory_pressure_cost_tokens", 0.0))
+                )
+                self._policy_local_route_hint_default_p_hit = max(
+                    0.0, min(1.0, float(config.get("policy_local_route_hint_default_p_hit", 0.5)))
+                )
+            except Exception:
+                logger.exception("failed to fetch async observe config; fallback to sync observe")
+                self._async_observe_result = False
+                self._slim_route_request = False
+                self._policy_local_route_hint = False
+        return self._async_observe_result
+
+    def _is_slim_route_request_enabled(self) -> bool:
+        if self._slim_route_request is None:
+            self._is_async_observe_result_enabled()
+        return bool(self._slim_route_request)
+
+    def _is_policy_local_route_hint_enabled(self) -> bool:
+        if self._policy_local_route_hint is None:
+            self._is_async_observe_result_enabled()
+        return bool(self._policy_local_route_hint)
+
+    def _trajectory_id_from_route_meta(self, route_meta: Dict[str, Any]) -> Optional[str]:
+        trajectory_id = route_meta.get("trajectory_id") if isinstance(route_meta, dict) else None
+        if isinstance(trajectory_id, str) and trajectory_id:
+            return trajectory_id
+        return None
+
+    @staticmethod
+    def _float_route_value(source: Optional[Dict[str, Any]], *keys: str) -> Optional[float]:
+        if not isinstance(source, dict):
+            return None
+        for key in keys:
+            try:
+                value = source.get(key)
+                if value is not None:
+                    return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _cached_hint_record(self, trajectory_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not trajectory_id:
+            return None
+        record = self._local_route_hint_cache.get(trajectory_id)
+        if isinstance(record, int):
+            return {"backend_id": record}
+        if isinstance(record, dict):
+            return record
+        return None
+
+    def _route_or_cached_float(
+        self,
+        route_meta: Dict[str, Any],
+        cached_record: Optional[Dict[str, Any]],
+        *keys: str,
+    ) -> Optional[float]:
+        value = self._float_route_value(route_meta, *keys)
+        if value is not None:
+            return value
+        return self._float_route_value(cached_record, *keys)
+
+    def _compute_policy_local_dispatch_value(
+        self,
+        route_meta: Dict[str, Any],
+        cached_record: Optional[Dict[str, Any]],
+        dp_rank: int,
+    ) -> Tuple[Optional[float], str]:
+        history_len = self._route_or_cached_float(route_meta, cached_record, "history_len_tokens", "resume_history_len_tokens")
+        matched_tokens = self._route_or_cached_float(route_meta, cached_record, "matched_prefix_tokens", "saved_prefill_tokens")
+        p_hit = self._route_or_cached_float(
+            route_meta, cached_record, "p_hit_effective", "p_hit_measured", "belief_p_hit", "cache_confidence", "p_hit_estimate"
+        )
+        source_matched = 0.0
+        source_p_hit = 0.0
+        source_prior = 0.0
+        effective_p_hit = p_hit
+        if matched_tokens is not None and matched_tokens > 0.0:
+            expected_saved_tokens = matched_tokens
+            source_matched = 1.0
+        elif history_len is not None and p_hit is not None:
+            effective_p_hit = max(0.0, min(1.0, p_hit))
+            expected_saved_tokens = effective_p_hit * max(0.0, history_len)
+            source_p_hit = 1.0
+        elif history_len is not None:
+            effective_p_hit = self._policy_local_route_hint_default_p_hit
+            expected_saved_tokens = effective_p_hit * max(0.0, history_len)
+            source_prior = 1.0
+        else:
+            return None, "dispatch_value_missing"
+
+        inflight = float(self._local_route_hint_inflight[dp_rank])
+        inflight_ratio = inflight / max(1.0, float(self._policy_local_route_hint_max_inflight_per_worker))
+        queue_cost = self._policy_local_route_hint_queue_cost_tokens * inflight_ratio
+        memory_pressure = self._route_or_cached_float(route_meta, cached_record, "memory_pressure")
+        memory_pressure = max(0.0, memory_pressure) if memory_pressure is not None else 0.0
+        memory_cost = self._policy_local_route_hint_memory_pressure_cost_tokens * memory_pressure
+        dispatch_value = expected_saved_tokens - queue_cost - memory_cost
+
+        route_meta["policy_local_route_hint_use_dispatch_value"] = 1.0 if self._policy_local_route_hint_use_dispatch_value else 0.0
+        route_meta["policy_local_route_hint_dispatch_value"] = dispatch_value
+        route_meta["policy_local_route_hint_expected_saved_tokens"] = expected_saved_tokens
+        route_meta["policy_local_route_hint_expected_source_matched"] = source_matched
+        route_meta["policy_local_route_hint_expected_source_p_hit"] = source_p_hit
+        route_meta["policy_local_route_hint_expected_source_prior"] = source_prior
+        route_meta["policy_local_route_hint_history_len_for_value"] = max(0.0, history_len) if history_len is not None else 0.0
+        route_meta["policy_local_route_hint_matched_tokens_for_value"] = max(0.0, matched_tokens) if matched_tokens is not None else 0.0
+        route_meta["policy_local_route_hint_p_hit_for_value"] = max(0.0, min(1.0, effective_p_hit)) if effective_p_hit is not None else 0.0
+        route_meta["policy_local_route_hint_default_p_hit"] = self._policy_local_route_hint_default_p_hit
+        route_meta["policy_local_route_hint_queue_cost_tokens"] = queue_cost
+        route_meta["policy_local_route_hint_memory_pressure_cost_tokens"] = memory_cost
+        route_meta["policy_local_route_hint_inflight"] = inflight
+        route_meta["policy_local_route_hint_inflight_ratio"] = inflight_ratio
+        route_meta["policy_local_route_hint_memory_pressure"] = memory_pressure
+        return dispatch_value, "ok"
+
+    def _resolve_policy_local_hint_dp_rank(self, route_meta: Dict[str, Any], workers) -> Tuple[Optional[int], str]:
+        if not self._is_policy_local_route_hint_enabled():
+            return None, "disabled"
+        if not isinstance(route_meta, dict) or route_meta.get("request_type") != "resume":
+            return None, "not_resume"
+        pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
+        if pause_age >= self._policy_local_route_hint_max_pause_age_s:
+            return None, "pause_age_expired"
+        trajectory_id = self._trajectory_id_from_route_meta(route_meta)
+        cached_record = self._cached_hint_record(trajectory_id)
+        dp_rank = route_meta.get("last_backend_id")
+        if not isinstance(dp_rank, int) and cached_record is not None:
+            dp_rank = cached_record.get("backend_id")
+        if not isinstance(dp_rank, int):
+            return None, "missing_hint"
+
+        now = time.time()
+        lease_remaining_s = self._route_or_cached_float(
+            route_meta,
+            cached_record,
+            "ttl_remaining_s",
+            "lookup_lease_remaining_s",
+            "resume_lease_ttl_s",
+            "pending_resume_lease_ttl_s",
+            "lease_remaining_s",
+        )
+        lease_expires_at = self._float_route_value(cached_record, "lease_expires_at")
+        if lease_remaining_s is None and lease_expires_at is not None:
+            lease_remaining_s = max(0.0, lease_expires_at - now)
+        if lease_remaining_s is not None:
+            route_meta["policy_local_route_hint_lease_remaining_s"] = max(0.0, lease_remaining_s)
+        if self._policy_local_route_hint_require_lease_alive and (lease_remaining_s is None or lease_remaining_s <= 0.0):
+            return None, "lease_not_alive"
+
+        lease_score = self._route_or_cached_float(
+            route_meta, cached_record, "resume_lease_score", "pending_resume_lease_score", "lease_score"
+        )
+        if lease_score is not None:
+            route_meta["policy_local_route_hint_lease_score"] = max(0.0, lease_score)
+        if lease_score is not None and lease_score < self._policy_local_route_hint_min_lease_score:
+            return None, "lease_score_low"
+
+        p_hit_estimate = self._route_or_cached_float(
+            route_meta, cached_record, "p_hit_effective", "p_hit_measured", "belief_p_hit", "cache_confidence", "p_hit_estimate"
+        )
+        if p_hit_estimate is not None:
+            route_meta["policy_local_route_hint_p_hit"] = max(0.0, min(1.0, p_hit_estimate))
+        if p_hit_estimate is not None and p_hit_estimate < self._policy_local_route_hint_min_p_hit:
+            return None, "p_hit_low"
+
+        if cached_record is not None:
+            updated_at = self._float_route_value(cached_record, "updated_at")
+            if updated_at is not None:
+                route_meta["policy_local_route_hint_cache_age_s"] = max(0.0, now - updated_at)
+
+        if dp_rank < 0 or dp_rank >= len(workers):
+            if trajectory_id is not None:
+                self._local_route_hint_cache.pop(trajectory_id, None)
+            return None, "invalid_backend"
+        if self._policy_local_route_hint_use_dispatch_value:
+            dispatch_value, dispatch_reason = self._compute_policy_local_dispatch_value(route_meta, cached_record, dp_rank)
+            if dispatch_value is None:
+                return None, dispatch_reason
+            if dispatch_value < self._policy_local_route_hint_min_dispatch_value:
+                return None, "dispatch_value_low"
+        if self._local_route_hint_inflight[dp_rank] >= self._policy_local_route_hint_max_inflight_per_worker:
+            return None, "local_inflight_guard"
+        return dp_rank, "hit"
+
+    def _build_policy_local_route_decision(self, route_meta: Dict[str, Any], request_id, uid, dp_rank: int) -> Dict[str, Any]:
+        now = time.time()
+        route_meta = dict(route_meta or {})
+        route_meta["policy_local_route_hint"] = 1.0
+        route_meta["policy_local_route_hint_hit"] = 1.0
+        route_meta["policy_local_route_hint_reason"] = "hit"
+        route_meta["router_slim_route_request"] = 0.0
+        route_meta["router_fast_route_path"] = 0.0
+        route_meta["resume_fast_path"] = 1.0
+        route_meta["resume_fast_path_reason"] = "policy_local_route_hint"
+        route_meta.setdefault("router_handle_start_ts", now)
+        route_meta.setdefault("router_resume_enter_ts", now)
+        route_meta.setdefault("resume_enqueue_ts", now)
+        route_meta.setdefault("router_after_lookup_ts", now)
+        route_meta.setdefault("router_after_priority_ts", now)
+        route_meta["resume_dispatch_ts"] = now
+        route_meta["resume_queue_wait_s"] = 0.0
+        route_meta["router_after_schedule_ts"] = now
+        route_meta["router_route_decision_done_ts"] = now
+        route_meta["router_route_return_ts"] = now
+        return {
+            "request_id": request_id,
+            "uid": uid,
+            "request_type": route_meta.get("request_type", "resume"),
+            "dp_rank": dp_rank,
+            "selected_dp_rank": dp_rank,
+            "selected_worker_name": f"actor_infer-{dp_rank}",
+            "route_reason": "policy_local_route_hint",
+            "route_meta": route_meta,
+            "route_ts": now,
+            "router_route_return_ts": now,
+            "policy_local_route_hint": 1.0,
+        }
+
+    def _update_policy_local_route_hint_cache(self, route_meta: Optional[Dict[str, Any]], response: Dict[str, Any]) -> None:
+        if not isinstance(response, dict):
+            return
+        route_meta = route_meta if isinstance(route_meta, dict) else {}
+        trajectory_id = self._trajectory_id_from_route_meta(route_meta)
+        selected_backend_id = response.get("selected_backend_id")
+        if trajectory_id is None or not isinstance(selected_backend_id, int):
+            return
+        now = time.time()
+
+        def read_float(*keys: str) -> Optional[float]:
+            value = self._float_route_value(response, *keys)
+            if value is not None:
+                return value
+            return self._float_route_value(route_meta, *keys)
+
+        lease_remaining_s = read_float(
+            "ttl_remaining_s",
+            "lookup_lease_remaining_s",
+            "resume_lease_ttl_s",
+            "pending_resume_lease_ttl_s",
+            "policy_local_route_hint_lease_remaining_s",
+        )
+        record: Dict[str, Any] = {
+            "backend_id": selected_backend_id,
+            "updated_at": now,
+        }
+        if lease_remaining_s is not None:
+            record["lease_remaining_s"] = max(0.0, lease_remaining_s)
+            record["lease_expires_at"] = now + max(0.0, lease_remaining_s)
+        lease_score = read_float("resume_lease_score", "pending_resume_lease_score", "policy_local_route_hint_lease_score")
+        if lease_score is not None:
+            record["lease_score"] = max(0.0, lease_score)
+        p_hit_estimate = read_float(
+            "p_hit_effective",
+            "p_hit_measured",
+            "belief_p_hit",
+            "cache_confidence",
+            "policy_local_route_hint_p_hit",
+        )
+        if p_hit_estimate is not None:
+            record["p_hit_estimate"] = max(0.0, min(1.0, p_hit_estimate))
+        for key in (
+            "history_len_tokens",
+            "matched_prefix_tokens",
+            "resume_prefill_tokens",
+            "kv_bytes_proxy",
+            "policy_local_route_hint_dispatch_value",
+            "policy_local_route_hint_expected_saved_tokens",
+            "policy_local_route_hint_expected_source_matched",
+            "policy_local_route_hint_expected_source_p_hit",
+            "policy_local_route_hint_expected_source_prior",
+            "policy_local_route_hint_history_len_for_value",
+            "policy_local_route_hint_matched_tokens_for_value",
+            "policy_local_route_hint_p_hit_for_value",
+            "policy_local_route_hint_default_p_hit",
+            "policy_local_route_hint_memory_pressure",
+        ):
+            value = read_float(key)
+            if value is not None:
+                record[key] = value
+        self._local_route_hint_cache[trajectory_id] = record
+
+    def _drain_observe_pending(self, *, force: bool = False) -> int:
+        if not self._observe_pending:
+            return 0
+        now = time.time()
+        if (
+            not force
+            and len(self._observe_pending) < self._observe_pending_max
+            and now - self._last_observe_drain_ts < self._observe_drain_interval_s
+        ):
+            return 0
+        self._last_observe_drain_ts = now
+        refs = [item[0] for item in self._observe_pending]
+        ready, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
+        drained = 0
+        if ready:
+            remaining = []
+            for ref, pending_request_id in self._observe_pending:
+                if ref in ready:
+                    try:
+                        ray.get(ref)
+                    except Exception:
+                        logger.exception("async observe_result failed request_id=%s", pending_request_id)
+                    drained += 1
+                else:
+                    remaining.append((ref, pending_request_id))
+            self._observe_pending = remaining
+        if len(self._observe_pending) >= self._observe_pending_max:
+            overflow = len(self._observe_pending) - self._observe_pending_max + 1
+            refs = [item[0] for item in self._observe_pending]
+            ready, _ = ray.wait(refs, num_returns=overflow, timeout=0.1)
+            if ready:
+                remaining = []
+                for ref, pending_request_id in self._observe_pending:
+                    if ref in ready:
+                        try:
+                            ray.get(ref)
+                        except Exception:
+                            logger.exception("async observe_result failed request_id=%s", pending_request_id)
+                        drained += 1
+                    else:
+                        remaining.append((ref, pending_request_id))
+                self._observe_pending = remaining
+        return drained
 
     async def generate_request(self, payload, request_id, uid):
         return await self.router_manager.generate_request.remote(payload=payload, request_id=request_id, uid=uid)
@@ -622,8 +1126,160 @@ class RayProxy(RouterProxy):
     async def on_request_routed(self, request_id):
         return await self.router_manager.on_request_routed.remote(request_id)
 
+    def _build_observe_summary(self, response: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(response, dict):
+            return {}
+        return {key: response[key] for key in self._OBSERVE_RESPONSE_KEYS if key in response}
+
+    def _attach_route_meta_to_response(self, route_meta: Optional[Dict[str, Any]], response: Dict[str, Any]) -> None:
+        if not isinstance(route_meta, dict) or not isinstance(response, dict):
+            return
+        for key, value in route_meta.items():
+            response.setdefault(key, value)
+
+    def _generate_request_direct_sync(self, payload, request_id, uid):
+        policy_route_submit_ts = time.time()
+        slim_route_request = self._is_slim_route_request_enabled()
+        route_meta_payload = dict(extract_roll_route_meta(payload))
+        if route_meta_payload and "history_len_tokens" not in route_meta_payload and "input_ids" in payload:
+            try:
+                route_meta_payload["history_len_tokens"] = len(payload["input_ids"])
+            except TypeError:
+                pass
+        workers = self._worker_handles()
+        local_hint_dp_rank, local_hint_reason = self._resolve_policy_local_hint_dp_rank(route_meta_payload, workers)
+        if local_hint_dp_rank is not None:
+            route_decision = self._build_policy_local_route_decision(
+                route_meta=route_meta_payload,
+                request_id=request_id,
+                uid=uid,
+                dp_rank=local_hint_dp_rank,
+            )
+            policy_route_submit_done_ts = time.time()
+            policy_route_return_ts = policy_route_submit_done_ts
+        else:
+            route_meta_payload["policy_local_route_hint"] = 1.0 if self._is_policy_local_route_hint_enabled() else 0.0
+            route_meta_payload["policy_local_route_hint_hit"] = 0.0
+            route_meta_payload["policy_local_route_hint_reason"] = local_hint_reason
+            if slim_route_request:
+                route_ref = self.router_manager.route_request_slim.remote(
+                    route_meta=route_meta_payload,
+                    request_id=request_id,
+                    uid=uid,
+                )
+            else:
+                if route_meta_payload:
+                    payload["_roll_route_meta"] = route_meta_payload
+                route_ref = self.router_manager.route_request.remote(payload=payload, request_id=request_id, uid=uid)
+            policy_route_submit_done_ts = time.time()
+            route_decision = ray.get(route_ref)
+            policy_route_return_ts = time.time()
+
+        if isinstance(route_decision, dict) and "abort_response" in route_decision:
+            response = route_decision["abort_response"]
+            if isinstance(response, dict):
+                response["direct_worker_data_path"] = 1.0
+                response["policy_route_submit_ts"] = policy_route_submit_ts
+                response["policy_route_submit_done_ts"] = policy_route_submit_done_ts
+                response["policy_route_return_ts"] = policy_route_return_ts
+                response["policy_slim_route_request"] = 1.0 if slim_route_request else 0.0
+            return response
+
+        if not isinstance(route_decision, dict) or "dp_rank" not in route_decision:
+            raise RuntimeError(f"Invalid route_decision from RouterManager: {route_decision!r}")
+
+        dp_rank = int(route_decision["dp_rank"])
+        route_meta = route_decision.get("route_meta")
+        if isinstance(route_meta, dict):
+            route_meta = dict(route_meta)
+            route_meta["direct_worker_data_path"] = 1.0
+            payload["_roll_route_meta"] = route_meta
+
+        policy_worker_submit_ts = time.time()
+        self._local_route_hint_inflight[dp_rank] += 1
+        worker_ref = workers[dp_rank].generate_request.remote(payload)
+        policy_worker_submit_done_ts = time.time()
+        try:
+            response = ray.get(worker_ref)
+        except Exception as e:
+            error_summary = {
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "policy_error_ts": time.time(),
+            }
+            try:
+                ray.get(self.router_manager.observe_error.remote(route_decision, error_summary))
+            except Exception:
+                logger.exception("direct worker observe_error failed request_id=%s", request_id)
+            trajectory_id = self._trajectory_id_from_route_meta(route_meta if isinstance(route_meta, dict) else {})
+            if trajectory_id is not None:
+                self._local_route_hint_cache.pop(trajectory_id, None)
+            raise
+        finally:
+            self._local_route_hint_inflight[dp_rank] = max(0, self._local_route_hint_inflight[dp_rank] - 1)
+        policy_worker_return_ts = time.time()
+
+        if isinstance(response, dict):
+            response["direct_worker_data_path"] = 1.0
+            response["selected_backend_id"] = dp_rank
+            response["policy_route_submit_ts"] = policy_route_submit_ts
+            response["policy_route_submit_done_ts"] = policy_route_submit_done_ts
+            response["policy_route_return_ts"] = policy_route_return_ts
+            response["policy_slim_route_request"] = 1.0 if slim_route_request else 0.0
+            response["policy_local_route_hint"] = float(route_meta.get("policy_local_route_hint", 0.0)) if isinstance(route_meta, dict) else 0.0
+            response["policy_local_route_hint_hit"] = float(route_meta.get("policy_local_route_hint_hit", 0.0)) if isinstance(route_meta, dict) else 0.0
+            if isinstance(route_meta, dict) and "policy_local_route_hint_reason" in route_meta:
+                response["policy_local_route_hint_reason"] = route_meta["policy_local_route_hint_reason"]
+            response["policy_worker_submit_ts"] = policy_worker_submit_ts
+            response["policy_worker_submit_done_ts"] = policy_worker_submit_done_ts
+            response["policy_worker_return_ts"] = policy_worker_return_ts
+            response["policy_ray_submit_done_ts"] = policy_route_submit_done_ts
+
+        if isinstance(response, dict) and isinstance(route_meta, dict) and route_meta.get("request_type") == "resume":
+            annotate_resume_waste_metrics(route_meta, response)
+        self._update_policy_local_route_hint_cache(route_meta, response)
+        observe_summary = self._build_observe_summary(response)
+        policy_observe_submit_ts = time.time()
+        observe_ref = self.router_manager.observe_result.remote(route_decision, observe_summary)
+        policy_observe_submit_done_ts = time.time()
+        async_observe = self._is_async_observe_result_enabled()
+        observe_response = None
+        policy_observe_return_ts = None
+        observe_drain_count = 0
+        observe_in_critical_path = 1.0
+        if async_observe:
+            self._observe_pending.append((observe_ref, request_id))
+            observe_drain_count = self._drain_observe_pending()
+            observe_in_critical_path = 0.0
+        else:
+            observe_response = ray.get(observe_ref)
+            policy_observe_return_ts = time.time()
+
+        if isinstance(response, dict):
+            self._attach_route_meta_to_response(route_meta, response)
+            if isinstance(observe_response, dict):
+                response.update(observe_response)
+            response["direct_worker_data_path"] = 1.0
+            response["policy_observe_submit_ts"] = policy_observe_submit_ts
+            response["policy_observe_submit_done_ts"] = policy_observe_submit_done_ts
+            if policy_observe_return_ts is not None:
+                response["policy_observe_return_ts"] = policy_observe_return_ts
+            response["policy_observe_async"] = 1.0 if async_observe else 0.0
+            response["observe_in_critical_path"] = observe_in_critical_path
+            response["observe_pending_count"] = float(len(self._observe_pending))
+            response["observe_drain_count"] = float(observe_drain_count)
+            response["router_return_ts"] = policy_worker_return_ts
+        return response
+
     def generate_request_sync(self, payload, request_id, uid):
-        return ray.get(self.router_manager.generate_request.remote(payload=payload, request_id=request_id, uid=uid))
+        if self._is_direct_worker_data_path_enabled():
+            return self._generate_request_direct_sync(payload=payload, request_id=request_id, uid=uid)
+        obj_ref = self.router_manager.generate_request.remote(payload=payload, request_id=request_id, uid=uid)
+        submit_done_ts = time.time()
+        response = ray.get(obj_ref)
+        if isinstance(response, dict):
+            response["policy_ray_submit_done_ts"] = submit_done_ts
+        return response
 
     def on_send_request_sync(self, request_id):
         return ray.get(self.router_manager.on_send_request.remote(request_id))
@@ -674,14 +1330,26 @@ class SglangProxy(RouterProxy):
         from roll.distributed.strategy.sglang_strategy import postprocess_generate
         assert "multi_modal_data" not in payload
         url = f"http://{self.router_ip}:{self.router_port}/generate"
+        route_meta = payload.get("_roll_route_meta")
+        if not isinstance(route_meta, dict):
+            route_meta = {}
+        route_meta["gateway_post_start_ts"] = time.time()
         headers = self._build_router_headers(payload)
         response = await self.client.post(url, json=payload, headers=headers)
+        route_meta["gateway_response_headers_ts"] = time.time()
         raise_for_status(response)
         selected_worker_url = response.headers.get("x-smg-selected-worker-url")
         raw_response = response.json()
+        route_meta["gateway_body_done_ts"] = time.time()
         chunks = raw_response if isinstance(raw_response, list) else [raw_response]
         out = postprocess_generate(chunks)
         self._attach_selected_backend_from_header(selected_worker_url, out)
+        for key in ("gateway_post_start_ts", "gateway_response_headers_ts", "gateway_body_done_ts"):
+            if key in route_meta:
+                out[key] = route_meta[key]
+        router_return_ts = time.time()
+        route_meta["router_return_ts"] = router_return_ts
+        out["router_return_ts"] = router_return_ts
         return out
 
     async def on_send_request(self, request_id):
@@ -694,14 +1362,26 @@ class SglangProxy(RouterProxy):
         from roll.distributed.strategy.sglang_strategy import postprocess_generate
         assert "multi_modal_data" not in payload
         url = f"http://{self.router_ip}:{self.router_port}/generate"
+        route_meta = payload.get("_roll_route_meta")
+        if not isinstance(route_meta, dict):
+            route_meta = {}
+        route_meta["gateway_post_start_ts"] = time.time()
         headers = self._build_router_headers(payload)
         response = self.client_sync.post(url, json=payload, headers=headers)
+        route_meta["gateway_response_headers_ts"] = time.time()
         raise_for_status(response)
         selected_worker_url = response.headers.get("x-smg-selected-worker-url")
         raw_response = response.json()
+        route_meta["gateway_body_done_ts"] = time.time()
         chunks = raw_response if isinstance(raw_response, list) else [raw_response]
         out = postprocess_generate(chunks)
         self._attach_selected_backend_from_header(selected_worker_url, out)
+        for key in ("gateway_post_start_ts", "gateway_response_headers_ts", "gateway_body_done_ts"):
+            if key in route_meta:
+                out[key] = route_meta[key]
+        router_return_ts = time.time()
+        route_meta["router_return_ts"] = router_return_ts
+        out["router_return_ts"] = router_return_ts
         return out
 
     def on_send_request_sync(self, request_id):
@@ -753,6 +1433,10 @@ class RouterClient:
         route_meta = {}
         for key in (
             "trajectory_id",
+            "global_step",
+            "model_version",
+            "weight_version",
+            "kv_lease_model_version",
             "request_type",
             "resume_generation",
             "pause_ts",
@@ -810,6 +1494,97 @@ class RouterClient:
             output_data.meta_info["selected_backend_id"] = response["selected_backend_id"]
         for key in (
             "selected_worker_url",
+            "router_handle_start_ts",
+            "router_resume_enter_ts",
+            "router_after_lookup_ts",
+            "router_after_priority_ts",
+            "router_after_schedule_ts",
+            "gateway_post_start_ts",
+            "gateway_response_headers_ts",
+            "gateway_body_done_ts",
+            "resume_fast_path",
+            "resume_fast_path_reason",
+            "router_return_ts",
+            "direct_worker_data_path",
+            "policy_route_submit_ts",
+            "policy_route_submit_done_ts",
+            "policy_route_return_ts",
+            "policy_slim_route_request",
+            "resume_dispatch_value",
+            "resume_dispatch_expected_saved_tokens",
+            "resume_dispatch_queue_cost_tokens",
+            "resume_dispatch_memory_pressure_cost_tokens",
+            "resume_dispatch_inflight",
+            "resume_dispatch_inflight_ratio",
+            "resume_dispatch_memory_pressure",
+            "resume_dispatch_history_len_for_value",
+            "resume_dispatch_matched_tokens_for_value",
+            "resume_dispatch_p_hit_for_value",
+            "resume_dispatch_value_source_matched",
+            "resume_dispatch_value_source_p_hit",
+            "resume_dispatch_value_source_prior",
+            "resume_dispatch_value_min",
+            "resume_admission_admitted",
+            "route_model_version",
+            "kv_lease_model_version",
+            "kv_lease_model_version_match",
+            "kv_lease_stale_version_blocked",
+            "kv_hit_same_version",
+            "kv_hit_stale_version_blocked",
+            "engine_kv_pinned_tokens",
+            "engine_kv_evicted_tokens",
+            "engine_kv_evicted_pinned_tokens",
+            "engine_kv_lease_hit",
+            "engine_kv_lease_miss",
+            "engine_kv_lease_stale_version_blocked",
+            "policy_local_route_hint",
+            "policy_local_route_hint_hit",
+            "policy_local_route_hint_reason",
+            "policy_local_route_hint_lease_remaining_s",
+            "policy_local_route_hint_lease_score",
+            "policy_local_route_hint_p_hit",
+            "policy_local_route_hint_cache_age_s",
+            "policy_local_route_hint_use_dispatch_value",
+            "policy_local_route_hint_dispatch_value",
+            "policy_local_route_hint_expected_saved_tokens",
+            "policy_local_route_hint_expected_source_matched",
+            "policy_local_route_hint_expected_source_p_hit",
+            "policy_local_route_hint_expected_source_prior",
+            "policy_local_route_hint_history_len_for_value",
+            "policy_local_route_hint_matched_tokens_for_value",
+            "policy_local_route_hint_p_hit_for_value",
+            "policy_local_route_hint_default_p_hit",
+            "policy_local_route_hint_queue_cost_tokens",
+            "policy_local_route_hint_memory_pressure_cost_tokens",
+            "policy_local_route_hint_inflight",
+            "policy_local_route_hint_inflight_ratio",
+            "policy_local_route_hint_memory_pressure",
+            "policy_worker_submit_ts",
+            "policy_worker_submit_done_ts",
+            "policy_worker_return_ts",
+            "policy_observe_submit_ts",
+            "policy_observe_submit_done_ts",
+            "policy_observe_return_ts",
+            "policy_observe_async",
+            "observe_in_critical_path",
+            "observe_pending_count",
+            "observe_drain_count",
+            "router_route_decision_done_ts",
+            "router_route_return_ts",
+            "router_slim_route_request",
+            "router_fast_route_path",
+            "router_fast_route_reason",
+            "router_observe_recv_ts",
+            "engine_start_ts",
+            "engine_first_token_ts",
+            "engine_finish_ts",
+    "worker_generator_done_ts",
+    "worker_postprocess_done_ts",
+    "worker_log_done_ts",
+    "worker_log_skipped",
+    "router_worker_response_ts",
+    "router_observe_done_ts",
+    "policy_ray_submit_done_ts",
             "resume_enqueue_ts",
             "resume_dispatch_ts",
             "resume_queue_wait_s",
@@ -838,6 +1613,8 @@ class RouterClient:
             "memory_pressure",
             "pending_resume_lease_ttl_s",
             "pending_resume_lease_score",
+            "belief_estimated_hit_tokens",
+            "belief_estimated_prefill_tokens",
             "lookup_resume_found",
             "lookup_hit_tokens",
             "lookup_cache_confidence",
@@ -856,6 +1633,29 @@ class RouterClient:
             "p_hit_measured",
             "p_hit_effective",
             "p_hit_belief",
+            "saved_prefill_tokens",
+            "saved_prefill_ms",
+            "saved_prefill_ms_per_gb_second",
+            "pinned_kv_gb_seconds",
+            "avoidable_reprefill_tokens",
+            "dead_pinned_kv_gb_seconds",
+            "hot_resume_miss_ratio",
+            "locality_mismatch_count",
+            "queue_decay_loss_ms",
+            "queue_decay_loss_proxy",
+            "kv_lease_effective_ttl_s",
+            "kv_lease_state_code",
+            "kv_lease_state_created",
+            "kv_lease_state_active",
+            "kv_lease_state_renewed",
+            "kv_lease_state_expired",
+            "kv_lease_state_released",
+            "kv_lease_state_evicted",
+            "kv_lease_version",
+            "kv_lease_record_ttl_s",
+            "kv_lease_record_score",
+            "kv_lease_remaining_s",
+            "kv_lease_backend_id",
         ):
             if key in response:
                 output_data.meta_info[key] = response[key]
@@ -907,6 +1707,15 @@ class Router:
     @abstractmethod
     async def generate_request(self, payload, request_id, uid):
         pass
+
+    async def route_request(self, payload, request_id, uid):
+        raise NotImplementedError(f"{self.__class__.__name__} does not support route_request")
+
+    async def observe_result(self, route_decision: Dict[str, Any], response: Dict[str, Any]):
+        raise NotImplementedError(f"{self.__class__.__name__} does not support observe_result")
+
+    async def observe_error(self, route_decision: Dict[str, Any], error_summary: Dict[str, Any]):
+        raise NotImplementedError(f"{self.__class__.__name__} does not support observe_error")
 
     @abstractmethod
     async def abort_requests(self, request_ids, uid):
@@ -1354,6 +2163,31 @@ class EnvAffinityRouter(Router):
             )
         self.fairness_enable = bool(router_config.get("fairness_enable", False))
         self.fairness_boost_max = float(router_config.get("fairness_boost_max", 1.0))
+        self.enable_resume_fast_path = bool(router_config.get("enable_resume_fast_path", True))
+        self.resume_fast_path_max_load = int(router_config.get("resume_fast_path_max_load", self.max_running_requests_per_worker))
+        self.enable_direct_worker_data_path = bool(router_config.get("enable_direct_worker_data_path", False))
+        self.enable_async_observe_result = bool(router_config.get("enable_async_observe_result", False))
+        self.enable_slim_route_request = bool(router_config.get("enable_slim_route_request", False))
+        self.enable_router_fast_route_path = bool(router_config.get("enable_router_fast_route_path", False))
+        self.enable_policy_local_route_hint = bool(router_config.get("enable_policy_local_route_hint", False))
+        self.policy_local_route_hint_max_pause_age_s = float(router_config.get("policy_local_route_hint_max_pause_age_s", 300.0))
+        self.policy_local_route_hint_max_inflight_per_worker = int(router_config.get("policy_local_route_hint_max_inflight_per_worker", 64))
+        self.policy_local_route_hint_min_lease_score = float(router_config.get("policy_local_route_hint_min_lease_score", 0.0))
+        self.policy_local_route_hint_min_p_hit = float(router_config.get("policy_local_route_hint_min_p_hit", 0.0))
+        self.policy_local_route_hint_require_lease_alive = bool(router_config.get("policy_local_route_hint_require_lease_alive", False))
+        self.policy_local_route_hint_use_dispatch_value = bool(router_config.get("policy_local_route_hint_use_dispatch_value", False))
+        self.policy_local_route_hint_min_dispatch_value = float(router_config.get("policy_local_route_hint_min_dispatch_value", 0.0))
+        self.policy_local_route_hint_queue_cost_tokens = float(router_config.get("policy_local_route_hint_queue_cost_tokens", 128.0))
+        self.policy_local_route_hint_memory_pressure_cost_tokens = float(router_config.get("policy_local_route_hint_memory_pressure_cost_tokens", 0.0))
+        self.policy_local_route_hint_default_p_hit = max(0.0, min(1.0, float(router_config.get("policy_local_route_hint_default_p_hit", 0.5))))
+        self.enable_resume_dispatch_value_admission = bool(router_config.get("enable_resume_dispatch_value_admission", False))
+        self.resume_dispatch_value_min = float(router_config.get("resume_dispatch_value_min", self.policy_local_route_hint_min_dispatch_value))
+        self.resume_dispatch_value_queue_cost_tokens = float(router_config.get("resume_dispatch_value_queue_cost_tokens", self.policy_local_route_hint_queue_cost_tokens))
+        self.resume_dispatch_value_memory_pressure_cost_tokens = float(router_config.get("resume_dispatch_value_memory_pressure_cost_tokens", self.policy_local_route_hint_memory_pressure_cost_tokens))
+        self.resume_dispatch_value_default_p_hit = max(0.0, min(1.0, float(router_config.get("resume_dispatch_value_default_p_hit", self.policy_local_route_hint_default_p_hit))))
+        self.resume_dispatch_value_degrade_to_least_load = bool(router_config.get("resume_dispatch_value_degrade_to_least_load", True))
+        self.observe_pending_max = int(router_config.get("observe_pending_max", 4096))
+        self.observe_drain_interval_s = float(router_config.get("observe_drain_interval_s", 0.1))
 
         # Unified rollback switch: disable all resume-priority behaviors.
         if not self.enable_resume_priority:
@@ -1371,6 +2205,9 @@ class EnvAffinityRouter(Router):
             self.normal_max_queue_wait_s = 0.0
             self.resume_max_queue_wait_s = 0.0
         # Pending requests split by request_type for soft-quota dispatch.
+        self.kv_lease_records: Dict[str, KvLeaseRecord] = {}
+        self.kv_lease_transition_counts: Dict[str, int] = defaultdict(int)
+        self.resume_admission_counts: Dict[str, int] = defaultdict(int)
         self.pending_resume_requests: Dict[str, PendingTrajectoryRequest] = {}
         self.pending_normal_requests: Dict[str, PendingTrajectoryRequest] = {}
         self.cancelled_pending_requests: Set[str] = set()
@@ -1419,7 +2256,32 @@ class EnvAffinityRouter(Router):
             f"adaptive_quota_use_affinity_signal={self.adaptive_quota_use_affinity_signal}, "
             f"adaptive_quota_affinity_window={self.adaptive_quota_affinity_window}, "
             f"adaptive_quota_min_feasible_rate={self.adaptive_quota_min_feasible_rate}, "
-            f"adaptive_quota_min_hit_rate={self.adaptive_quota_min_hit_rate}"
+            f"adaptive_quota_min_hit_rate={self.adaptive_quota_min_hit_rate}, "
+            f"enable_resume_fast_path={self.enable_resume_fast_path}, "
+            f"resume_fast_path_max_load={self.resume_fast_path_max_load}, "
+            f"enable_direct_worker_data_path={self.enable_direct_worker_data_path}, "
+            f"enable_async_observe_result={self.enable_async_observe_result}, "
+            f"enable_slim_route_request={self.enable_slim_route_request}, "
+            f"enable_router_fast_route_path={self.enable_router_fast_route_path}, "
+            f"enable_policy_local_route_hint={self.enable_policy_local_route_hint}, "
+            f"policy_local_route_hint_max_pause_age_s={self.policy_local_route_hint_max_pause_age_s}, "
+            f"policy_local_route_hint_max_inflight_per_worker={self.policy_local_route_hint_max_inflight_per_worker}, "
+            f"policy_local_route_hint_min_lease_score={self.policy_local_route_hint_min_lease_score}, "
+            f"policy_local_route_hint_min_p_hit={self.policy_local_route_hint_min_p_hit}, "
+            f"policy_local_route_hint_require_lease_alive={self.policy_local_route_hint_require_lease_alive}, "
+            f"policy_local_route_hint_use_dispatch_value={self.policy_local_route_hint_use_dispatch_value}, "
+            f"policy_local_route_hint_min_dispatch_value={self.policy_local_route_hint_min_dispatch_value}, "
+            f"policy_local_route_hint_queue_cost_tokens={self.policy_local_route_hint_queue_cost_tokens}, "
+            f"policy_local_route_hint_memory_pressure_cost_tokens={self.policy_local_route_hint_memory_pressure_cost_tokens}, "
+            f"policy_local_route_hint_default_p_hit={self.policy_local_route_hint_default_p_hit}, "
+            f"enable_resume_dispatch_value_admission={self.enable_resume_dispatch_value_admission}, "
+            f"resume_dispatch_value_min={self.resume_dispatch_value_min}, "
+            f"resume_dispatch_value_queue_cost_tokens={self.resume_dispatch_value_queue_cost_tokens}, "
+            f"resume_dispatch_value_memory_pressure_cost_tokens={self.resume_dispatch_value_memory_pressure_cost_tokens}, "
+            f"resume_dispatch_value_default_p_hit={self.resume_dispatch_value_default_p_hit}, "
+            f"resume_dispatch_value_degrade_to_least_load={self.resume_dispatch_value_degrade_to_least_load}, "
+            f"observe_pending_max={self.observe_pending_max}, "
+            f"observe_drain_interval_s={self.observe_drain_interval_s}"
         )
 
     async def _poll_gateway_backend_state_loop(self) -> None:
@@ -1650,6 +2512,19 @@ class EnvAffinityRouter(Router):
         tid = route_meta.get("trajectory_id")
         return tid if isinstance(tid, str) and tid else None
 
+    def _route_model_version(self, route_meta: Dict[str, Any]) -> Optional[int]:
+        if not isinstance(route_meta, dict):
+            return None
+        for key in ("kv_lease_model_version", "model_version", "weight_version", "global_step"):
+            value = route_meta.get(key)
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
     def _worker_load_for_rank(self, dp_rank: int) -> float:
         local = float(len(self.running_requests[dp_rank]))
         if self.gateway_inflight_load_weight <= 0:
@@ -1711,6 +2586,7 @@ class EnvAffinityRouter(Router):
         tid = self._trajectory_id_from_route_meta(route_meta)
         if not tid:
             return
+        self._attach_kv_lease_state_meta(route_meta, tid)
         ttl = route_meta.get("resume_lease_ttl_s")
         if ttl is None:
             ttl = route_meta.get("pending_resume_lease_ttl_s")
@@ -1726,6 +2602,53 @@ class EnvAffinityRouter(Router):
             route_meta["last_backend_id"] = bid
             self.scheduling_state.set_last_lease_backend_id(tid, bid)
 
+    def _clear_lookup_route_meta(self, route_meta: Dict[str, Any]) -> None:
+        for key in _LOOKUP_ROUTE_META_RESPONSE_KEYS:
+            route_meta.pop(key, None)
+
+    def _populate_belief_resume_estimates(self, route_meta: Dict[str, Any]) -> None:
+        history_len = max(0.0, float(route_meta.get("history_len_tokens", 0.0) or 0.0))
+        p_hit = float(route_meta.get("belief_p_hit", 0.45) or 0.45)
+        p_hit = min(max(p_hit, 0.0), 1.0)
+
+        lease_ttl = route_meta.get("resume_lease_ttl_s")
+        if lease_ttl is None:
+            lease_ttl = route_meta.get("pending_resume_lease_ttl_s")
+        ttl_factor = 1.0
+        try:
+            if lease_ttl is not None:
+                lease_ttl = float(lease_ttl)
+                if lease_ttl <= 0.0:
+                    ttl_factor = 0.25
+                elif lease_ttl < 1.0:
+                    ttl_factor = 0.5 + 0.5 * lease_ttl
+        except (TypeError, ValueError):
+            ttl_factor = 1.0
+
+        lease_score = route_meta.get("resume_lease_score")
+        if lease_score is None:
+            lease_score = route_meta.get("pending_resume_lease_score")
+        lease_factor = 1.0
+        try:
+            if lease_score is not None:
+                lease_score = float(lease_score)
+                lease_factor = 0.5 + 0.5 * min(max(lease_score, 0.0), 1.0)
+        except (TypeError, ValueError):
+            lease_factor = 1.0
+
+        try:
+            memory_pressure = float(route_meta.get("memory_pressure", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            memory_pressure = 0.0
+        memory_factor = max(0.25, 1.0 - min(max(memory_pressure, 0.0), 1.0) * 0.5)
+
+        affinity_factor = 1.0 if route_meta.get("last_backend_id") is not None else 0.35
+        estimated_hit = history_len * p_hit * ttl_factor * lease_factor * memory_factor * affinity_factor
+        estimated_hit = min(history_len, max(0.0, estimated_hit))
+        route_meta["belief_estimated_hit_tokens"] = float(estimated_hit)
+        route_meta["belief_estimated_prefill_tokens"] = float(max(0.0, history_len - estimated_hit))
+        route_meta["resume_lookup_mode"] = "heuristic"
+
     async def _push_kv_lease_inproc(
         self,
         dp_rank: int,
@@ -1734,26 +2657,46 @@ class EnvAffinityRouter(Router):
         ttl_s: float,
         lease_score: float,
         belief_level: Optional[str] = None,
+        model_version: Optional[int] = None,
     ) -> bool:
         if not (0 <= dp_rank < len(self.workers)):
             return False
         try:
-            result = await self.workers[dp_rank].set_kv_lease.remote(
-                trajectory_id=trajectory_id,
-                ttl_s=float(ttl_s),
-                lease_score=float(lease_score),
-                belief_level=belief_level,
-            )
-            return bool(isinstance(result, dict) and result.get("ok"))
+            try:
+                result = await self.workers[dp_rank].set_kv_lease.remote(
+                    trajectory_id=trajectory_id,
+                    ttl_s=float(ttl_s),
+                    lease_score=float(lease_score),
+                    belief_level=belief_level,
+                    model_version=model_version,
+                )
+            except TypeError as e:
+                if "model_version" not in str(e):
+                    raise
+                result = await self.workers[dp_rank].set_kv_lease.remote(
+                    trajectory_id=trajectory_id,
+                    ttl_s=float(ttl_s),
+                    lease_score=float(lease_score),
+                    belief_level=belief_level,
+                )
+            ok = bool(isinstance(result, dict) and result.get("ok"))
+            if not ok:
+                logger.warning(
+                    "inproc set_kv_lease returned non-ok dp_rank=%s tid=%s result=%s",
+                    dp_rank,
+                    trajectory_id,
+                    result,
+                )
+            return ok
         except Exception as e:
-            logger.debug("inproc set_kv_lease failed dp_rank=%s tid=%s: %s", dp_rank, trajectory_id, e)
+            logger.warning("inproc set_kv_lease failed dp_rank=%s tid=%s: %s", dp_rank, trajectory_id, e)
             return False
 
-    async def _lookup_resume_inproc(self, dp_rank: int, trajectory_id: str) -> LookupResumeResult:
+    async def _lookup_resume_inproc(self, dp_rank: int, trajectory_id: str, model_version: Optional[int] = None) -> LookupResumeResult:
         if not (0 <= dp_rank < len(self.workers)):
             return LookupResumeResult()
         try:
-            result = await self.workers[dp_rank].lookup_kv_resume.remote(trajectory_id)
+            result = await self.workers[dp_rank].lookup_kv_resume.remote(trajectory_id, model_version=model_version)
             if isinstance(result, dict):
                 out = lookup_result_from_worker_payload(result)
                 if out.worker_url is None and 0 <= dp_rank < len(self.worker_urls):
@@ -1786,13 +2729,15 @@ class EnvAffinityRouter(Router):
             p_hit = float(route_meta.get("belief_p_hit", 0.0) or 0.0)
             v_traj = float(route_meta.get("trajectory_value", 0.0) or 0.0)
             self._resolve_ttl_s(route_meta, level, p_hit, v_traj)
-        await self._maybe_push_kv_lease(route_meta, phase="tool_suspend")
+        self._schedule_kv_lease_push(route_meta, phase="tool_suspend")
 
     async def _enrich_resume_route_meta(self, route_meta: Dict[str, Any]) -> None:
-        """L2: optional lookup_resume before computing resume priority."""
+        """Optional online lookup or heuristic resume enrichment before computing resume priority."""
         self._sync_scheduling_meta(route_meta)
         await self._push_kv_lease_before_resume_lookup(route_meta)
         if not self.enable_lookup_resume:
+            self._clear_lookup_route_meta(route_meta)
+            self._populate_belief_resume_estimates(route_meta)
             return
         tid = self._trajectory_id_from_route_meta(route_meta)
         if not tid:
@@ -1803,6 +2748,9 @@ class EnvAffinityRouter(Router):
         worker_url: Optional[str] = None
         if isinstance(last_backend_id, int) and 0 <= last_backend_id < len(self.worker_urls):
             worker_url = self.worker_urls[last_backend_id]
+        model_version = self._route_model_version(route_meta)
+        if model_version is not None:
+            route_meta["route_model_version"] = float(model_version)
         headers = {str(k): str(v) for k, v in self.gateway_kv_headers.items()} or None
         timeout_s = max(self.lookup_resume_timeout_s, self.lease_worker_timeout_s)
         result = None
@@ -1812,7 +2760,7 @@ class EnvAffinityRouter(Router):
             and is_inproc_worker_url(worker_url)
         )
         if use_inproc:
-            result = await self._lookup_resume_inproc(last_backend_id, tid)
+            result = await self._lookup_resume_inproc(last_backend_id, tid, model_version=model_version)
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s)) as client:
             if (
                 not use_inproc
@@ -1824,6 +2772,7 @@ class EnvAffinityRouter(Router):
                     worker_url,
                     tid,
                     lookup_path_template=self.lease_worker_lookup_path,
+                    model_version=model_version,
                     headers=headers,
                     timeout_s=timeout_s,
                 )
@@ -1839,11 +2788,25 @@ class EnvAffinityRouter(Router):
                     tid,
                     lookup_path_template=self.gateway_kv_lookup_path,
                     worker_url=worker_url,
+                    model_version=model_version,
                     headers=headers,
                     timeout_s=timeout_s,
                 )
         if result is None:
             return
+        for key, value in (
+            ("kv_lease_model_version_match", 1.0),
+            ("kv_lease_stale_version_blocked", 0.0),
+            ("kv_hit_same_version", 0.0),
+            ("kv_hit_stale_version_blocked", 0.0),
+            ("engine_kv_pinned_tokens", 0.0),
+            ("engine_kv_evicted_tokens", 0.0),
+            ("engine_kv_evicted_pinned_tokens", 0.0),
+            ("engine_kv_lease_hit", 0.0),
+            ("engine_kv_lease_miss", 0.0),
+            ("engine_kv_lease_stale_version_blocked", 0.0),
+        ):
+            route_meta.setdefault(key, value)
         route_meta["lookup_resume_found"] = 1.0 if result.found else 0.0
         route_meta["lookup_hit_tokens"] = float(result.hit_tokens)
         route_meta["lookup_cache_confidence"] = float(result.cache_confidence)
@@ -1855,6 +2818,24 @@ class EnvAffinityRouter(Router):
             route_meta["ttl_remaining_s"] = float(result.lease_remaining_s)
         if result.memory_pressure is not None:
             route_meta["memory_pressure"] = float(result.memory_pressure)
+        for key, value in (
+            ("kv_lease_model_version", result.lease_model_version),
+            ("route_model_version", result.request_model_version),
+            ("kv_lease_model_version_match", result.model_version_match),
+            ("kv_lease_stale_version_blocked", result.stale_version_blocked),
+            ("kv_hit_stale_version_blocked", result.stale_version_blocked),
+            ("engine_kv_pinned_tokens", result.engine_kv_pinned_tokens),
+            ("engine_kv_evicted_tokens", result.engine_kv_evicted_tokens),
+            ("engine_kv_evicted_pinned_tokens", result.engine_kv_evicted_pinned_tokens),
+            ("engine_kv_lease_hit", result.engine_kv_lease_hit),
+            ("engine_kv_lease_miss", result.engine_kv_lease_miss),
+            ("engine_kv_lease_stale_version_blocked", result.engine_kv_lease_stale_version_blocked),
+        ):
+            if value is None:
+                continue
+            route_meta[key] = float(value) if isinstance(value, bool) else value
+        if result.model_version_match is not None:
+            route_meta["kv_hit_same_version"] = 1.0 if result.found and result.model_version_match else 0.0
         if (
             result.lookup_source != "gateway_local_unconfirmed"
             and result.worker_url
@@ -1870,6 +2851,7 @@ class EnvAffinityRouter(Router):
                 history_len_tokens=float(route_meta.get("history_len_tokens", 0) or 0),
             )
             route_meta["p_hit_bias"] = self.scheduling_state.get_p_hit_bias(tid)
+        route_meta["resume_lookup_mode"] = "lookup"
 
     def _refresh_pending_resume_priorities(self) -> None:
         if not self.enable_refresh_resume_priority_on_dispatch:
@@ -1886,6 +2868,245 @@ class EnvAffinityRouter(Router):
                 request_type="resume",
                 route_meta=pending.route_meta,
             )
+
+
+    @staticmethod
+    def _route_float_value(source: Optional[Dict[str, Any]], *keys: str) -> Optional[float]:
+        if not isinstance(source, dict):
+            return None
+        for key in keys:
+            value = source.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _current_kv_lease_record(self, trajectory_id: Optional[str]) -> Optional[KvLeaseRecord]:
+        if not trajectory_id:
+            return None
+        self._expire_kv_lease_records()
+        return self.kv_lease_records.get(trajectory_id)
+
+    def _expire_kv_lease_records(self, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else now
+        for record in list(self.kv_lease_records.values()):
+            if record.state in ("created", "active", "renewed") and record.expires_at > 0.0 and record.expires_at <= now:
+                self._set_kv_lease_state(
+                    record.trajectory_id,
+                    "expired",
+                    backend_id=record.backend_id,
+                    ttl_s=record.ttl_s,
+                    lease_score=record.lease_score,
+                    model_version=record.model_version,
+                    phase=record.phase,
+                    reason="ttl_expired",
+                    now=now,
+                )
+
+    def _set_kv_lease_state(
+        self,
+        trajectory_id: Optional[str],
+        state: str,
+        *,
+        backend_id: Optional[int] = None,
+        ttl_s: Optional[float] = None,
+        lease_score: Optional[float] = None,
+        model_version: Optional[int] = None,
+        phase: str = "",
+        reason: str = "",
+        now: Optional[float] = None,
+    ) -> Optional[KvLeaseRecord]:
+        if not trajectory_id or state not in KV_LEASE_STATE_CODES:
+            return None
+        now = time.time() if now is None else now
+        old = self.kv_lease_records.get(trajectory_id)
+        if old is None:
+            record = KvLeaseRecord(
+                trajectory_id=trajectory_id,
+                state=state,
+                backend_id=backend_id,
+                ttl_s=max(0.0, float(ttl_s or 0.0)),
+                lease_score=max(0.0, float(lease_score or 0.0)),
+                created_ts=now,
+                updated_ts=now,
+                expires_at=now + max(0.0, float(ttl_s or 0.0)) if ttl_s is not None else 0.0,
+                version=1,
+                model_version=model_version,
+                phase=phase,
+                last_transition_reason=reason,
+            )
+        else:
+            record = old
+            record.state = state
+            if backend_id is not None:
+                record.backend_id = backend_id
+            if ttl_s is not None:
+                record.ttl_s = max(0.0, float(ttl_s))
+                record.expires_at = now + record.ttl_s if record.ttl_s > 0.0 else 0.0
+            if lease_score is not None:
+                record.lease_score = max(0.0, float(lease_score))
+            if model_version is not None:
+                record.model_version = model_version
+            record.updated_ts = now
+            record.version += 1
+            record.phase = phase or record.phase
+            record.last_transition_reason = reason
+        self.kv_lease_records[trajectory_id] = record
+        self.kv_lease_transition_counts[state] += 1
+        return record
+
+    def _attach_kv_lease_state_meta(self, route_meta: Dict[str, Any], trajectory_id: Optional[str] = None) -> None:
+        tid = trajectory_id or self._trajectory_id_from_route_meta(route_meta)
+        record = self._current_kv_lease_record(tid)
+        route_model_version = self._route_model_version(route_meta)
+        if route_model_version is not None:
+            route_meta["route_model_version"] = float(route_model_version)
+        for key, value in (
+            ("kv_lease_model_version_match", 1.0),
+            ("kv_lease_stale_version_blocked", 0.0),
+            ("kv_hit_same_version", 0.0),
+            ("kv_hit_stale_version_blocked", 0.0),
+            ("engine_kv_pinned_tokens", 0.0),
+            ("engine_kv_evicted_tokens", 0.0),
+            ("engine_kv_evicted_pinned_tokens", 0.0),
+            ("engine_kv_lease_hit", 0.0),
+            ("engine_kv_lease_miss", 0.0),
+            ("engine_kv_lease_stale_version_blocked", 0.0),
+        ):
+            route_meta.setdefault(key, value)
+        if record is None:
+            return
+        stale_version_blocked = False
+        if (
+            route_model_version is not None
+            and record.model_version is not None
+            and int(record.model_version) != int(route_model_version)
+            and record.state in ("created", "active", "renewed")
+        ):
+            stale_version_blocked = True
+            record = self._set_kv_lease_state(
+                tid,
+                "expired",
+                backend_id=record.backend_id,
+                ttl_s=record.ttl_s,
+                lease_score=record.lease_score,
+                model_version=record.model_version,
+                phase=record.phase,
+                reason="model_version_mismatch",
+            ) or record
+        now = time.time()
+        route_meta["kv_lease_state_code"] = float(KV_LEASE_STATE_CODES.get(record.state, 0))
+        for state in KV_LEASE_STATES:
+            route_meta[f"kv_lease_state_{state}"] = 1.0 if record.state == state else 0.0
+        route_meta["kv_lease_version"] = float(record.version)
+        route_meta["kv_lease_record_ttl_s"] = float(record.ttl_s)
+        route_meta["kv_lease_record_score"] = float(record.lease_score)
+        route_meta["kv_lease_remaining_s"] = max(0.0, record.expires_at - now) if record.expires_at > 0.0 else 0.0
+        if record.model_version is not None:
+            route_meta["kv_lease_model_version"] = float(record.model_version)
+        version_match = (
+            route_model_version is None
+            or record.model_version is None
+            or int(record.model_version) == int(route_model_version)
+        )
+        route_meta["kv_lease_model_version_match"] = 1.0 if version_match else 0.0
+        route_meta["kv_lease_stale_version_blocked"] = 1.0 if stale_version_blocked else 0.0
+        hot_state = record.state in ("created", "active", "renewed")
+        route_meta["kv_hit_same_version"] = 1.0 if hot_state and version_match else 0.0
+        route_meta["kv_hit_stale_version_blocked"] = 1.0 if stale_version_blocked else 0.0
+        if record.backend_id is not None:
+            route_meta["kv_lease_backend_id"] = float(record.backend_id)
+
+    def _compute_resume_dispatch_value_for_rank(
+        self,
+        route_meta: Dict[str, Any],
+        dp_rank: Optional[int] = None,
+    ) -> Tuple[Optional[float], str]:
+        history_len = self._route_float_value(route_meta, "history_len_tokens", "resume_history_len_tokens")
+        matched_tokens = self._route_float_value(route_meta, "matched_prefix_tokens", "saved_prefill_tokens", "lookup_hit_tokens")
+        p_hit = self._route_float_value(
+            route_meta,
+            "p_hit_effective",
+            "p_hit_measured",
+            "belief_p_hit",
+            "cache_confidence",
+            "lookup_cache_confidence",
+        )
+        source_matched = 0.0
+        source_p_hit = 0.0
+        source_prior = 0.0
+        effective_p_hit = p_hit
+        if matched_tokens is not None and matched_tokens > 0.0:
+            expected_saved_tokens = matched_tokens
+            source_matched = 1.0
+        elif history_len is not None and p_hit is not None:
+            effective_p_hit = max(0.0, min(1.0, p_hit))
+            expected_saved_tokens = effective_p_hit * max(0.0, history_len)
+            source_p_hit = 1.0
+        elif history_len is not None:
+            effective_p_hit = self.resume_dispatch_value_default_p_hit
+            expected_saved_tokens = effective_p_hit * max(0.0, history_len)
+            source_prior = 1.0
+        else:
+            route_meta["resume_admission_reason"] = "dispatch_value_missing"
+            return None, "dispatch_value_missing"
+
+        if dp_rank is not None and isinstance(dp_rank, int):
+            inflight = float(self._worker_load_for_rank(dp_rank))
+        else:
+            inflight = 0.0
+        max_inflight = max(1.0, float(self.max_running_requests_per_worker or self.router_args.max_running_requests or 1))
+        inflight_ratio = inflight / max_inflight
+        queue_cost = max(0.0, self.resume_dispatch_value_queue_cost_tokens) * inflight_ratio
+        memory_pressure = self._route_float_value(route_meta, "memory_pressure") or 0.0
+        memory_pressure = max(0.0, memory_pressure)
+        memory_cost = max(0.0, self.resume_dispatch_value_memory_pressure_cost_tokens) * memory_pressure
+        dispatch_value = expected_saved_tokens - queue_cost - memory_cost
+
+        route_meta["resume_dispatch_value"] = dispatch_value
+        route_meta["resume_dispatch_expected_saved_tokens"] = expected_saved_tokens
+        route_meta["resume_dispatch_queue_cost_tokens"] = queue_cost
+        route_meta["resume_dispatch_memory_pressure_cost_tokens"] = memory_cost
+        route_meta["resume_dispatch_inflight"] = inflight
+        route_meta["resume_dispatch_inflight_ratio"] = inflight_ratio
+        route_meta["resume_dispatch_memory_pressure"] = memory_pressure
+        route_meta["resume_dispatch_history_len_for_value"] = max(0.0, history_len) if history_len is not None else 0.0
+        route_meta["resume_dispatch_matched_tokens_for_value"] = max(0.0, matched_tokens) if matched_tokens is not None else 0.0
+        route_meta["resume_dispatch_p_hit_for_value"] = max(0.0, min(1.0, effective_p_hit)) if effective_p_hit is not None else 0.0
+        route_meta["resume_dispatch_value_source_matched"] = source_matched
+        route_meta["resume_dispatch_value_source_p_hit"] = source_p_hit
+        route_meta["resume_dispatch_value_source_prior"] = source_prior
+        route_meta["resume_dispatch_value_min"] = float(self.resume_dispatch_value_min)
+        return dispatch_value, "ok"
+
+    def _resume_dispatch_value_admitted(self, route_meta: Dict[str, Any], dp_rank: Optional[int] = None) -> bool:
+        if not self.enable_resume_dispatch_value_admission or route_meta.get("request_type") != "resume":
+            route_meta.setdefault("resume_admission_decision", "disabled")
+            route_meta.setdefault("resume_admission_admitted", 1.0)
+            return True
+        dispatch_value, reason = self._compute_resume_dispatch_value_for_rank(route_meta, dp_rank)
+        if dispatch_value is None:
+            route_meta["resume_admission_decision"] = "degrade"
+            route_meta["resume_admission_reason"] = reason
+            route_meta["resume_admission_admitted"] = 0.0
+            return False
+        if dispatch_value < self.resume_dispatch_value_min:
+            route_meta["resume_admission_decision"] = "degrade"
+            route_meta["resume_admission_reason"] = "dispatch_value_low"
+            route_meta["resume_admission_admitted"] = 0.0
+            return False
+        route_meta["resume_admission_decision"] = "admit"
+        route_meta["resume_admission_reason"] = "dispatch_value_ok"
+        route_meta["resume_admission_admitted"] = 1.0
+        return True
+
+    def _least_load_candidate(self, candidate_ranks: List[int]) -> Optional[int]:
+        if not candidate_ranks:
+            return None
+        return min(candidate_ranks, key=lambda r: self._worker_load_for_rank(r))
 
     def _sync_scheduling_meta(self, route_meta: Dict[str, Any]) -> None:
         tid = self._trajectory_id_from_route_meta(route_meta)
@@ -1923,6 +3144,10 @@ class EnvAffinityRouter(Router):
         gateway_url = getattr(self, "gateway_url", None) or self.gateway_status_url
         timeout_s = max(self.lookup_resume_timeout_s, self.lease_worker_timeout_s)
         belief_level = str(route_meta.get("belief_level", "")) or None
+        model_version = self._route_model_version(route_meta)
+        if model_version is not None:
+            route_meta["route_model_version"] = float(model_version)
+            route_meta["kv_lease_model_version"] = float(model_version)
         ok_any = False
         use_inproc = (
             isinstance(last_backend_id, int)
@@ -1939,6 +3164,7 @@ class EnvAffinityRouter(Router):
                     ttl_s=float(ttl),
                     lease_score=float(score),
                     belief_level=belief_level,
+                    model_version=model_version,
                 ):
                     ok_any = True
             elif worker_url and self.lease_push_mode in ("worker", "both"):
@@ -1949,6 +3175,7 @@ class EnvAffinityRouter(Router):
                     ttl_s=float(ttl),
                     lease_score=float(score),
                     belief_level=belief_level,
+                    model_version=model_version,
                     lease_path=self.lease_worker_path,
                     headers=headers,
                     timeout_s=timeout_s,
@@ -1963,6 +3190,7 @@ class EnvAffinityRouter(Router):
                     lease_score=float(score),
                     worker_url=worker_url,
                     belief_level=belief_level,
+                    model_version=model_version,
                     lease_path=self.gateway_kv_lease_path,
                     headers=headers,
                     timeout_s=timeout_s,
@@ -1977,6 +3205,19 @@ class EnvAffinityRouter(Router):
             await _push(client)
         if ok_any:
             self.lease_push_success_count += 1
+            previous = self.kv_lease_records.get(tid)
+            next_state = "renewed" if previous is not None and previous.state in ("active", "renewed") else "active"
+            self._set_kv_lease_state(
+                tid,
+                next_state,
+                backend_id=last_backend_id if isinstance(last_backend_id, int) else None,
+                ttl_s=float(ttl),
+                lease_score=float(score),
+                model_version=model_version,
+                phase=phase,
+                reason="push_success",
+            )
+            self._attach_kv_lease_state_meta(route_meta, tid)
             if isinstance(last_backend_id, int):
                 self.scheduling_state.set_last_lease_backend_id(tid, last_backend_id)
         else:
@@ -2043,6 +3284,7 @@ class EnvAffinityRouter(Router):
             await _delete(client)
         if ok_any:
             self.lease_delete_success_count += 1
+            self._set_kv_lease_state(trajectory_id, "released", phase="delete", reason="delete_success")
         return ok_any
 
     async def set_tool_suspend_lease(self, route_meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -2064,12 +3306,15 @@ class EnvAffinityRouter(Router):
             p_hit = float(route_meta.get("belief_p_hit", 0.0) or 0.0)
             v_traj = float(route_meta.get("trajectory_value", 0.0) or 0.0)
             self._resolve_ttl_s(route_meta, level, p_hit, v_traj)
-        await self._maybe_push_kv_lease(route_meta, phase="tool_suspend")
+        self._schedule_kv_lease_push(route_meta, phase="tool_suspend")
+        self._attach_kv_lease_state_meta(route_meta)
         return {
             "pushed": bool(self.enable_gateway_kv_lease_push and self.enable_value_driven_lease),
             "trajectory_id": self._trajectory_id_from_route_meta(route_meta),
             "ttl_s": route_meta.get("resume_lease_ttl_s"),
             "lease_score": route_meta.get("resume_lease_score"),
+            "kv_lease_state_code": route_meta.get("kv_lease_state_code"),
+            "kv_lease_remaining_s": route_meta.get("kv_lease_remaining_s"),
         }
 
     async def delete_kv_lease(self, trajectory_id: str) -> Dict[str, Any]:
@@ -2560,6 +3805,22 @@ class EnvAffinityRouter(Router):
                 return min(candidate_ranks, key=lambda r: self._worker_load_for_rank(r))
 
         if self.enable_resume_aware_routing and request_type == "resume":
+            candidate_ranks = [r for r in self.active_dp_ranks if self._has_worker_capacity(r)]
+            if not candidate_ranks:
+                return None
+            preferred_rank = route_meta.get("last_backend_id")
+            if not isinstance(preferred_rank, int):
+                preferred_rank = self.src_rank2_dp_rank.get(src_rank)
+            admitted = True
+            if isinstance(preferred_rank, int) and preferred_rank in candidate_ranks:
+                admitted = self._resume_dispatch_value_admitted(route_meta, preferred_rank)
+            elif self.enable_resume_dispatch_value_admission:
+                self._resume_dispatch_value_admitted(route_meta, None)
+            if not admitted and self.resume_dispatch_value_degrade_to_least_load:
+                return self._least_load_candidate(candidate_ranks)
+            if admitted and isinstance(preferred_rank, int) and preferred_rank in candidate_ranks and route_meta.get("pause_age_s", 0.0) < self.force_migrate_age_s:
+                route_meta.setdefault("resume_admission_reason", "dispatch_value_affinity")
+                return preferred_rank
             if self.enable_system_cost_resume_scheduling:
                 return self._select_worker_system_cost(pending)
             if self.enable_trajectory_value_scheduling:
@@ -2636,9 +3897,15 @@ class EnvAffinityRouter(Router):
         eff_score = base_priority + self.request_wait_aging_weight * queue_wait_s
         self.score_bucket_served[f"resume/{bucketize_score(eff_score)}"] += 1
 
+        self._record_resume_admission(route_meta)
         reason = self._resume_fallback_reason(route_meta=route_meta, selected_dp_rank=dp_rank, previous_rank=previous_rank)
         if reason != "hit":
             self.resume_fallback_reason_count[reason] += 1
+
+    def _record_resume_admission(self, route_meta: Dict[str, Any]) -> None:
+        admission_decision = str(route_meta.get("resume_admission_decision", "disabled"))
+        admission_reason = str(route_meta.get("resume_admission_reason", admission_decision))
+        self.resume_admission_counts[f"{admission_decision}/{admission_reason}"] += 1
 
     def _record_normal_dispatch(self, *, enqueue_ts: float, base_priority: float) -> None:
         queue_wait_s = max(0.0, time.time() - enqueue_ts)
@@ -2677,18 +3944,224 @@ class EnvAffinityRouter(Router):
         if not candidate_ranks:
             raise RuntimeError("No active DP ranks with capacity")
         fallback_last_backend = self.src_rank2_dp_rank.get(src_rank)
+        preferred_rank = route_meta.get("last_backend_id")
+        if not isinstance(preferred_rank, int):
+            preferred_rank = fallback_last_backend
+        admitted = True
+        if isinstance(preferred_rank, int) and preferred_rank in candidate_ranks:
+            admitted = self._resume_dispatch_value_admitted(route_meta, preferred_rank)
+        elif self.enable_resume_dispatch_value_admission:
+            self._resume_dispatch_value_admitted(route_meta, None)
+        if not admitted and self.resume_dispatch_value_degrade_to_least_load:
+            selected = self._least_load_candidate(candidate_ranks)
+            if selected is not None:
+                return selected
+        if admitted and isinstance(preferred_rank, int) and preferred_rank in candidate_ranks:
+            return preferred_rank
         return max(
             candidate_ranks,
             key=lambda r: self._compute_resume_score(r, route_meta, fallback_last_backend=fallback_last_backend),
         )
 
-    async def generate_request(self, payload, request_id, uid):
+    def _try_resume_fast_path(self, src_rank: int, route_meta: Dict[str, Any]) -> Optional[int]:
+        route_meta["resume_fast_path"] = 0.0
+        if not self.enable_resume_fast_path:
+            route_meta["resume_fast_path_reason"] = "disabled"
+            return None
+        pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
+        if pause_age >= self.force_migrate_age_s:
+            route_meta["resume_fast_path_reason"] = "force_migrate_age"
+            return None
+        preferred_rank = route_meta.get("last_backend_id")
+        if not isinstance(preferred_rank, int):
+            preferred_rank = self.src_rank2_dp_rank.get(src_rank)
+        if not isinstance(preferred_rank, int):
+            route_meta["resume_fast_path_reason"] = "missing_last_backend"
+            return None
+        if not self._resume_dispatch_value_admitted(route_meta, preferred_rank):
+            route_meta["resume_fast_path_reason"] = "dispatch_value_low"
+            return None
+        if preferred_rank not in self.active_dp_ranks:
+            route_meta["resume_fast_path_reason"] = "inactive_backend"
+            return None
+        if not self._has_worker_capacity(preferred_rank):
+            route_meta["resume_fast_path_reason"] = "no_capacity"
+            return None
+        if self._worker_load_for_rank(preferred_rank) > self.resume_fast_path_max_load:
+            route_meta["resume_fast_path_reason"] = "load_guard"
+            return None
+        route_meta["resume_fast_path"] = 1.0
+        route_meta["resume_fast_path_reason"] = "affinity"
+        return preferred_rank
+
+    def _schedule_kv_lease_push(self, route_meta: Dict[str, Any], *, phase: str) -> None:
+        tid = self._trajectory_id_from_route_meta(route_meta)
+        if tid:
+            ttl = route_meta.get("resume_lease_ttl_s") or route_meta.get("pending_resume_lease_ttl_s")
+            score = route_meta.get("resume_lease_score") or route_meta.get("pending_resume_lease_score")
+            backend_id = self._resolve_lease_backend_id(route_meta)
+            try:
+                ttl_f = float(ttl) if ttl is not None else 0.0
+            except (TypeError, ValueError):
+                ttl_f = 0.0
+            try:
+                score_f = float(score) if score is not None else 0.0
+            except (TypeError, ValueError):
+                score_f = 0.0
+            if ttl_f > 0.0:
+                current = self.kv_lease_records.get(tid)
+                if current is None or current.state in ("expired", "released", "evicted"):
+                    self._set_kv_lease_state(tid, "created", backend_id=backend_id, ttl_s=ttl_f, lease_score=score_f, phase=phase, reason="push_scheduled")
+                self._attach_kv_lease_state_meta(route_meta, tid)
+        async def _runner() -> None:
+            try:
+                await self._maybe_push_kv_lease(dict(route_meta), phase=phase)
+            except Exception as e:
+                logger.debug("best-effort kv lease push failed phase=%s tid=%s: %s", phase, self._trajectory_id_from_route_meta(route_meta), e)
+
+        asyncio.create_task(_runner())
+
+    async def route_request(self, payload, request_id, uid):
         route_meta = extract_roll_route_meta(payload)
+        return await self._route_request_from_meta(
+            route_meta=route_meta,
+            request_id=request_id,
+            uid=uid,
+            slim_request=False,
+        )
+
+    async def route_request_slim(self, route_meta: Dict[str, Any], request_id, uid):
+        return await self._route_request_from_meta(
+            route_meta=dict(route_meta or {}),
+            request_id=request_id,
+            uid=uid,
+            slim_request=True,
+        )
+
+    def _build_route_decision(
+        self,
+        *,
+        request_id,
+        src_rank: int,
+        request_type: str,
+        dp_rank: int,
+        route_meta: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        route_meta["router_route_decision_done_ts"] = time.time()
+        route_decision = {
+            "request_id": request_id,
+            "uid": src_rank,
+            "request_type": request_type,
+            "dp_rank": dp_rank,
+            "selected_dp_rank": dp_rank,
+            "selected_worker_name": f"actor_infer-{dp_rank}",
+            "route_reason": route_meta.get("resume_fast_path_reason") or route_meta.get("routing_policy") or self.routing_policy,
+            "route_meta": dict(route_meta),
+            "route_ts": route_meta.get("resume_dispatch_ts", time.time()),
+            "router_route_return_ts": time.time(),
+        }
+        return route_decision
+
+    def _try_router_fast_route_decision(
+        self,
+        *,
+        route_meta: Dict[str, Any],
+        request_id,
+        src_rank: int,
+        request_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.enable_router_fast_route_path:
+            return None
+        if request_type != "resume":
+            return None
+        route_meta["router_fast_route_path"] = 1.0
+        route_meta["router_fast_route_reason"] = "attempt"
+        self._sync_scheduling_meta(route_meta)
+        self._clear_lookup_route_meta(route_meta)
+        self._prepare_lease_route_meta(route_meta)
+        self._populate_belief_resume_estimates(route_meta)
+        if self.enable_gateway_kv_lease_push and self.enable_value_driven_lease:
+            self._schedule_kv_lease_push(route_meta, phase="route_fast_path")
+        previous_rank = self.src_rank2_dp_rank.get(src_rank)
+        pause_age = float(route_meta.get("pause_age_s", 0.0) or 0.0)
+        preferred_rank = route_meta.get("last_backend_id")
+        if not isinstance(preferred_rank, int):
+            preferred_rank = previous_rank
+        candidate_ranks = [r for r in self.active_dp_ranks if self._has_worker_capacity(r)]
+        if not candidate_ranks:
+            route_meta["router_fast_route_reason"] = "no_capacity"
+            return None
+        admitted = True
+        if isinstance(preferred_rank, int) and preferred_rank in candidate_ranks and pause_age < self.force_migrate_age_s:
+            admitted = self._resume_dispatch_value_admitted(route_meta, preferred_rank)
+        if (
+            isinstance(preferred_rank, int)
+            and preferred_rank in candidate_ranks
+            and pause_age < self.force_migrate_age_s
+            and admitted
+        ):
+            dp_rank = preferred_rank
+            route_meta["resume_fast_path"] = 1.0
+            route_meta["resume_fast_path_reason"] = "router_fast_affinity"
+        else:
+            dp_rank = self._least_load_candidate(candidate_ranks)
+            if dp_rank is None:
+                route_meta["router_fast_route_reason"] = "no_capacity"
+                return None
+            if not admitted:
+                route_meta["resume_fast_path_reason"] = "router_fast_dispatch_value_low"
+            else:
+                route_meta["resume_fast_path_reason"] = "router_fast_least_load"
+            route_meta["resume_fast_path"] = 0.0
+        self.src_rank2_dp_rank[src_rank] = dp_rank
+        self.request_id_2_src_rank[request_id] = src_rank
+        self.running_requests[dp_rank].add(request_id)
+        dispatch_ts = time.time()
+        enqueue_ts = float(route_meta.get("resume_enqueue_ts", dispatch_ts) or dispatch_ts)
+        route_meta["resume_enqueue_ts"] = enqueue_ts
+        route_meta["resume_dispatch_ts"] = dispatch_ts
+        route_meta["resume_queue_wait_s"] = max(0.0, dispatch_ts - enqueue_ts)
+        route_meta.setdefault("router_after_lookup_ts", dispatch_ts)
+        route_meta.setdefault("router_after_priority_ts", dispatch_ts)
+        self._record_dispatch_load_metrics(route_meta, dp_rank)
+        self.resume_total_requests += 1
+        self._record_resume_admission(route_meta)
+        if previous_rank is not None and previous_rank == dp_rank:
+            self.resume_affinity_hits += 1
+        elif previous_rank is not None:
+            self.resume_migrations += 1
+        route_meta["router_after_schedule_ts"] = time.time()
+        return self._build_route_decision(
+            request_id=request_id,
+            src_rank=src_rank,
+            request_type=request_type,
+            dp_rank=dp_rank,
+            route_meta=route_meta,
+        )
+
+    async def _route_request_from_meta(self, route_meta: Dict[str, Any], request_id, uid, *, slim_request: bool):
+        route_meta = dict(route_meta or {})
+        route_meta["router_handle_start_ts"] = time.time()
+        route_meta["router_slim_route_request"] = 1.0 if slim_request else 0.0
         request_type = route_meta.get("request_type", "normal")
         src_rank = uid
         if request_type == "resume":
+            route_meta["router_resume_enter_ts"] = time.time()
+            route_meta["resume_enqueue_ts"] = route_meta["router_resume_enter_ts"]
+            fast_decision = self._try_router_fast_route_decision(
+                route_meta=route_meta,
+                request_id=request_id,
+                src_rank=src_rank,
+                request_type=request_type,
+            )
+            if fast_decision is not None:
+                return fast_decision
             await self._enrich_resume_route_meta(route_meta)
+            route_meta["router_after_lookup_ts"] = time.time()
+        route_meta["router_fast_route_path"] = 0.0
         base_priority = self._compute_request_base_priority(request_type=request_type, route_meta=route_meta)
+        if request_type == "resume":
+            route_meta["router_after_priority_ts"] = time.time()
 
         if self.enable_request_priority_queue:
             pending = PendingTrajectoryRequest(
@@ -2712,7 +4185,14 @@ class EnvAffinityRouter(Router):
                             self.cancelled_pending_requests.discard(request_id)
                             self.pending_resume_requests.pop(request_id, None)
                             self.pending_normal_requests.pop(request_id, None)
-                            return self._build_abort_response()
+                            return {
+                                "abort_response": self._build_abort_response(),
+                                "request_id": request_id,
+                                "uid": src_rank,
+                                "request_type": request_type,
+                                "route_meta": dict(route_meta),
+                                "router_route_return_ts": time.time(),
+                            }
                         selected, selected_dp_rank = self._pick_next_dispatchable_request()
                         if selected and selected.request_id == request_id and selected_dp_rank is not None:
                             dp_rank = selected_dp_rank
@@ -2736,6 +4216,7 @@ class EnvAffinityRouter(Router):
                                     base_priority=base_priority,
                                     previous_rank=previous_rank,
                                 )
+                                route_meta["router_after_schedule_ts"] = time.time()
                             else:
                                 self._record_normal_dispatch(
                                     enqueue_ts=pending.enqueue_ts,
@@ -2779,6 +4260,7 @@ class EnvAffinityRouter(Router):
                             base_priority=base_priority,
                             previous_rank=previous_rank,
                         )
+                        route_meta["router_after_schedule_ts"] = time.time()
                 elif self.routing_policy == "hybrid_threshold":
                     previous_rank = self.src_rank2_dp_rank.get(src_rank)
                     candidate_ranks = [r for r in self.active_dp_ranks if self._has_worker_capacity(r)]
@@ -2808,9 +4290,13 @@ class EnvAffinityRouter(Router):
                             base_priority=base_priority,
                             previous_rank=previous_rank,
                         )
+                        route_meta["router_after_schedule_ts"] = time.time()
                 elif self.enable_resume_aware_routing and request_type == "resume":
                     previous_rank = self.src_rank2_dp_rank.get(src_rank)
-                    if self.enable_system_cost_resume_scheduling:
+                    fast_path_rank = self._try_resume_fast_path(src_rank=src_rank, route_meta=route_meta)
+                    if fast_path_rank is not None:
+                        dp_rank = fast_path_rank
+                    elif self.enable_system_cost_resume_scheduling:
                         pending = PendingTrajectoryRequest(
                             request_id=request_id,
                             uid=src_rank,
@@ -2853,72 +4339,275 @@ class EnvAffinityRouter(Router):
                     route_meta["resume_queue_wait_s"] = max(0.0, dispatch_ts - enqueue_ts)
                     self._record_dispatch_load_metrics(route_meta, dp_rank)
 
+        return self._build_route_decision(
+            request_id=request_id,
+            src_rank=src_rank,
+            request_type=request_type,
+            dp_rank=dp_rank,
+            route_meta=route_meta,
+        )
+
+    async def _finish_routed_request(self, *, dp_rank: Optional[int], request_id: str) -> None:
+        if dp_rank is None:
+            return
+        if self.enable_request_priority_queue:
+            async with self.dispatch_condition:
+                self.running_requests[dp_rank].discard(request_id)
+                self.request_id_2_src_rank.pop(request_id, None)
+                self.dispatch_condition.notify_all()
+        else:
+            self.running_requests[dp_rank].discard(request_id)
+            self.request_id_2_src_rank.pop(request_id, None)
+
+    def _attach_route_meta_to_response(self, route_meta: Dict[str, Any], response: Dict[str, Any]) -> None:
+        for key in (
+            "router_handle_start_ts",
+            "router_resume_enter_ts",
+            "router_after_lookup_ts",
+            "router_after_priority_ts",
+            "router_after_schedule_ts",
+            "router_route_decision_done_ts",
+            "router_route_return_ts",
+            "router_slim_route_request",
+            "router_fast_route_path",
+            "router_fast_route_reason",
+            "router_slim_route_request",
+            "router_fast_route_path",
+            "router_fast_route_reason",
+            "gateway_post_start_ts",
+            "gateway_response_headers_ts",
+            "gateway_body_done_ts",
+            "resume_fast_path",
+            "resume_fast_path_reason",
+            "resume_enqueue_ts",
+            "resume_dispatch_ts",
+            "resume_queue_wait_s",
+            "worker_load_skew_at_dispatch",
+            "selected_worker_load_at_dispatch",
+            "routing_policy",
+            "remaining_steps",
+            "max_steps",
+            "remaining_steps_ratio",
+            "trajectory_value",
+            "order_score",
+            "dispatch_score",
+            "system_dispatch_score",
+            "system_delay_regret",
+            "expected_prefill_saved",
+            "belief_level",
+            "belief_p_hit",
+            "resume_lease_ttl_s",
+            "resume_lease_score",
+            "kv_bytes_proxy",
+            "memory_pressure",
+            "pending_resume_lease_ttl_s",
+            "pending_resume_lease_score",
+            *_HEURISTIC_ROUTE_META_RESPONSE_KEYS,
+            *_LOOKUP_ROUTE_META_RESPONSE_KEYS,
+            "resume_dispatch_value",
+            "resume_dispatch_expected_saved_tokens",
+            "resume_dispatch_queue_cost_tokens",
+            "resume_dispatch_memory_pressure_cost_tokens",
+            "resume_dispatch_inflight",
+            "resume_dispatch_inflight_ratio",
+            "resume_dispatch_memory_pressure",
+            "resume_dispatch_history_len_for_value",
+            "resume_dispatch_matched_tokens_for_value",
+            "resume_dispatch_p_hit_for_value",
+            "resume_dispatch_value_source_matched",
+            "resume_dispatch_value_source_p_hit",
+            "resume_dispatch_value_source_prior",
+            "resume_dispatch_value_min",
+            "resume_admission_admitted",
+            "resume_admission_reason",
+            "route_model_version",
+            "kv_lease_model_version",
+            "kv_lease_model_version_match",
+            "kv_lease_stale_version_blocked",
+            "kv_hit_same_version",
+            "kv_hit_stale_version_blocked",
+            "engine_kv_pinned_tokens",
+            "engine_kv_evicted_tokens",
+            "engine_kv_evicted_pinned_tokens",
+            "engine_kv_lease_hit",
+            "engine_kv_lease_miss",
+            "engine_kv_lease_stale_version_blocked",
+            "policy_local_route_hint_lease_remaining_s",
+            "policy_local_route_hint_lease_score",
+            "policy_local_route_hint_p_hit",
+            "policy_local_route_hint_cache_age_s",
+            "policy_local_route_hint_use_dispatch_value",
+            "policy_local_route_hint_dispatch_value",
+            "policy_local_route_hint_expected_saved_tokens",
+            "policy_local_route_hint_expected_source_matched",
+            "policy_local_route_hint_expected_source_p_hit",
+            "policy_local_route_hint_expected_source_prior",
+            "policy_local_route_hint_history_len_for_value",
+            "policy_local_route_hint_matched_tokens_for_value",
+            "policy_local_route_hint_p_hit_for_value",
+            "policy_local_route_hint_default_p_hit",
+            "policy_local_route_hint_queue_cost_tokens",
+            "policy_local_route_hint_memory_pressure_cost_tokens",
+            "policy_local_route_hint_inflight",
+            "policy_local_route_hint_inflight_ratio",
+            "policy_local_route_hint_memory_pressure",
+            "saved_prefill_tokens",
+            "saved_prefill_ms",
+            "saved_prefill_ms_per_gb_second",
+            "pinned_kv_gb_seconds",
+            "avoidable_reprefill_tokens",
+            "dead_pinned_kv_gb_seconds",
+            "hot_resume_miss_ratio",
+            "locality_mismatch_count",
+            "queue_decay_loss_ms",
+            "queue_decay_loss_proxy",
+            "kv_lease_effective_ttl_s",
+            "kv_lease_state_code",
+            "kv_lease_state_created",
+            "kv_lease_state_active",
+            "kv_lease_state_renewed",
+            "kv_lease_state_expired",
+            "kv_lease_state_released",
+            "kv_lease_state_evicted",
+            "kv_lease_version",
+            "kv_lease_record_ttl_s",
+            "kv_lease_record_score",
+            "kv_lease_remaining_s",
+            "kv_lease_backend_id",
+        ):
+            if key in route_meta:
+                response[key] = route_meta[key]
+
+    def _observe_kv_lease_outcome(self, route_meta: Dict[str, Any], response: Dict[str, Any]) -> None:
+        if route_meta.get("request_type") != "resume":
+            return
+        tid = self._trajectory_id_from_route_meta(route_meta)
+        if not tid:
+            return
+        record = self._current_kv_lease_record(tid)
         try:
-            response = await self.workers[dp_rank].generate_request.remote(payload)
-            if isinstance(response, dict):
-                response["selected_backend_id"] = dp_rank
+            actual_hit = float(response.get("actual_hit", route_meta.get("actual_hit", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            actual_hit = 0.0
+        if record is not None and record.state in ("created", "active", "renewed") and actual_hit <= 0.0:
+            self._set_kv_lease_state(
+                tid,
+                "evicted",
+                backend_id=record.backend_id,
+                ttl_s=record.ttl_s,
+                lease_score=record.lease_score,
+                phase="observe_result",
+                reason="resume_cache_miss",
+            )
+        self._attach_kv_lease_state_meta(route_meta, tid)
+        for key in self._kv_lease_route_meta_keys():
+            if key in route_meta:
+                response[key] = route_meta[key]
+
+    @staticmethod
+    def _kv_lease_route_meta_keys() -> Tuple[str, ...]:
+        return (
+            "kv_lease_state_code",
+            "kv_lease_state_created",
+            "kv_lease_state_active",
+            "kv_lease_state_renewed",
+            "kv_lease_state_expired",
+            "kv_lease_state_released",
+            "kv_lease_state_evicted",
+            "kv_lease_version",
+            "kv_lease_record_ttl_s",
+            "kv_lease_record_score",
+            "kv_lease_remaining_s",
+            "kv_lease_backend_id",
+        )
+
+    async def observe_result(self, route_decision: Dict[str, Any], response: Dict[str, Any]):
+        request_id = route_decision.get("request_id") if isinstance(route_decision, dict) else None
+        dp_rank = route_decision.get("dp_rank") if isinstance(route_decision, dict) else None
+        request_type = route_decision.get("request_type") if isinstance(route_decision, dict) else None
+        route_meta = dict(route_decision.get("route_meta") or {}) if isinstance(route_decision, dict) else {}
+        if isinstance(route_decision, dict) and "router_route_return_ts" in route_decision:
+            route_meta.setdefault("router_route_return_ts", route_decision["router_route_return_ts"])
+        observe_recv_ts = time.time()
+        try:
+            if not isinstance(response, dict):
+                return response
+            response["router_observe_recv_ts"] = observe_recv_ts
+            response["selected_backend_id"] = dp_rank
+            self._attach_route_meta_to_response(route_meta, response)
+            if request_type == "resume" and (
+                self.enable_belief_feedback
+                or self.enable_value_driven_lease
+                or self.enable_engine_telemetry
+            ):
+                self._observe_resume_outcome(route_meta, response)
+                self._observe_kv_lease_outcome(route_meta, response)
+                annotate_resume_waste_metrics(route_meta, response)
                 for key in (
-                    "resume_enqueue_ts",
-                    "resume_dispatch_ts",
-                    "resume_queue_wait_s",
-                    "worker_load_skew_at_dispatch",
-                    "selected_worker_load_at_dispatch",
-                    "routing_policy",
-                    "remaining_steps",
-                    "max_steps",
-                    "remaining_steps_ratio",
-                    "trajectory_value",
-                    "order_score",
-                    "dispatch_score",
-                    "system_dispatch_score",
-                    "system_delay_regret",
-                    "expected_prefill_saved",
-                    "belief_level",
-                    "belief_p_hit",
-                    "resume_lease_ttl_s",
-                    "resume_lease_score",
-                    "kv_bytes_proxy",
-                    "memory_pressure",
-                    "pending_resume_lease_ttl_s",
-                    "pending_resume_lease_score",
-                    *_LOOKUP_ROUTE_META_RESPONSE_KEYS,
+                    "context_class",
+                    "context_class_gpu_hit",
+                    "context_class_cpu_reload",
+                    "context_class_full_prefill",
+                    "matched_prefix_tokens",
+                    "resume_prefill_tokens",
+                    "prefill_ratio",
+                    "actual_hit",
+                    "engine_cache_confidence",
+                    "p_hit_measured",
+                    "p_hit_effective",
+                    "saved_prefill_tokens",
+                    "saved_prefill_ms",
+                    "saved_prefill_ms_per_gb_second",
+                    "pinned_kv_gb_seconds",
+                    "avoidable_reprefill_tokens",
+                    "dead_pinned_kv_gb_seconds",
+                    "hot_resume_miss_ratio",
+                    "locality_mismatch_count",
+                    "queue_decay_loss_ms",
+                    "queue_decay_loss_proxy",
+                    "kv_lease_effective_ttl_s",
                 ):
                     if key in route_meta:
                         response[key] = route_meta[key]
-                if request_type == "resume" and (
-                    self.enable_belief_feedback
-                    or self.enable_value_driven_lease
-                    or self.enable_engine_telemetry
-                ):
-                    self._observe_resume_outcome(route_meta, response)
-                    for key in (
-                        "context_class",
-                        "context_class_gpu_hit",
-                        "context_class_cpu_reload",
-                        "context_class_full_prefill",
-                        "matched_prefix_tokens",
-                        "resume_prefill_tokens",
-                        "prefill_ratio",
-                        "actual_hit",
-                        "engine_cache_confidence",
-                        "p_hit_measured",
-                        "p_hit_effective",
-                    ):
-                        if key in route_meta:
-                            response[key] = route_meta[key]
-                        elif key in response:
-                            route_meta[key] = response[key]
+                    elif key in response:
+                        route_meta[key] = response[key]
+            if request_type == "resume":
+                annotate_resume_waste_metrics(route_meta, response)
+            response["router_observe_done_ts"] = time.time()
             return response
         finally:
-            if self.enable_request_priority_queue:
-                async with self.dispatch_condition:
-                    self.running_requests[dp_rank].discard(request_id)
-                    # Cleanup tracking (on both success and abort paths)
-                    self.request_id_2_src_rank.pop(request_id, None)
-                    self.dispatch_condition.notify_all()
-            else:
-                self.running_requests[dp_rank].discard(request_id)
-                self.request_id_2_src_rank.pop(request_id, None)
+            if request_id is not None:
+                await self._finish_routed_request(dp_rank=dp_rank, request_id=request_id)
+
+    async def observe_error(self, route_decision: Dict[str, Any], error_summary: Dict[str, Any]):
+        request_id = route_decision.get("request_id") if isinstance(route_decision, dict) else None
+        dp_rank = route_decision.get("dp_rank") if isinstance(route_decision, dict) else None
+        try:
+            logger.warning("route request failed request_id=%s dp_rank=%s error=%s", request_id, dp_rank, error_summary)
+            return {"observed": True, "request_id": request_id, "dp_rank": dp_rank, "error": error_summary}
+        finally:
+            if request_id is not None:
+                await self._finish_routed_request(dp_rank=dp_rank, request_id=request_id)
+
+    async def generate_request(self, payload, request_id, uid):
+        route_decision = await self.route_request(payload=payload, request_id=request_id, uid=uid)
+        if isinstance(route_decision, dict) and "abort_response" in route_decision:
+            return route_decision["abort_response"]
+        dp_rank = route_decision["dp_rank"]
+        try:
+            response = await self.workers[dp_rank].generate_request.remote(payload)
+            if isinstance(response, dict):
+                response["router_worker_response_ts"] = time.time()
+            response = await self.observe_result(route_decision=route_decision, response=response)
+            if isinstance(response, dict):
+                response["router_return_ts"] = time.time()
+            return response
+        except Exception as e:
+            await self.observe_error(
+                route_decision=route_decision,
+                error_summary={"error_type": type(e).__name__, "error_message": str(e), "router_error_ts": time.time()},
+            )
+            raise
 
     async def abort_requests(self, request_ids, uid):
         raise NotImplementedError
@@ -2994,6 +4683,17 @@ class EnvAffinityRouter(Router):
             metrics[f"scheduler/router/score_bucket_served/{bucket}"] = float(served)
         for reason, cnt in self.resume_fallback_reason_count.items():
             metrics[f"scheduler/router/resume_fallback_reason/{reason}"] = float(cnt)
+        for reason, cnt in self.resume_admission_counts.items():
+            safe_reason = str(reason).replace("/", "_")
+            metrics[f"scheduler/router/resume_admission/{safe_reason}"] = float(cnt)
+        self._expire_kv_lease_records()
+        lease_state_counts = defaultdict(int)
+        for record in self.kv_lease_records.values():
+            lease_state_counts[record.state] += 1
+        for state in KV_LEASE_STATES:
+            metrics[f"scheduler/router/kv_lease_state/{state}_current"] = float(lease_state_counts.get(state, 0))
+            if self.kv_lease_transition_counts.get(state):
+                metrics[f"scheduler/router/kv_lease_transition/{state}"] = float(self.kv_lease_transition_counts[state])
         if self.trajectory_value_sum and self.resume_total_requests:
             metrics["scheduler/router/trajectory_value_mean"] = (
                 self.trajectory_value_sum / float(self.resume_total_requests)
@@ -3546,10 +5246,11 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
             if isinstance(history_len_tokens, int):
                 headers["X-ROLL-History-Len-Tokens"] = str(history_len_tokens)
             self._attach_lease_headers(headers, route_meta)
-            await self._maybe_push_kv_lease(route_meta, phase="resume")
+            self._schedule_kv_lease_push(route_meta, phase="resume")
 
         url = f"{self.gateway_url}{self.gateway_generate_path}"
         response = None
+        route_meta["gateway_post_start_ts"] = time.time()
         for attempt in range(max(1, self.gateway_generate_retry_503 + 1)):
             response = await self.client.post(url, json=payload, headers=headers)
             if response.status_code != 503:
@@ -3562,13 +5263,37 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
                 )
             await asyncio.sleep(self.gateway_generate_retry_backoff_s * (1.5 ** min(attempt, 8)))
         assert response is not None
+        route_meta["gateway_response_headers_ts"] = time.time()
         raise_for_status(response)
         if route_meta.pop("_roll_used_pending_tool_lease", False):
             self.scheduling_state.consume_pending_tool_lease(
                 self._trajectory_id_from_route_meta(route_meta)
             )
         raw = response.json()
+        route_meta["gateway_body_done_ts"] = time.time()
         chunks = raw if isinstance(raw, list) else [raw]
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            chunk_meta = chunk.get("meta_info")
+            if not isinstance(chunk_meta, dict):
+                chunk_meta = {}
+                chunk["meta_info"] = chunk_meta
+            for key in (
+                "gateway_post_start_ts",
+                "gateway_response_headers_ts",
+                "gateway_body_done_ts",
+                "router_handle_start_ts",
+                "router_resume_enter_ts",
+                "router_after_lookup_ts",
+                "router_after_priority_ts",
+                "router_after_schedule_ts",
+                "resume_enqueue_ts",
+                "resume_dispatch_ts",
+                "resume_queue_wait_s",
+            ):
+                if key in route_meta and key not in chunk_meta:
+                    chunk_meta[key] = route_meta[key]
         out = postprocess_generate(chunks)
         selected_worker_url = response.headers.get("x-smg-selected-worker-url")
         if isinstance(selected_worker_url, str) and selected_worker_url in self.worker_urls:
@@ -3602,6 +5327,12 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
             except (TypeError, ValueError):
                 pass
         for key in (
+            "router_handle_start_ts",
+            "gateway_post_start_ts",
+            "gateway_response_headers_ts",
+            "gateway_body_done_ts",
+            "resume_fast_path",
+            "resume_fast_path_reason",
             "resume_enqueue_ts",
             "resume_dispatch_ts",
             "resume_queue_wait_s",
@@ -3615,12 +5346,54 @@ class SglangOrderingRouter(SglangRouter, EnvAffinityRouter):
             "belief_p_hit",
             "kv_bytes_proxy",
             "memory_pressure",
+            *_HEURISTIC_ROUTE_META_RESPONSE_KEYS,
             *_LOOKUP_ROUTE_META_RESPONSE_KEYS,
+            "policy_local_route_hint_lease_remaining_s",
+            "policy_local_route_hint_lease_score",
+            "policy_local_route_hint_p_hit",
+            "policy_local_route_hint_cache_age_s",
+            "policy_local_route_hint_use_dispatch_value",
+            "policy_local_route_hint_dispatch_value",
+            "policy_local_route_hint_expected_saved_tokens",
+            "policy_local_route_hint_expected_source_matched",
+            "policy_local_route_hint_expected_source_p_hit",
+            "policy_local_route_hint_expected_source_prior",
+            "policy_local_route_hint_history_len_for_value",
+            "policy_local_route_hint_matched_tokens_for_value",
+            "policy_local_route_hint_p_hit_for_value",
+            "policy_local_route_hint_default_p_hit",
+            "policy_local_route_hint_queue_cost_tokens",
+            "policy_local_route_hint_memory_pressure_cost_tokens",
+            "policy_local_route_hint_inflight",
+            "policy_local_route_hint_inflight_ratio",
+            "policy_local_route_hint_memory_pressure",
+            "saved_prefill_tokens",
+            "saved_prefill_ms",
+            "saved_prefill_ms_per_gb_second",
+            "pinned_kv_gb_seconds",
+            "avoidable_reprefill_tokens",
+            "dead_pinned_kv_gb_seconds",
+            "hot_resume_miss_ratio",
+            "locality_mismatch_count",
+            "queue_decay_loss_ms",
+            "queue_decay_loss_proxy",
+            "kv_lease_effective_ttl_s",
         ):
             if key in route_meta:
                 out[key] = route_meta[key]
         self._attach_selected_backend_affinity_info(route_meta, out)
         self._attach_context_lifecycle_info(route_meta, out)
+        router_return_ts = time.time()
+        route_meta["router_return_ts"] = router_return_ts
+        out["router_return_ts"] = router_return_ts
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            chunk_meta = chunk.get("meta_info")
+            if not isinstance(chunk_meta, dict):
+                chunk_meta = {}
+                chunk["meta_info"] = chunk_meta
+            chunk_meta.setdefault("router_return_ts", router_return_ts)
         return out
 
     def _attach_selected_backend_id(self, chunks: List[Dict[str, Any]], out: Dict[str, Any]) -> None:

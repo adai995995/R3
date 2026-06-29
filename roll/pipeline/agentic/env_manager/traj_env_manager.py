@@ -77,8 +77,23 @@ class TrajEnvManager(BaseEnvManager):
         self._resume_e2e_latency_samples: list[float] = []
         self._resume_infer_latency_samples: list[float] = []
         self._resume_prefill_tokens_samples: list[float] = []
+        self._resume_actual_hit_samples: list[Optional[float]] = []
+        self._resume_matched_prefix_tokens_samples: list[Optional[float]] = []
+        self._resume_pinned_kv_gb_seconds_samples: list[Optional[float]] = []
+        self._resume_prefill_ratio_samples: list[Optional[float]] = []
+        self._resume_saved_prefill_ms_samples: list[Optional[float]] = []
         self._external_wait_samples: list[float] = []
         self._resume_queue_wait_samples: list[float] = []
+        self._resume_client_submit_before_samples: list[float] = []
+        self._resume_pre_router_samples: list[float] = []
+        self._resume_router_lookup_samples: list[float] = []
+        self._resume_router_priority_samples: list[float] = []
+        self._resume_router_schedule_samples: list[float] = []
+        self._resume_dispatch_to_engine_start_samples: list[float] = []
+        self._resume_engine_ttft_samples: list[float] = []
+        self._resume_decode_tail_samples: list[float] = []
+        self._resume_router_return_overhead_samples: list[float] = []
+        self._resume_post_router_overhead_samples: list[float] = []
         self.use_thread_lock = self.env_config.get("use_thread_lock", False) # 避免同时执行大量cpu操作, 可以通过env_config配置
         self.thread_lock = thread_lock if self.use_thread_lock else nullcontext()
         # Set environment step concurrency limit
@@ -228,8 +243,23 @@ class TrajEnvManager(BaseEnvManager):
         self._resume_e2e_latency_samples = []
         self._resume_infer_latency_samples = []
         self._resume_prefill_tokens_samples = []
+        self._resume_actual_hit_samples = []
+        self._resume_matched_prefix_tokens_samples = []
+        self._resume_pinned_kv_gb_seconds_samples = []
+        self._resume_prefill_ratio_samples = []
+        self._resume_saved_prefill_ms_samples = []
         self._external_wait_samples = []
         self._resume_queue_wait_samples = []
+        self._resume_client_submit_before_samples = []
+        self._resume_pre_router_samples = []
+        self._resume_router_lookup_samples = []
+        self._resume_router_priority_samples = []
+        self._resume_router_schedule_samples = []
+        self._resume_dispatch_to_engine_start_samples = []
+        self._resume_engine_ttft_samples = []
+        self._resume_decode_tail_samples = []
+        self._resume_router_return_overhead_samples = []
+        self._resume_post_router_overhead_samples = []
         self._pending_resume_lease_ttl_s: Optional[float] = None
         self._pending_resume_lease_score: Optional[float] = None
 
@@ -335,7 +365,7 @@ class TrajEnvManager(BaseEnvManager):
     def _maybe_set_pending_tool_suspend_lease(self) -> None:
         """Register tool-wait KV lease before external tool blocks in env.step (L1 suspend)."""
         snapshot = get_scheduling_weight_snapshot()
-        if snapshot is None or not self.trajectory_id or self._last_backend_id is None:
+        if not self.trajectory_id or self._last_backend_id is None:
             return
         traj_signals = compute_trajectory_signals(
             history=self.rollout_cache.history,
@@ -350,42 +380,59 @@ class TrajEnvManager(BaseEnvManager):
                 history_len_tokens += len(entry["prompt_ids"])
             if entry.get("response_ids") is not None:
                 history_len_tokens += len(entry["response_ids"])
+        state = get_trajectory_scheduling_state()
+        t_tool = state.get_t_tool_s(self.trajectory_id)
         route_meta = {
             "trajectory_id": self.trajectory_id,
             "request_type": "resume",
             "last_backend_id": int(self._last_backend_id) if self._last_backend_id is not None else None,
+            "global_step": int(self.current_step),
+            "model_version": int(self.current_step),
+            "weight_version": int(self.current_step),
+            "kv_lease_model_version": int(self.current_step),
             "env_id": self.env_config["env_id"],
             "history_len_tokens": float(history_len_tokens),
+            "scheduling_t_tool_s": float(t_tool),
             **traj_signals,
         }
-        state = get_trajectory_scheduling_state()
-        t_tool = state.get_t_tool_s(self.trajectory_id)
-        bias = state.get_p_hit_bias(self.trajectory_id)
-        ttl, score, _, _ = plan_tool_suspend_lease(
-            route_meta,
-            belief=snapshot.belief,
-            force_migrate_age_s=snapshot.force_migrate_age_s,
-            value_weights=snapshot.value_weights,
-            penalty_weights=snapshot.penalty_weights,
-            lease_weights=snapshot.lease_weights,
-            t_tool_s=t_tool,
-            p_hit_bias=bias,
-            feedback_hot_downgrade_bias=snapshot.feedback_hot_downgrade_bias,
-            use_system_cost=snapshot.enable_system_cost_resume_scheduling,
-            system_cost_weights=snapshot.system_cost_weights,
-        )
-        route_meta["resume_lease_ttl_s"] = ttl
-        route_meta["resume_lease_score"] = score
-        state.set_pending_tool_lease(
-            self.trajectory_id,
-            ttl_s=ttl,
-            lease_score=score,
-            backend_id=self._last_backend_id,
-        )
-        self._pending_resume_lease_ttl_s = ttl
-        self._pending_resume_lease_score = score
+        if snapshot is not None:
+            bias = state.get_p_hit_bias(self.trajectory_id)
+            ttl, score, _, _ = plan_tool_suspend_lease(
+                route_meta,
+                belief=snapshot.belief,
+                force_migrate_age_s=snapshot.force_migrate_age_s,
+                value_weights=snapshot.value_weights,
+                penalty_weights=snapshot.penalty_weights,
+                lease_weights=snapshot.lease_weights,
+                t_tool_s=t_tool,
+                p_hit_bias=bias,
+                feedback_hot_downgrade_bias=snapshot.feedback_hot_downgrade_bias,
+                use_system_cost=snapshot.enable_system_cost_resume_scheduling,
+                system_cost_weights=snapshot.system_cost_weights,
+            )
+            route_meta["resume_lease_ttl_s"] = ttl
+            route_meta["resume_lease_score"] = score
+            state.set_pending_tool_lease(
+                self.trajectory_id,
+                ttl_s=ttl,
+                lease_score=score,
+                backend_id=self._last_backend_id,
+            )
+            self._pending_resume_lease_ttl_s = ttl
+            self._pending_resume_lease_score = score
         result = self._call_router_control_sync("set_tool_suspend_lease", route_meta, timeout_s=2.0)
         if isinstance(result, dict):
+            ttl = result.get("ttl_s")
+            score = result.get("lease_score")
+            if ttl is not None and score is not None:
+                state.set_pending_tool_lease(
+                    self.trajectory_id,
+                    ttl_s=float(ttl),
+                    lease_score=float(score),
+                    backend_id=self._last_backend_id,
+                )
+                self._pending_resume_lease_ttl_s = float(ttl)
+                self._pending_resume_lease_score = float(score)
             self.logger.debug("set_tool_suspend_lease result for %s: %s", self.trajectory_id, result)
 
     def _scheduling_fields_for_meta(self) -> Dict[str, float]:
@@ -529,6 +576,10 @@ class TrajEnvManager(BaseEnvManager):
         )
         lm_input.meta_info.update({
             "trajectory_id": self.trajectory_id,
+            "global_step": int(self.current_step),
+            "model_version": int(self.current_step),
+            "weight_version": int(self.current_step),
+            "kv_lease_model_version": int(self.current_step),
             "env_id": self.env_config["env_id"],
             "request_type": request_type,
             "resume_generation": self._resume_generation,
@@ -579,12 +630,177 @@ class TrajEnvManager(BaseEnvManager):
         # - resume_infer_latency_s: only generation RPC latency for this resume turn
         # - resume_prefill_tokens: proxy for resume prefill/reload cost
         if request_type == "resume":
+            def _meta_float(key: str) -> Optional[float]:
+                value = lm_output.meta_info.get(key)
+                if value is None:
+                    return None
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return None
+
             resume_infer_latency_s = max(0.0, infer_end_ts - infer_start_ts)
             self._resume_infer_latency_samples.append(resume_infer_latency_s)
-            self._resume_prefill_tokens_samples.append(float(input_ids.shape[1]))
+
+            history_len_tokens = float(input_ids.shape[1])
+            resume_prefill_tokens = _meta_float("resume_prefill_tokens")
+            if resume_prefill_tokens is None:
+                resume_prefill_tokens = history_len_tokens
+            self._resume_prefill_tokens_samples.append(resume_prefill_tokens)
+            self._resume_actual_hit_samples.append(_meta_float("actual_hit"))
+            self._resume_matched_prefix_tokens_samples.append(_meta_float("matched_prefix_tokens"))
+            self._resume_pinned_kv_gb_seconds_samples.append(_meta_float("pinned_kv_gb_seconds"))
+            self._resume_prefill_ratio_samples.append(_meta_float("prefill_ratio"))
+            self._resume_saved_prefill_ms_samples.append(_meta_float("saved_prefill_ms"))
+
             if self._pause_ts is not None:
                 resume_latency_e2e_s = max(0.0, infer_end_ts - self._pause_ts)
                 self._resume_e2e_latency_samples.append(resume_latency_e2e_s)
+
+            client_submit_ts = _meta_float("client_submit_ts")
+            router_handle_start_ts = _meta_float("router_handle_start_ts")
+            router_resume_enter_ts = _meta_float("router_resume_enter_ts")
+            router_after_lookup_ts = _meta_float("router_after_lookup_ts")
+            router_after_priority_ts = _meta_float("router_after_priority_ts")
+            router_after_schedule_ts = _meta_float("router_after_schedule_ts")
+            gateway_post_start_ts = _meta_float("gateway_post_start_ts")
+            gateway_response_headers_ts = _meta_float("gateway_response_headers_ts")
+            gateway_body_done_ts = _meta_float("gateway_body_done_ts")
+            resume_enqueue_ts = _meta_float("resume_enqueue_ts")
+            resume_dispatch_ts = _meta_float("resume_dispatch_ts")
+            router_return_ts = _meta_float("router_return_ts")
+            engine_start_ts = _meta_float("engine_start_ts")
+            engine_first_token_ts = _meta_float("engine_first_token_ts")
+            engine_finish_ts = _meta_float("engine_finish_ts")
+            worker_generator_done_ts = _meta_float("worker_generator_done_ts")
+            worker_postprocess_done_ts = _meta_float("worker_postprocess_done_ts")
+            worker_log_done_ts = _meta_float("worker_log_done_ts")
+            router_worker_response_ts = _meta_float("router_worker_response_ts")
+            router_observe_done_ts = _meta_float("router_observe_done_ts")
+            policy_ray_submit_done_ts = _meta_float("policy_ray_submit_done_ts")
+
+            client_submit_before_s = None
+            if client_submit_ts is not None:
+                client_submit_before_s = max(0.0, client_submit_ts - infer_start_ts)
+                self._resume_client_submit_before_samples.append(client_submit_before_s)
+
+            client_to_router_handle_s = None
+            if client_submit_ts is not None and router_handle_start_ts is not None:
+                client_to_router_handle_s = max(0.0, router_handle_start_ts - client_submit_ts)
+
+            policy_ray_submit_overhead_s = None
+            if client_submit_ts is not None and policy_ray_submit_done_ts is not None:
+                policy_ray_submit_overhead_s = max(0.0, policy_ray_submit_done_ts - client_submit_ts)
+
+            policy_ray_wait_to_router_s = None
+            if policy_ray_submit_done_ts is not None and router_handle_start_ts is not None:
+                policy_ray_wait_to_router_s = max(0.0, router_handle_start_ts - policy_ray_submit_done_ts)
+
+            direct_worker_data_path = _meta_float("direct_worker_data_path")
+            policy_route_submit_ts = _meta_float("policy_route_submit_ts")
+            policy_route_submit_done_ts = _meta_float("policy_route_submit_done_ts")
+            policy_route_return_ts = _meta_float("policy_route_return_ts")
+            policy_worker_submit_ts = _meta_float("policy_worker_submit_ts")
+            policy_worker_submit_done_ts = _meta_float("policy_worker_submit_done_ts")
+            policy_worker_return_ts = _meta_float("policy_worker_return_ts")
+            policy_observe_submit_ts = _meta_float("policy_observe_submit_ts")
+            policy_observe_submit_done_ts = _meta_float("policy_observe_submit_done_ts")
+            policy_observe_return_ts = _meta_float("policy_observe_return_ts")
+            policy_observe_async = _meta_float("policy_observe_async")
+            policy_slim_route_request = _meta_float("policy_slim_route_request")
+            policy_local_route_hint = _meta_float("policy_local_route_hint")
+            policy_local_route_hint_hit = _meta_float("policy_local_route_hint_hit")
+            router_slim_route_request = _meta_float("router_slim_route_request")
+            router_fast_route_path = _meta_float("router_fast_route_path")
+            observe_in_critical_path = _meta_float("observe_in_critical_path")
+            observe_pending_count = _meta_float("observe_pending_count")
+            observe_drain_count = _meta_float("observe_drain_count")
+            router_route_decision_done_ts = _meta_float("router_route_decision_done_ts")
+            router_route_return_ts = _meta_float("router_route_return_ts")
+            router_observe_recv_ts = _meta_float("router_observe_recv_ts")
+
+            route_rpc_latency_s = None
+            if policy_route_submit_ts is not None and policy_route_return_ts is not None:
+                route_rpc_latency_s = max(0.0, policy_route_return_ts - policy_route_submit_ts)
+            router_route_compute_s = None
+            if router_handle_start_ts is not None and router_route_decision_done_ts is not None:
+                router_route_compute_s = max(0.0, router_route_decision_done_ts - router_handle_start_ts)
+            route_return_overhead_s = None
+            if router_route_return_ts is not None and policy_route_return_ts is not None:
+                route_return_overhead_s = max(0.0, policy_route_return_ts - router_route_return_ts)
+            worker_rpc_latency_s = None
+            if policy_worker_submit_ts is not None and policy_worker_return_ts is not None:
+                worker_rpc_latency_s = max(0.0, policy_worker_return_ts - policy_worker_submit_ts)
+            worker_return_overhead_s = None
+            if worker_log_done_ts is not None and policy_worker_return_ts is not None:
+                worker_return_overhead_s = max(0.0, policy_worker_return_ts - worker_log_done_ts)
+            observe_rpc_latency_s = None
+            if policy_observe_submit_ts is not None and policy_observe_return_ts is not None:
+                observe_rpc_latency_s = max(0.0, policy_observe_return_ts - policy_observe_submit_ts)
+            router_observe_compute_s = None
+            if router_observe_recv_ts is not None and router_observe_done_ts is not None:
+                router_observe_compute_s = max(0.0, router_observe_done_ts - router_observe_recv_ts)
+
+            router_handle_to_enqueue_s = None
+            if router_handle_start_ts is not None and resume_enqueue_ts is not None:
+                router_handle_to_enqueue_s = max(0.0, resume_enqueue_ts - router_handle_start_ts)
+
+            pre_router_s = None
+            if client_submit_ts is not None and resume_enqueue_ts is not None:
+                pre_router_s = max(0.0, resume_enqueue_ts - client_submit_ts)
+                self._resume_pre_router_samples.append(pre_router_s)
+
+            router_lookup_s = None
+            if router_resume_enter_ts is not None and router_after_lookup_ts is not None:
+                router_lookup_s = max(0.0, router_after_lookup_ts - router_resume_enter_ts)
+                self._resume_router_lookup_samples.append(router_lookup_s)
+
+            router_priority_s = None
+            if router_after_lookup_ts is not None and router_after_priority_ts is not None:
+                router_priority_s = max(0.0, router_after_priority_ts - router_after_lookup_ts)
+                self._resume_router_priority_samples.append(router_priority_s)
+
+            router_schedule_s = None
+            if router_after_priority_ts is not None and router_after_schedule_ts is not None:
+                router_schedule_s = max(0.0, router_after_schedule_ts - router_after_priority_ts)
+                self._resume_router_schedule_samples.append(router_schedule_s)
+
+            dispatch_to_engine_start_s = None
+            if resume_dispatch_ts is not None and engine_start_ts is not None:
+                dispatch_to_engine_start_s = max(0.0, engine_start_ts - resume_dispatch_ts)
+                self._resume_dispatch_to_engine_start_samples.append(dispatch_to_engine_start_s)
+
+            engine_ttft_s = None
+            if engine_start_ts is not None and engine_first_token_ts is not None:
+                engine_ttft_s = max(0.0, engine_first_token_ts - engine_start_ts)
+                self._resume_engine_ttft_samples.append(engine_ttft_s)
+
+            decode_tail_s = None
+            if engine_first_token_ts is not None and engine_finish_ts is not None:
+                decode_tail_s = max(0.0, engine_finish_ts - engine_first_token_ts)
+                self._resume_decode_tail_samples.append(decode_tail_s)
+
+            gateway_post_to_headers_s = None
+            if gateway_post_start_ts is not None and gateway_response_headers_ts is not None:
+                gateway_post_to_headers_s = max(0.0, gateway_response_headers_ts - gateway_post_start_ts)
+
+            gateway_body_parse_s = None
+            if gateway_response_headers_ts is not None and gateway_body_done_ts is not None:
+                gateway_body_parse_s = max(0.0, gateway_body_done_ts - gateway_response_headers_ts)
+
+            router_tail_after_body_s = None
+            if gateway_body_done_ts is not None and router_return_ts is not None:
+                router_tail_after_body_s = max(0.0, router_return_ts - gateway_body_done_ts)
+
+            router_return_overhead_s = None
+            if engine_finish_ts is not None and router_return_ts is not None:
+                router_return_overhead_s = max(0.0, router_return_ts - engine_finish_ts)
+                self._resume_router_return_overhead_samples.append(router_return_overhead_s)
+
+            post_router_overhead_s = None
+            if router_return_ts is not None:
+                post_router_overhead_s = max(0.0, infer_end_ts - router_return_ts)
+                self._resume_post_router_overhead_samples.append(post_router_overhead_s)
 
             if "metrics" not in content or not isinstance(content["metrics"], dict):
                 content["metrics"] = {}
@@ -593,14 +809,153 @@ class TrajEnvManager(BaseEnvManager):
             if self._resume_e2e_latency_samples:
                 content["metrics"]["resume_latency_e2e_s"] = self._resume_e2e_latency_samples[-1]
             content["metrics"]["resume_infer_start_ts"] = infer_start_ts
-            content["metrics"]["resume_first_token_ts"] = infer_end_ts
+            content["metrics"]["resume_client_submit_ts"] = client_submit_ts
+            content["metrics"]["router_handle_start_ts"] = router_handle_start_ts
+            content["metrics"]["router_resume_enter_ts"] = router_resume_enter_ts
+            content["metrics"]["router_after_lookup_ts"] = router_after_lookup_ts
+            content["metrics"]["router_after_priority_ts"] = router_after_priority_ts
+            content["metrics"]["router_after_schedule_ts"] = router_after_schedule_ts
+            content["metrics"]["gateway_post_start_ts"] = gateway_post_start_ts
+            content["metrics"]["gateway_response_headers_ts"] = gateway_response_headers_ts
+            content["metrics"]["gateway_body_done_ts"] = gateway_body_done_ts
+            content["metrics"]["resume_enqueue_ts"] = resume_enqueue_ts
+            content["metrics"]["resume_dispatch_ts"] = resume_dispatch_ts
+            content["metrics"]["engine_start_ts"] = engine_start_ts
+            content["metrics"]["engine_first_token_ts"] = engine_first_token_ts
+            content["metrics"]["resume_first_token_ts"] = engine_first_token_ts if engine_first_token_ts is not None else infer_end_ts
+            content["metrics"]["engine_finish_ts"] = engine_finish_ts
+            content["metrics"]["router_return_ts"] = router_return_ts
             content["metrics"]["resume_infer_end_ts"] = infer_end_ts
             content["metrics"]["resume_infer_latency_s"] = resume_infer_latency_s
-            content["metrics"]["resume_prefill_tokens"] = float(input_ids.shape[1])
-            content["metrics"]["resume_history_len_tokens"] = float(input_ids.shape[1])
+            content["metrics"]["resume_prefill_tokens"] = resume_prefill_tokens
+            content["metrics"]["resume_history_len_tokens"] = history_len_tokens
+            if client_submit_before_s is not None:
+                content["metrics"]["resume_client_submit_before_s"] = client_submit_before_s
+            if client_to_router_handle_s is not None:
+                content["metrics"]["resume_client_to_router_handle_s"] = client_to_router_handle_s
+            if router_handle_to_enqueue_s is not None:
+                content["metrics"]["resume_router_handle_to_enqueue_s"] = router_handle_to_enqueue_s
+            if pre_router_s is not None:
+                content["metrics"]["resume_pre_router_s"] = pre_router_s
+            if router_lookup_s is not None:
+                content["metrics"]["resume_router_lookup_s"] = router_lookup_s
+            if router_priority_s is not None:
+                content["metrics"]["resume_router_priority_s"] = router_priority_s
+            if router_schedule_s is not None:
+                content["metrics"]["resume_router_schedule_s"] = router_schedule_s
+            if dispatch_to_engine_start_s is not None:
+                content["metrics"]["resume_dispatch_to_engine_start_s"] = dispatch_to_engine_start_s
+            if engine_ttft_s is not None:
+                content["metrics"]["resume_engine_ttft_s"] = engine_ttft_s
+            if decode_tail_s is not None:
+                content["metrics"]["resume_decode_tail_s"] = decode_tail_s
+            if gateway_post_to_headers_s is not None:
+                content["metrics"]["resume_gateway_post_to_headers_s"] = gateway_post_to_headers_s
+            if gateway_body_parse_s is not None:
+                content["metrics"]["resume_gateway_body_parse_s"] = gateway_body_parse_s
+            if router_tail_after_body_s is not None:
+                content["metrics"]["resume_router_tail_after_body_s"] = router_tail_after_body_s
+            if router_return_overhead_s is not None:
+                content["metrics"]["resume_router_return_overhead_s"] = router_return_overhead_s
+            if post_router_overhead_s is not None:
+                content["metrics"]["resume_post_router_overhead_s"] = post_router_overhead_s
+
+            content["metrics"]["worker_generator_done_ts"] = worker_generator_done_ts
+            content["metrics"]["worker_postprocess_done_ts"] = worker_postprocess_done_ts
+            content["metrics"]["worker_log_done_ts"] = worker_log_done_ts
+            content["metrics"]["router_worker_response_ts"] = router_worker_response_ts
+            content["metrics"]["router_observe_done_ts"] = router_observe_done_ts
+            content["metrics"]["policy_ray_submit_done_ts"] = policy_ray_submit_done_ts
+            content["metrics"]["direct_worker_data_path"] = direct_worker_data_path
+            content["metrics"]["policy_route_submit_ts"] = policy_route_submit_ts
+            content["metrics"]["policy_route_submit_done_ts"] = policy_route_submit_done_ts
+            content["metrics"]["policy_route_return_ts"] = policy_route_return_ts
+            content["metrics"]["policy_worker_submit_ts"] = policy_worker_submit_ts
+            content["metrics"]["policy_worker_submit_done_ts"] = policy_worker_submit_done_ts
+            content["metrics"]["policy_worker_return_ts"] = policy_worker_return_ts
+            content["metrics"]["policy_observe_submit_ts"] = policy_observe_submit_ts
+            content["metrics"]["policy_observe_submit_done_ts"] = policy_observe_submit_done_ts
+            content["metrics"]["policy_observe_return_ts"] = policy_observe_return_ts
+            content["metrics"]["policy_observe_async"] = policy_observe_async
+            content["metrics"]["policy_slim_route_request"] = policy_slim_route_request
             for key in (
-                "resume_enqueue_ts",
-                "resume_dispatch_ts",
+                "resume_dispatch_value",
+                "resume_dispatch_expected_saved_tokens",
+                "resume_dispatch_queue_cost_tokens",
+                "resume_dispatch_memory_pressure_cost_tokens",
+                "resume_dispatch_inflight",
+                "resume_dispatch_inflight_ratio",
+                "resume_dispatch_memory_pressure",
+                "resume_dispatch_history_len_for_value",
+                "resume_dispatch_matched_tokens_for_value",
+                "resume_dispatch_p_hit_for_value",
+                "resume_dispatch_value_source_matched",
+                "resume_dispatch_value_source_p_hit",
+                "resume_dispatch_value_source_prior",
+                "resume_dispatch_value_min",
+                "resume_admission_admitted",
+                "route_model_version",
+                "kv_lease_model_version",
+                "kv_lease_model_version_match",
+                "kv_lease_stale_version_blocked",
+                "kv_hit_same_version",
+                "kv_hit_stale_version_blocked",
+                "engine_kv_pinned_tokens",
+                "engine_kv_evicted_tokens",
+                "engine_kv_evicted_pinned_tokens",
+                "engine_kv_lease_hit",
+                "engine_kv_lease_miss",
+                "engine_kv_lease_stale_version_blocked",
+            ):
+                value = _meta_float(key)
+                if value is not None:
+                    content["metrics"][key] = value
+            content["metrics"]["policy_local_route_hint"] = policy_local_route_hint
+            content["metrics"]["policy_local_route_hint_hit"] = policy_local_route_hint_hit
+            content["metrics"]["router_slim_route_request"] = router_slim_route_request
+            content["metrics"]["router_fast_route_path"] = router_fast_route_path
+            content["metrics"]["observe_in_critical_path"] = observe_in_critical_path
+            content["metrics"]["observe_pending_count"] = observe_pending_count
+            content["metrics"]["observe_drain_count"] = observe_drain_count
+            content["metrics"]["router_route_decision_done_ts"] = router_route_decision_done_ts
+            content["metrics"]["router_route_return_ts"] = router_route_return_ts
+            content["metrics"]["router_observe_recv_ts"] = router_observe_recv_ts
+            if route_rpc_latency_s is not None:
+                content["metrics"]["resume_route_rpc_latency_s"] = route_rpc_latency_s
+            if router_route_compute_s is not None:
+                content["metrics"]["resume_router_route_compute_s"] = router_route_compute_s
+            if route_return_overhead_s is not None:
+                content["metrics"]["resume_route_return_overhead_s"] = route_return_overhead_s
+            if worker_rpc_latency_s is not None:
+                content["metrics"]["resume_worker_rpc_latency_s"] = worker_rpc_latency_s
+            if worker_return_overhead_s is not None:
+                content["metrics"]["resume_worker_return_overhead_s"] = worker_return_overhead_s
+            if observe_rpc_latency_s is not None:
+                content["metrics"]["resume_observe_rpc_latency_s"] = observe_rpc_latency_s
+            if router_observe_compute_s is not None:
+                content["metrics"]["resume_router_observe_compute_s"] = router_observe_compute_s
+            if policy_ray_submit_overhead_s is not None:
+                content["metrics"]["resume_policy_ray_submit_overhead_s"] = policy_ray_submit_overhead_s
+            if policy_ray_wait_to_router_s is not None:
+                content["metrics"]["resume_policy_ray_wait_to_router_s"] = policy_ray_wait_to_router_s
+            if engine_finish_ts is not None and worker_generator_done_ts is not None:
+                content["metrics"]["resume_worker_generator_tail_s"] = max(0.0, worker_generator_done_ts - engine_finish_ts)
+            if worker_generator_done_ts is not None and worker_postprocess_done_ts is not None:
+                content["metrics"]["resume_worker_postprocess_s"] = max(0.0, worker_postprocess_done_ts - worker_generator_done_ts)
+            if worker_postprocess_done_ts is not None and worker_log_done_ts is not None:
+                content["metrics"]["resume_worker_log_s"] = max(0.0, worker_log_done_ts - worker_postprocess_done_ts)
+            if worker_log_done_ts is not None and router_worker_response_ts is not None:
+                content["metrics"]["resume_worker_to_router_return_s"] = max(0.0, router_worker_response_ts - worker_log_done_ts)
+            if router_worker_response_ts is not None and router_observe_done_ts is not None:
+                content["metrics"]["resume_router_observe_s"] = max(0.0, router_observe_done_ts - router_worker_response_ts)
+            if router_observe_done_ts is not None and router_return_ts is not None:
+                content["metrics"]["resume_router_finalize_s"] = max(0.0, router_return_ts - router_observe_done_ts)
+            worker_log_skipped = _meta_float("worker_log_skipped")
+            if worker_log_skipped is not None:
+                content["metrics"]["worker_log_skipped"] = worker_log_skipped
+
+            for key in (
+                "resume_fast_path",
                 "resume_queue_wait_s",
                 "context_class_gpu_hit",
                 "context_class_cpu_reload",
@@ -625,6 +980,8 @@ class TrajEnvManager(BaseEnvManager):
                 "memory_pressure",
                 "pending_resume_lease_ttl_s",
                 "pending_resume_lease_score",
+                "belief_estimated_hit_tokens",
+                "belief_estimated_prefill_tokens",
                 "lookup_resume_found",
                 "lookup_hit_tokens",
                 "lookup_cache_confidence",
@@ -633,7 +990,6 @@ class TrajEnvManager(BaseEnvManager):
                 "ttl_remaining_s",
                 "actual_hit",
                 "matched_prefix_tokens",
-                "resume_prefill_tokens",
                 "estimated_prefill_tokens",
                 "prefill_time_ms",
                 "cache_confidence",
@@ -641,6 +997,36 @@ class TrajEnvManager(BaseEnvManager):
                 "engine_cache_confidence",
                 "p_hit_measured",
                 "p_hit_effective",
+                "policy_local_route_hint_lease_remaining_s",
+                "policy_local_route_hint_lease_score",
+                "policy_local_route_hint_p_hit",
+                "policy_local_route_hint_cache_age_s",
+                "policy_local_route_hint_use_dispatch_value",
+                "policy_local_route_hint_dispatch_value",
+                "policy_local_route_hint_expected_saved_tokens",
+                "policy_local_route_hint_expected_source_matched",
+                "policy_local_route_hint_expected_source_p_hit",
+                "policy_local_route_hint_expected_source_prior",
+                "policy_local_route_hint_history_len_for_value",
+                "policy_local_route_hint_matched_tokens_for_value",
+                "policy_local_route_hint_p_hit_for_value",
+                "policy_local_route_hint_default_p_hit",
+                "policy_local_route_hint_queue_cost_tokens",
+                "policy_local_route_hint_memory_pressure_cost_tokens",
+                "policy_local_route_hint_inflight",
+                "policy_local_route_hint_inflight_ratio",
+                "policy_local_route_hint_memory_pressure",
+                "saved_prefill_tokens",
+                "saved_prefill_ms",
+                "saved_prefill_ms_per_gb_second",
+                "pinned_kv_gb_seconds",
+                "avoidable_reprefill_tokens",
+                "dead_pinned_kv_gb_seconds",
+                "hot_resume_miss_ratio",
+                "locality_mismatch_count",
+                "queue_decay_loss_ms",
+                "queue_decay_loss_proxy",
+                "kv_lease_effective_ttl_s",
             ):
                 if key in lm_output.meta_info:
                     value = lm_output.meta_info[key]
@@ -656,14 +1042,122 @@ class TrajEnvManager(BaseEnvManager):
             content["metrics_agg_mode"].update({
                 "resume_latency_e2e_s": "mean",
                 "resume_infer_start_ts": "last",
+                "resume_client_submit_ts": "last",
+                "router_handle_start_ts": "last",
+                "gateway_post_start_ts": "last",
+                "gateway_response_headers_ts": "last",
+                "gateway_body_done_ts": "last",
+                "resume_enqueue_ts": "last",
+                "resume_dispatch_ts": "last",
+                "engine_start_ts": "last",
+                "engine_first_token_ts": "last",
                 "resume_first_token_ts": "last",
+                "engine_finish_ts": "last",
+                "router_return_ts": "last",
+                "worker_generator_done_ts": "last",
+                "worker_postprocess_done_ts": "last",
+                "worker_log_done_ts": "last",
+                "router_worker_response_ts": "last",
+                "router_observe_done_ts": "last",
+                "policy_ray_submit_done_ts": "last",
+                "direct_worker_data_path": "mean",
+                "policy_route_submit_ts": "last",
+                "policy_route_submit_done_ts": "last",
+                "policy_route_return_ts": "last",
+                "policy_worker_submit_ts": "last",
+                "policy_worker_submit_done_ts": "last",
+                "policy_worker_return_ts": "last",
+                "policy_observe_submit_ts": "last",
+                "policy_observe_submit_done_ts": "last",
+                "policy_observe_return_ts": "last",
+                "policy_observe_async": "mean",
+                "policy_slim_route_request": "mean",
+                "resume_dispatch_value": "mean",
+                "resume_dispatch_expected_saved_tokens": "mean",
+                "resume_dispatch_queue_cost_tokens": "mean",
+                "resume_dispatch_memory_pressure_cost_tokens": "mean",
+                "resume_dispatch_inflight": "mean",
+                "resume_dispatch_inflight_ratio": "mean",
+                "resume_dispatch_memory_pressure": "mean",
+                "resume_dispatch_history_len_for_value": "mean",
+                "resume_dispatch_matched_tokens_for_value": "mean",
+                "resume_dispatch_p_hit_for_value": "mean",
+                "resume_dispatch_value_source_matched": "mean",
+                "resume_dispatch_value_source_p_hit": "mean",
+                "resume_dispatch_value_source_prior": "mean",
+                "resume_dispatch_value_min": "mean",
+                "resume_admission_admitted": "mean",
+                "route_model_version": "last",
+                "kv_lease_model_version": "last",
+                "kv_lease_model_version_match": "mean",
+                "kv_lease_stale_version_blocked": "sum",
+                "kv_hit_same_version": "mean",
+                "kv_hit_stale_version_blocked": "sum",
+                "engine_kv_pinned_tokens": "last",
+                "engine_kv_evicted_tokens": "last",
+                "engine_kv_evicted_pinned_tokens": "last",
+                "engine_kv_lease_hit": "sum",
+                "engine_kv_lease_miss": "sum",
+                "engine_kv_lease_stale_version_blocked": "sum",
+                "kv_lease_state_code": "mean",
+                "kv_lease_state_created": "mean",
+                "kv_lease_state_active": "mean",
+                "kv_lease_state_renewed": "mean",
+                "kv_lease_state_expired": "mean",
+                "kv_lease_state_released": "mean",
+                "kv_lease_state_evicted": "mean",
+                "kv_lease_version": "mean",
+                "kv_lease_record_ttl_s": "mean",
+                "kv_lease_record_score": "mean",
+                "kv_lease_remaining_s": "mean",
+                "kv_lease_backend_id": "mean",
+                "policy_local_route_hint": "mean",
+                "policy_local_route_hint_hit": "mean",
+                "router_slim_route_request": "mean",
+                "router_fast_route_path": "mean",
+                "observe_in_critical_path": "mean",
+                "observe_pending_count": "last",
+                "observe_drain_count": "sum",
+                "router_route_decision_done_ts": "last",
+                "router_route_return_ts": "last",
+                "router_observe_recv_ts": "last",
+                "resume_route_rpc_latency_s": "mean",
+                "resume_router_route_compute_s": "mean",
+                "resume_route_return_overhead_s": "mean",
+                "resume_worker_rpc_latency_s": "mean",
+                "resume_worker_return_overhead_s": "mean",
+                "resume_observe_rpc_latency_s": "mean",
+                "resume_router_observe_compute_s": "mean",
                 "resume_infer_end_ts": "last",
                 "resume_infer_latency_s": "mean",
                 "resume_prefill_tokens": "mean",
                 "resume_history_len_tokens": "mean",
-                "resume_enqueue_ts": "last",
-                "resume_dispatch_ts": "last",
+                "resume_fast_path": "mean",
+                "resume_client_to_router_handle_s": "mean",
+                "resume_router_handle_to_enqueue_s": "mean",
+                "resume_gateway_post_to_headers_s": "mean",
+                "resume_gateway_body_parse_s": "mean",
+                "resume_router_tail_after_body_s": "mean",
                 "resume_queue_wait_s": "mean",
+                "resume_client_submit_before_s": "mean",
+                "resume_pre_router_s": "mean",
+                "resume_router_lookup_s": "mean",
+                "resume_router_priority_s": "mean",
+                "resume_router_schedule_s": "mean",
+                "resume_dispatch_to_engine_start_s": "mean",
+                "resume_engine_ttft_s": "mean",
+                "resume_decode_tail_s": "mean",
+                "resume_router_return_overhead_s": "mean",
+                "resume_post_router_overhead_s": "mean",
+                "resume_policy_ray_submit_overhead_s": "mean",
+                "resume_policy_ray_wait_to_router_s": "mean",
+                "resume_worker_generator_tail_s": "mean",
+                "resume_worker_postprocess_s": "mean",
+                "resume_worker_log_s": "mean",
+                "resume_worker_to_router_return_s": "mean",
+                "resume_router_observe_s": "mean",
+                "resume_router_finalize_s": "mean",
+                "worker_log_skipped": "mean",
                 "context_class_gpu_hit": "sum",
                 "context_class_cpu_reload": "sum",
                 "context_class_full_prefill": "sum",
@@ -687,6 +1181,8 @@ class TrajEnvManager(BaseEnvManager):
                 "memory_pressure": "mean",
                 "pending_resume_lease_ttl_s": "mean",
                 "pending_resume_lease_score": "mean",
+                "belief_estimated_hit_tokens": "mean",
+                "belief_estimated_prefill_tokens": "mean",
                 "lookup_resume_found": "mean",
                 "lookup_hit_tokens": "mean",
                 "lookup_cache_confidence": "mean",
@@ -702,6 +1198,36 @@ class TrajEnvManager(BaseEnvManager):
                 "engine_cache_confidence": "mean",
                 "p_hit_measured": "mean",
                 "p_hit_effective": "mean",
+                "policy_local_route_hint_lease_remaining_s": "mean",
+                "policy_local_route_hint_lease_score": "mean",
+                "policy_local_route_hint_p_hit": "mean",
+                "policy_local_route_hint_cache_age_s": "mean",
+                "policy_local_route_hint_use_dispatch_value": "mean",
+                "policy_local_route_hint_dispatch_value": "mean",
+                "policy_local_route_hint_expected_saved_tokens": "mean",
+                "policy_local_route_hint_expected_source_matched": "mean",
+                "policy_local_route_hint_expected_source_p_hit": "mean",
+                "policy_local_route_hint_expected_source_prior": "mean",
+                "policy_local_route_hint_history_len_for_value": "mean",
+                "policy_local_route_hint_matched_tokens_for_value": "mean",
+                "policy_local_route_hint_p_hit_for_value": "mean",
+                "policy_local_route_hint_default_p_hit": "mean",
+                "policy_local_route_hint_queue_cost_tokens": "mean",
+                "policy_local_route_hint_memory_pressure_cost_tokens": "mean",
+                "policy_local_route_hint_inflight": "mean",
+                "policy_local_route_hint_inflight_ratio": "mean",
+                "policy_local_route_hint_memory_pressure": "mean",
+                "saved_prefill_tokens": "mean",
+                "saved_prefill_ms": "mean",
+                "saved_prefill_ms_per_gb_second": "mean",
+                "pinned_kv_gb_seconds": "sum",
+                "avoidable_reprefill_tokens": "sum",
+                "dead_pinned_kv_gb_seconds": "sum",
+                "hot_resume_miss_ratio": "mean",
+                "locality_mismatch_count": "sum",
+                "queue_decay_loss_ms": "sum",
+                "queue_decay_loss_proxy": "sum",
+                "kv_lease_effective_ttl_s": "mean",
             })
 
         lm_output.meta_info["stop_reason"] = GenerateStopReason.FINISH
@@ -865,6 +1391,46 @@ class TrajEnvManager(BaseEnvManager):
             env_metric["resume_queue_wait_mean_s"] = float(np.mean(self._resume_queue_wait_samples))
             env_metric["resume_queue_wait_p50_s"] = float(np.percentile(self._resume_queue_wait_samples, 50))
             env_metric["resume_queue_wait_p95_s"] = float(np.percentile(self._resume_queue_wait_samples, 95))
+        if self._resume_client_submit_before_samples:
+            env_metric["resume_client_submit_before_mean_s"] = float(np.mean(self._resume_client_submit_before_samples))
+            env_metric["resume_client_submit_before_p50_s"] = float(np.percentile(self._resume_client_submit_before_samples, 50))
+            env_metric["resume_client_submit_before_p95_s"] = float(np.percentile(self._resume_client_submit_before_samples, 95))
+        if self._resume_pre_router_samples:
+            env_metric["resume_pre_router_mean_s"] = float(np.mean(self._resume_pre_router_samples))
+            env_metric["resume_pre_router_p50_s"] = float(np.percentile(self._resume_pre_router_samples, 50))
+            env_metric["resume_pre_router_p95_s"] = float(np.percentile(self._resume_pre_router_samples, 95))
+        if self._resume_router_lookup_samples:
+            env_metric["resume_router_lookup_mean_s"] = float(np.mean(self._resume_router_lookup_samples))
+            env_metric["resume_router_lookup_p50_s"] = float(np.percentile(self._resume_router_lookup_samples, 50))
+            env_metric["resume_router_lookup_p95_s"] = float(np.percentile(self._resume_router_lookup_samples, 95))
+        if self._resume_router_priority_samples:
+            env_metric["resume_router_priority_mean_s"] = float(np.mean(self._resume_router_priority_samples))
+            env_metric["resume_router_priority_p50_s"] = float(np.percentile(self._resume_router_priority_samples, 50))
+            env_metric["resume_router_priority_p95_s"] = float(np.percentile(self._resume_router_priority_samples, 95))
+        if self._resume_router_schedule_samples:
+            env_metric["resume_router_schedule_mean_s"] = float(np.mean(self._resume_router_schedule_samples))
+            env_metric["resume_router_schedule_p50_s"] = float(np.percentile(self._resume_router_schedule_samples, 50))
+            env_metric["resume_router_schedule_p95_s"] = float(np.percentile(self._resume_router_schedule_samples, 95))
+        if self._resume_dispatch_to_engine_start_samples:
+            env_metric["resume_dispatch_to_engine_start_mean_s"] = float(np.mean(self._resume_dispatch_to_engine_start_samples))
+            env_metric["resume_dispatch_to_engine_start_p50_s"] = float(np.percentile(self._resume_dispatch_to_engine_start_samples, 50))
+            env_metric["resume_dispatch_to_engine_start_p95_s"] = float(np.percentile(self._resume_dispatch_to_engine_start_samples, 95))
+        if self._resume_engine_ttft_samples:
+            env_metric["resume_engine_ttft_mean_s"] = float(np.mean(self._resume_engine_ttft_samples))
+            env_metric["resume_engine_ttft_p50_s"] = float(np.percentile(self._resume_engine_ttft_samples, 50))
+            env_metric["resume_engine_ttft_p95_s"] = float(np.percentile(self._resume_engine_ttft_samples, 95))
+        if self._resume_decode_tail_samples:
+            env_metric["resume_decode_tail_mean_s"] = float(np.mean(self._resume_decode_tail_samples))
+            env_metric["resume_decode_tail_p50_s"] = float(np.percentile(self._resume_decode_tail_samples, 50))
+            env_metric["resume_decode_tail_p95_s"] = float(np.percentile(self._resume_decode_tail_samples, 95))
+        if self._resume_router_return_overhead_samples:
+            env_metric["resume_router_return_overhead_mean_s"] = float(np.mean(self._resume_router_return_overhead_samples))
+            env_metric["resume_router_return_overhead_p50_s"] = float(np.percentile(self._resume_router_return_overhead_samples, 50))
+            env_metric["resume_router_return_overhead_p95_s"] = float(np.percentile(self._resume_router_return_overhead_samples, 95))
+        if self._resume_post_router_overhead_samples:
+            env_metric["resume_post_router_overhead_mean_s"] = float(np.mean(self._resume_post_router_overhead_samples))
+            env_metric["resume_post_router_overhead_p50_s"] = float(np.percentile(self._resume_post_router_overhead_samples, 50))
+            env_metric["resume_post_router_overhead_p95_s"] = float(np.percentile(self._resume_post_router_overhead_samples, 95))
 
         env_metric = {f"env/{rollout_cache.tag}/{k}": v for k, v in env_metric.items()}
         env_metric["env/response_length"] = response_length
@@ -895,9 +1461,21 @@ class TrajEnvManager(BaseEnvManager):
             "resume_count": len(self._resume_prefill_tokens_samples),
             "tool_use_count": sum(1 for h in history if h.get("use_tool")),
             "resume_prefill_tokens_samples": list(self._resume_prefill_tokens_samples),
+            "resume_actual_hit_samples": list(self._resume_actual_hit_samples),
+            "resume_matched_prefix_tokens_samples": list(self._resume_matched_prefix_tokens_samples),
+            "resume_pinned_kv_gb_seconds_samples": list(self._resume_pinned_kv_gb_seconds_samples),
+            "resume_prefill_ratio_samples": list(self._resume_prefill_ratio_samples),
+            "resume_saved_prefill_ms_samples": list(self._resume_saved_prefill_ms_samples),
             "resume_latency_e2e_samples": list(self._resume_e2e_latency_samples),
             "resume_infer_latency_samples": list(self._resume_infer_latency_samples),
             "resume_queue_wait_samples": list(self._resume_queue_wait_samples),
+            "resume_client_submit_before_samples": list(self._resume_client_submit_before_samples),
+            "resume_pre_router_samples": list(self._resume_pre_router_samples),
+            "resume_dispatch_to_engine_start_samples": list(self._resume_dispatch_to_engine_start_samples),
+            "resume_engine_ttft_samples": list(self._resume_engine_ttft_samples),
+            "resume_decode_tail_samples": list(self._resume_decode_tail_samples),
+            "resume_router_return_overhead_samples": list(self._resume_router_return_overhead_samples),
+            "resume_post_router_overhead_samples": list(self._resume_post_router_overhead_samples),
             "external_wait_samples": list(self._external_wait_samples),
             "history": serializable_history,
         }
