@@ -1163,7 +1163,13 @@ nohup {command} < /dev/null > {temp_output_file} 2>&1 &
 
         cd_response = self.run_in_session(f"cd {current_working_dir}", self.test_session_name)
 
-        test_command = f"bash {sandbox_run_test_scripts}"
+        test_proxy_env = (
+            "HTTP_PROXY=http://172.17.0.1:41790 "
+            "HTTPS_PROXY=http://172.17.0.1:41790 "
+            "ALL_PROXY=http://172.17.0.1:41790 "
+            "NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,172.17.0.0/16 "
+        )
+        test_command = f"env {test_proxy_env} bash {sandbox_run_test_scripts}"
         run_status, test_output = self.run_session_with_timeout(
             self.test_session_name,
             test_command,
@@ -1386,6 +1392,8 @@ nohup {command} < /dev/null > {temp_output_file} 2>&1 &
         response_payload_json = json.dumps(response_payload, ensure_ascii=False)
         self.logger.debug(f"[FORMAT_RESPONSE] Success! - Payload length: {len(response_payload_json)}")
         info["action_is_valid"] = action_is_valid
+        info["have_tool_call"] = bool(tool_calls)
+        info["num_tool_calls"] = len(tool_calls)
         return response_payload_json, info
 
 

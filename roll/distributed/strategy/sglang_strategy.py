@@ -107,7 +107,7 @@ class SgLangStrategy(InferenceStrategy):
                 "model_path": self.worker_config.model_args.model_name_or_path,
                 "dtype": dtype,
                 "random_seed": self.worker.pipeline_config.seed,
-                "skip_tokenizer_init": True,
+                "skip_tokenizer_init": sglang_config.get("skip_tokenizer_init", True),
                 "mem_fraction_static": sglang_config["mem_fraction_static"],
                 "trust_remote_code": True,
                 "tp_size": tp_size,
@@ -119,10 +119,11 @@ class SgLangStrategy(InferenceStrategy):
                 "disable_custom_all_reduce": sglang_config.get("disable_custom_all_reduce", True),
                 'nnodes': nnodes,
                 'node_rank': 0,
-                # new：router replay
-                "enable_return_routed_experts": self.enable_rollout_routing_replay,
+                # Only newer SGLang builds accept this router-replay argument.
             }
         )
+        if self.enable_rollout_routing_replay:
+            sglang_config["enable_return_routed_experts"] = True
 
         if nnodes > 1:
             sglang_config['dist_init_addr'] = f'{ray.util.get_node_ip_address()}:{collect_free_port()}'
@@ -232,15 +233,23 @@ class SgLangStrategy(InferenceStrategy):
             image_data = None
             video_data = None
 
-        obj = GenerateReqInput(
+        import inspect
+        generate_req_kwargs = dict(
             input_ids=input_ids,
             sampling_params=payload["sampling_params"],
             rid=payload["rid"],
             return_logprob=payload["return_logprob"],
-            return_routed_experts=payload["return_routed_experts"],
             image_data=image_data,
-            video_data=video_data
+            video_data=video_data,
+            return_routed_experts=payload.get("return_routed_experts", False),
         )
+        supported_generate_req_kwargs = inspect.signature(GenerateReqInput).parameters
+        generate_req_kwargs = {
+            key: value
+            for key, value in generate_req_kwargs.items()
+            if key in supported_generate_req_kwargs
+        }
+        obj = GenerateReqInput(**generate_req_kwargs)
         generator = self.model.engine.tokenizer_manager.generate_request(obj, None)
         chunks = None
         async for chunks in generator:
@@ -583,6 +592,8 @@ def gather_outputs_to_pad_tensor(request_outputs, pad_token_id, device=None) -> 
 def create_sampling_params_for_sglang(gen_kwargs: dict):
     return dict(
         max_new_tokens=gen_kwargs["max_new_tokens"],
+        min_new_tokens=gen_kwargs.get("min_new_tokens", 0),
+        ignore_eos=gen_kwargs.get("ignore_eos", False),
         temperature=gen_kwargs["temperature"],
         top_p=gen_kwargs["top_p"],
         top_k=gen_kwargs["top_k"],

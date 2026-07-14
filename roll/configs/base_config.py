@@ -138,6 +138,14 @@ class BaseConfig(ScheduleConfig):
         default=50,
         metadata={"help": "Save checkpoint every X update steps."}
     )
+    enable_checkpointing: bool = field(
+        default=False,
+        metadata={"help": "Master switch for periodic and final checkpoint writes."},
+    )
+    save_final_checkpoint: bool = field(
+        default=False,
+        metadata={"help": "Whether to save model weights at the final training step."},
+    )
     max_ckpt_to_keep: int = field(
         default=0,
         metadata={"help": "Maximum number of checkpoints to keep. 0 means keep all checkpoints."}
@@ -503,6 +511,48 @@ class PPOConfig(BaseConfig):
         default=0,
         metadata={
             "help": "The ratio of ahead generation requests in pipeline, 0 means synchronous pipeline."
+        },
+    )
+    trajectory_staleness_tolerance: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Maximum learner-version lag accepted for agentic trajectories. "
+                "Defaults to async_generation_ratio for backward compatibility."
+            )
+        },
+    )
+    trajectory_scheduling_policy: Literal["fifo", "version_priority"] = field(
+        default="fifo",
+        metadata={
+            "help": (
+                "Runtime scheduling policy for agentic trajectories. version_priority serves "
+                "the oldest policy version first while preserving environment-worker affinity."
+            )
+        },
+    )
+    trajectory_admission_policy: Literal["step", "outstanding_watermark"] = field(
+        default="step",
+        metadata={
+            "help": (
+                "Admission policy for agentic trajectories. step preserves the original fixed "
+                "per-learner-step behavior; outstanding_watermark caps total producer debt."
+            )
+        },
+    )
+    max_outstanding_trajectories: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Maximum completed, running, or reserved agentic trajectories under watermark "
+                "admission. Defaults to (1 + async_generation_ratio) * rollout_batch_size."
+            )
+        },
+    )
+    rollout_seed: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Optional deterministic seed for the agentic rollout producer."
         },
     )
 

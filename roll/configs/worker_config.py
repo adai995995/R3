@@ -309,7 +309,10 @@ class WorkerConfig:
                     )
 
         if self.device_mapping is not None:
-            self.device_mapping = eval(self.device_mapping)
+            if isinstance(self.device_mapping, str):
+                self.device_mapping = eval(self.device_mapping)
+            else:
+                self.device_mapping = list(self.device_mapping)
             assert (
                 len(self.device_mapping) % self.num_gpus_per_worker == 0
             ), f"len(device_mapping)={len(self.device_mapping)} must be divisible by num_gpus_per_worker={self.num_gpus_per_worker}."

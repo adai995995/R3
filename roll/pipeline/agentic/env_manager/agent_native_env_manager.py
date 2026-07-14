@@ -71,13 +71,18 @@ class AgentNativeStepEnvManager(TrajEnvManager):
                 stop_reason = lm_output.meta_info.pop("stop_reason")
                 if stop_reason == GenerateStopReason.MAX_LENGTH:
                     self.stop_reason = EpisodeStopReason.MAX_LENGTH
+                    # No response is generated once the prompt reaches the model
+                    # context limit. Finalize the work collected so far instead
+                    # of passing an empty DataProto to step().
+                    rollout_cache.terminated = True
+                    rollout_cache.truncated = True
                 elif stop_reason == GenerateStopReason.ABORT:
                     self.stop_reason = EpisodeStopReason.ABORT
             self.log_stats["current_step"].append(self.current_step)
             self.log_stats["generate_time"].append(round(generate_timer.last))
 
             with Timer(name="step", logger=None) as step_timer:
-                if stop_reason in [GenerateStopReason.FINISH, GenerateStopReason.MAX_LENGTH]:
+                if stop_reason == GenerateStopReason.FINISH:
                     rollout_cache: RolloutCache = self.step(lm_output)
             self.log_stats["step_time"].append(round(step_timer.last, 4))
 
@@ -108,6 +113,7 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         if self.episode_id is None:
             assert not self.running
             return None
+        self.trajectory_version = int(self.current_step)
 
         seed = self.group_seed + self.episode_id
         self.traj_start_time = time.time()
@@ -172,6 +178,9 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         generation_config = self.worker_config.generating_args.to_dict()
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
+        if getattr(self.pipeline_config, "trajectory_scheduling_policy", "fifo") == "version_priority":
+            # Lower versions are closer to expiry and receive service first when the router is saturated.
+            lm_input.meta_info["trajectory_priority"] = self.trajectory_version
 
         content = self.rollout_cache.history[-1]
         input_messages = content['observation']
@@ -221,6 +230,52 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         current_cache['state_hash'] = compute_object_hash(messages)
         current_cache['messages'] = messages
         return lm_input
+
+    def get_progress_snapshot(self) -> Optional[Dict]:
+        """Return local progress for the trajectory that has not been submitted yet."""
+        rollout_cache = self.rollout_cache
+        if rollout_cache is None or self.episode_id is None:
+            return None
+
+        generated_steps = [item for item in rollout_cache.history if "response_ids" in item]
+        prompt_tokens = sum(len(item.get("prompt_ids", [])) for item in generated_steps)
+        response_tokens = sum(len(item.get("response_ids", [])) for item in generated_steps)
+        tool_calls = sum(
+            int(item.get("metrics", {}).get("num_tool_calls", 0) or 0)
+            for item in rollout_cache.history
+        )
+        versions = self.log_stats.get("current_step", []) if hasattr(self, "log_stats") else []
+        version_start = int(versions[0]) if versions else int(self.current_step)
+        version_end = int(versions[-1]) if versions else int(self.current_step)
+        started_at = getattr(self, "traj_start_time", None)
+        env_seconds = max(0.0, time.time() - started_at) if started_at is not None else 0.0
+        trajectory_id = (
+            f"{rollout_cache.tag}_{rollout_cache.group_id}_{self.episode_id}_"
+            f"{self.group_seed}_{rollout_cache.env_id}"
+        )
+
+        return {
+            "trajectory_id": trajectory_id,
+            "category": "completed_not_submitted" if rollout_cache.terminated else "inflight_at_shutdown",
+            "discard_reason": "pipeline_shutdown",
+            "group_id": int(rollout_cache.group_id),
+            "episode_id": int(self.episode_id),
+            "env_id": int(rollout_cache.env_id),
+            "version_start": version_start,
+            "version_end": version_end,
+            "version_age": max(0, int(self.current_step) - version_start),
+            "reset_completed": bool(rollout_cache.history),
+            "completed": bool(rollout_cache.terminated),
+            "truncated": bool(rollout_cache.truncated),
+            "actions_completed": int(rollout_cache.step),
+            "inference_calls": len(generated_steps),
+            "tool_calls": tool_calls,
+            "prompt_tokens": prompt_tokens,
+            "response_tokens": response_tokens,
+            "inference_tokens": prompt_tokens + response_tokens,
+            "generate_seconds": float(sum(self.log_stats.get("generate_time", []))),
+            "env_seconds": float(env_seconds),
+        }
 
     def formulate_rollouts(self, rollout_cache: RolloutCache):
         """
@@ -329,7 +384,14 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         metrics_agg_mode = self.rollout_cache.history[-1].get('metrics_agg_mode', {})
         history_metrics = [item.get("metrics", {}) for item in self.rollout_cache.history]
         env_metric = aggregate_metrics(history_metrics=history_metrics, metrics_agg_mode=metrics_agg_mode)
+        inference_calls = sum("response_ids" in item for item in self.rollout_cache.history)
+        tool_calls = sum(
+            int(item.get("metrics", {}).get("num_tool_calls", 0) or 0)
+            for item in self.rollout_cache.history
+        )
         env_metric["num_actions"] = rollout_cache.step
+        env_metric["num_inference_calls"] = inference_calls
+        env_metric["num_tool_calls"] = tool_calls
         env_metric["env_timeout"] = getattr(self.env, "env_timeout", False)
         timing_metric = {
             "traj_time_env_total": round(float(time.time() - self.traj_start_time), 4),
@@ -358,8 +420,87 @@ class AgentNativeStepEnvManager(TrajEnvManager):
             "step_response_length_max": round(float(np.max(step_response_length_list)), 2),
         }
 
+        total_prompt_tokens = int(np.sum(step_prompt_length_list)) if step_prompt_length_list else 0
+        total_response_tokens = int(np.sum(step_response_length_list)) if step_response_length_list else 0
+        total_inference_tokens = total_prompt_tokens + total_response_tokens
+        trajectory_version_start = int(self.log_stats["current_step"][0]) if self.log_stats.get("current_step") else int(self.current_step)
+        trajectory_version_end = int(self.log_stats["current_step"][-1]) if self.log_stats.get("current_step") else int(self.current_step)
+        trajectory_version_age = max(0, int(self.current_step) - trajectory_version_start)
+        stale_tolerance = -1
+        for config_obj in (getattr(self, "env_config", None), getattr(self, "pipeline_config", None)):
+            if config_obj is None:
+                continue
+            if isinstance(config_obj, dict):
+                candidate = config_obj.get("staleness_tolerance", config_obj.get("max_policy_version_gap", None))
+            else:
+                candidate = getattr(config_obj, "staleness_tolerance", getattr(config_obj, "max_policy_version_gap", None))
+            if candidate is not None:
+                stale_tolerance = candidate
+                break
+
+        version_info = {
+            "version_start": trajectory_version_start,
+            "version_end": trajectory_version_end,
+            "version_age": trajectory_version_age,
+            "stale_tolerance": stale_tolerance,
+        }
+        waste_info = {
+            "observed": True,
+            "completed": bool(rollout_cache.terminated),
+            "truncated": bool(rollout_cache.truncated),
+            "reset_failed": bool(getattr(self, "drop_flag", False)),
+            "env_timeout": bool(getattr(self.env, "env_timeout", False)),
+            "actions_completed": int(rollout_cache.step),
+            "inference_calls": int(inference_calls),
+            "tool_calls": int(tool_calls),
+            "prompt_tokens_total": total_prompt_tokens,
+            "response_tokens_total": total_response_tokens,
+            "inference_tokens_total": total_inference_tokens,
+            "env_seconds_total": float(timing_metric["traj_time_env_total"]),
+            "generate_seconds_total": float(timing_metric["traj_time_generate_sum"]),
+            "wasted": False,
+            "wasted_actions": 0,
+            "wasted_prompt_tokens": 0,
+            "wasted_response_tokens": 0,
+            "wasted_inference_tokens": 0,
+            "wasted_env_seconds": 0.0,
+            "discard_reason": "",
+        }
+        waste_metric = {
+            "traj_observed": 1.0,
+            "traj_completed": float(waste_info["completed"]),
+            "traj_truncated": float(waste_info["truncated"]),
+            "traj_reset_failed": float(waste_info["reset_failed"]),
+            "traj_env_timeout": float(waste_info["env_timeout"]),
+            "traj_actions_completed": float(waste_info["actions_completed"]),
+            "traj_inference_calls": float(inference_calls),
+            "traj_tool_calls": float(tool_calls),
+            "traj_inference_calls_ge_1": float(inference_calls >= 1),
+            "traj_tool_calls_ge_1": float(tool_calls >= 1),
+            "traj_actions_ge_1": float(rollout_cache.step >= 1),
+            "traj_actions_ge_2": float(rollout_cache.step >= 2),
+            "traj_actions_ge_3": float(rollout_cache.step >= 3),
+            "traj_actions_ge_4": float(rollout_cache.step >= 4),
+            "traj_prompt_tokens_total": float(total_prompt_tokens),
+            "traj_response_tokens_total": float(total_response_tokens),
+            "traj_inference_tokens_total": float(total_inference_tokens),
+            "traj_env_seconds_total": float(waste_info["env_seconds_total"]),
+            "traj_generate_seconds_total": float(waste_info["generate_seconds_total"]),
+            "traj_version_start": float(trajectory_version_start),
+            "traj_version_end": float(trajectory_version_end),
+            "traj_version_age": float(trajectory_version_age),
+            "traj_stale_tolerance": float(stale_tolerance) if stale_tolerance is not None else -1.0,
+            "traj_wasted": 0.0,
+            "traj_wasted_actions": 0.0,
+            "traj_wasted_prompt_tokens": 0.0,
+            "traj_wasted_response_tokens": 0.0,
+            "traj_wasted_inference_tokens": 0.0,
+            "traj_wasted_env_seconds": 0.0,
+        }
+
         env_metric.update(timing_metric)
         env_metric.update(length_metric)
+        env_metric.update(waste_metric)
 
         env_metric = {f"env/{rollout_cache.tag}/{k}": v for k, v in env_metric.items()}
         env_metric["env/response_length"] = response_length
@@ -411,6 +552,8 @@ class AgentNativeStepEnvManager(TrajEnvManager):
                 "has_failure": bool(failure_mode and failure_mode not in ['', 'none']),
                 "failure_step": rollout_cache.step,
             },
+            "version_info": version_info,
+            "waste_info": waste_info,
             "metrics": env_metric,
             "last_observation": last_observation
         }

@@ -154,6 +154,7 @@ class TrajEnvManager(BaseEnvManager):
         if self.episode_id is None:
             assert not self.running
             return None
+        self.trajectory_version = int(self.current_step)
         seed = self.group_seed + self.episode_id
 
         traj_group_id = f"{self.rollout_cache.tag}_{self.rollout_cache.group_id}_{self.episode_id}_{self.group_seed}"
@@ -231,6 +232,8 @@ class TrajEnvManager(BaseEnvManager):
         generation_config = self.worker_config.generating_args.to_dict()
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
+        if getattr(self.pipeline_config, "trajectory_scheduling_policy", "fifo") == "version_priority":
+            lm_input.meta_info["trajectory_priority"] = self.trajectory_version
 
         input_messages = [item for items in self.rollout_cache.history for item in items["messages"]]
 

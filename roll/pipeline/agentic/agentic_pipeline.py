@@ -620,10 +620,45 @@ class AgenticPipeline(BasePipeline):
             global_step += 1
             logger.info(f"epoch {global_step} finished")
 
-        ray.get([
+        shutdown_reports = ray.get([
             self.train_rollout_scheduler.shutdown.remote(),
             self.val_rollout_scheduler.shutdown.remote(),
         ])
+        terminal_waste_report = shutdown_reports[0]
+        if terminal_waste_report is not None:
+            consumed_trajectories = global_step * self.pipeline_config.rollout_batch_size
+            terminal_waste_metrics = terminal_waste_report["metrics"]
+            terminal_waste_metrics["terminal_waste/consumed_trajectories"] = consumed_trajectories
+            terminal_waste_metrics["terminal_waste/waste_to_consumed_ratio"] = (
+                terminal_waste_metrics["terminal_waste/trajectories"] / consumed_trajectories
+                if consumed_trajectories > 0
+                else 0.0
+            )
+            terminal_waste_metrics["async_waste/consumed_trajectories"] = consumed_trajectories
+            terminal_waste_metrics["async_waste/waste_to_consumed_ratio"] = (
+                terminal_waste_metrics.get("async_waste/trajectories", 0) / consumed_trajectories
+                if consumed_trajectories > 0
+                else 0.0
+            )
+            terminal_waste_report["experiment"] = {
+                "exp_name": self.pipeline_config.exp_name,
+                "completed_training_steps": global_step,
+                "rollout_batch_size": self.pipeline_config.rollout_batch_size,
+                "async_generation_ratio": self.pipeline_config.async_generation_ratio,
+                "trajectory_staleness_tolerance": (
+                    self.pipeline_config.trajectory_staleness_tolerance
+                    if self.pipeline_config.trajectory_staleness_tolerance is not None
+                    else int(self.pipeline_config.async_generation_ratio)
+                ),
+            }
+            os.makedirs(self.pipeline_config.output_dir, exist_ok=True)
+            report_path = os.path.join(
+                self.pipeline_config.output_dir, f"terminal_waste.step_{global_step}.json"
+            )
+            with open(report_path, "w", encoding="utf-8") as output_file:
+                json.dump(terminal_waste_report, output_file, ensure_ascii=False, indent=2)
+            logger.info(f"terminal waste report: {report_path}")
+            logger.info(json.dumps(terminal_waste_metrics, ensure_ascii=False))
 
         logger.info("pipeline complete!")
 

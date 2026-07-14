@@ -1,4 +1,5 @@
 import asyncio
+import math
 import random
 import time
 from dataclasses import dataclass, field
@@ -223,8 +224,11 @@ class GroupQueue:
         group_size_redundancy,
         max_traj_per_env,
         async_generation_ratio,
+        staleness_tolerance,
         group_filter,
         env_monitor: Optional['EnvActivityMonitor'] = None,
+        scheduling_policy: str = "fifo",
+        fixed_step_admission: bool = True,
     ):
         self.group_id = group_id
         self.progress_bar = progress_bar
@@ -233,13 +237,34 @@ class GroupQueue:
         self.group_size_redundancy = group_size_redundancy
         self.max_traj_per_env = max_traj_per_env
         self.async_generation_ratio = async_generation_ratio
+        self.staleness_tolerance = staleness_tolerance
         self.group_filter = group_filter
+        if scheduling_policy not in ("fifo", "version_priority"):
+            raise ValueError(f"Unsupported trajectory_scheduling_policy: {scheduling_policy}")
+        self.scheduling_policy = scheduling_policy
+        self.fixed_step_admission = fixed_step_admission
+        self.admission_width = self.group_size + self.group_size_redundancy
         self.group_filter_count = 0
+        self.group_filter_rollout_count = 0
+        self.group_filter_actions = 0.0
+        self.group_filter_actions_ge_1 = 0.0
+        self.group_filter_actions_ge_2 = 0.0
+        self.group_filter_actions_ge_3 = 0.0
+        self.group_filter_actions_ge_4 = 0.0
+        self.group_filter_inference_calls = 0.0
+        self.group_filter_tool_calls = 0.0
+        self.group_filter_prompt_tokens = 0.0
+        self.group_filter_response_tokens = 0.0
+        self.group_filter_inference_tokens = 0.0
+        self.group_filter_env_seconds = 0.0
         self.env_monitor = env_monitor
 
         self.current_step = None
         self.next_episode_id = 0
         self.groups: Dict[int, GroupData] = {}
+        self.retired_groups: Dict[int, GroupData] = {}
+        self.discard_records: List[Dict[str, Any]] = []
+        self.discard_metrics_cursor = 0
 
         self.progress = asyncio.Event()
         self.complete = asyncio.Event()
@@ -250,6 +275,9 @@ class GroupQueue:
         self.current_step = None
         self.next_episode_id = 0
         self.groups.clear()
+        self.retired_groups.clear()
+        self.discard_records.clear()
+        self.discard_metrics_cursor = 0
 
         self.progress = asyncio.Event()
         self.complete = asyncio.Event()
@@ -259,11 +287,153 @@ class GroupQueue:
         self.groups.clear()
         self.progress.set()
 
+    @staticmethod
+    def _metric_by_suffix(rollout: DataProto, suffix: str, default: float = 0.0) -> float:
+        if rollout is None:
+            return default
+        metrics = rollout.meta_info.get("metrics", {}) if rollout.meta_info else {}
+        for key, value in metrics.items():
+            if key.endswith(suffix):
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return default
+        return default
+
+    def record_filtered_group(self, group: GroupData):
+        for rollout in group.rollouts:
+            if rollout is None:
+                continue
+            self.group_filter_rollout_count += 1
+            self.group_filter_actions += self._metric_by_suffix(rollout, "/traj_actions_completed")
+            self.group_filter_actions_ge_1 += self._metric_by_suffix(rollout, "/traj_actions_ge_1")
+            self.group_filter_actions_ge_2 += self._metric_by_suffix(rollout, "/traj_actions_ge_2")
+            self.group_filter_actions_ge_3 += self._metric_by_suffix(rollout, "/traj_actions_ge_3")
+            self.group_filter_actions_ge_4 += self._metric_by_suffix(rollout, "/traj_actions_ge_4")
+            self.group_filter_inference_calls += self._metric_by_suffix(rollout, "/traj_inference_calls")
+            self.group_filter_tool_calls += self._metric_by_suffix(rollout, "/traj_tool_calls")
+            self.group_filter_prompt_tokens += self._metric_by_suffix(rollout, "/traj_prompt_tokens_total")
+            self.group_filter_response_tokens += self._metric_by_suffix(rollout, "/traj_response_tokens_total")
+            self.group_filter_inference_tokens += self._metric_by_suffix(rollout, "/traj_inference_tokens_total")
+            self.group_filter_env_seconds += self._metric_by_suffix(rollout, "/traj_env_seconds_total")
+
+    @staticmethod
+    def _first_non_tensor_value(rollout: DataProto, key: str, default=None):
+        values = rollout.non_tensor_batch.get(key) if rollout.non_tensor_batch else None
+        if values is None or len(values) == 0:
+            return default
+        value = values[0]
+        return value.item() if hasattr(value, "item") else value
+
+    def record_discarded_rollout(
+        self,
+        rollout: Optional[DataProto],
+        group: GroupData,
+        reason: str,
+        observed_step: Optional[int] = None,
+    ):
+        if rollout is None:
+            return
+        metric = self._metric_by_suffix
+        step = self.current_step if observed_step is None else observed_step
+        step = group.create_step if step is None else step
+        env_id = self._first_non_tensor_value(rollout, "env_ids", -1)
+        self.discard_records.append({
+            "trajectory_id": str(self._first_non_tensor_value(rollout, "traj_id", "unknown")),
+            "category": "async_discard",
+            "discard_reason": reason,
+            "group_id": int(group.group_id),
+            "episode_id": int(group.episode_id),
+            "env_id": int(env_id),
+            "version_start": int(metric(rollout, "/traj_version_start", group.create_step)),
+            "version_end": int(metric(rollout, "/traj_version_end", group.create_step)),
+            "version_age": max(0, int(step) - int(group.create_step)),
+            "reset_completed": True,
+            "completed": bool(metric(rollout, "/traj_completed", 0)),
+            "truncated": bool(metric(rollout, "/traj_truncated", 0)),
+            "actions_completed": int(metric(rollout, "/traj_actions_completed", 0)),
+            "inference_calls": int(metric(rollout, "/traj_inference_calls", 0)),
+            "tool_calls": int(metric(rollout, "/traj_tool_calls", 0)),
+            "prompt_tokens": int(metric(rollout, "/traj_prompt_tokens_total", 0)),
+            "response_tokens": int(metric(rollout, "/traj_response_tokens_total", 0)),
+            "inference_tokens": int(metric(rollout, "/traj_inference_tokens_total", 0)),
+            "generate_seconds": float(metric(rollout, "/traj_generate_seconds_total", 0)),
+            "env_seconds": float(metric(rollout, "/traj_env_seconds_total", 0)),
+        })
+
+    def record_discarded_group(self, group: GroupData, reason: str, observed_step: Optional[int] = None):
+        for rollout in group.rollouts:
+            self.record_discarded_rollout(rollout, group, reason, observed_step)
+
+    def collect_new_discard_records(self) -> List[Dict[str, Any]]:
+        records = self.discard_records[self.discard_metrics_cursor:]
+        self.discard_metrics_cursor = len(self.discard_records)
+        return records
+
+    def reset_filter_metrics(self):
+        self.group_filter_count = 0
+        self.group_filter_rollout_count = 0
+        self.group_filter_actions = 0.0
+        self.group_filter_actions_ge_1 = 0.0
+        self.group_filter_actions_ge_2 = 0.0
+        self.group_filter_actions_ge_3 = 0.0
+        self.group_filter_actions_ge_4 = 0.0
+        self.group_filter_inference_calls = 0.0
+        self.group_filter_tool_calls = 0.0
+        self.group_filter_prompt_tokens = 0.0
+        self.group_filter_response_tokens = 0.0
+        self.group_filter_inference_tokens = 0.0
+        self.group_filter_env_seconds = 0.0
+
     def advance_group(self, create_step):
         assert not self.quit
         self.groups[self.next_episode_id] = GroupData(
             group_id=self.group_id, episode_id=self.next_episode_id, create_step=create_step)
         self.next_episode_id += 1
+
+    def _ordered_groups(self):
+        if self.scheduling_policy == "version_priority":
+            return sorted(
+                self.groups.items(),
+                key=lambda item: (item[1].create_step, item[1].episode_id),
+            )
+        return self.groups.items()
+
+    def outstanding_snapshot(self, observed_step: Optional[int] = None) -> Dict[str, Any]:
+        step = self.current_step if observed_step is None else observed_step
+        snapshot = {
+            "active_groups": len(self.groups),
+            "ready_trajectories": 0,
+            "running_trajectories": 0,
+            "reserved_trajectories": 0,
+            "retired_running_trajectories": 0,
+            "outstanding_trajectories": 0,
+            "oldest_version_age": 0,
+            "age_counts": {},
+        }
+        for group in self.groups.values():
+            ready = min(len(group.rollouts), self.admission_width)
+            running = max(0, min(group.running_rollouts, self.admission_width) - ready)
+            reserved = max(0, self.admission_width - max(group.running_rollouts, ready))
+            age = max(0, int(step) - group.create_step) if step is not None else 0
+            snapshot["ready_trajectories"] += ready
+            snapshot["running_trajectories"] += running
+            snapshot["reserved_trajectories"] += reserved
+            snapshot["oldest_version_age"] = max(snapshot["oldest_version_age"], age)
+            snapshot["age_counts"][age] = snapshot["age_counts"].get(age, 0) + ready + running + reserved
+        for group in self.retired_groups.values():
+            running = max(0, group.running_rollouts - len(group.rollouts))
+            age = max(0, int(step) - group.create_step) if step is not None else 0
+            snapshot["retired_running_trajectories"] += running
+            snapshot["oldest_version_age"] = max(snapshot["oldest_version_age"], age)
+            snapshot["age_counts"][age] = snapshot["age_counts"].get(age, 0) + running
+        snapshot["outstanding_trajectories"] = (
+            snapshot["ready_trajectories"]
+            + snapshot["running_trajectories"]
+            + snapshot["reserved_trajectories"]
+            + snapshot["retired_running_trajectories"]
+        )
+        return snapshot
 
     def _advance_step(self, create_step):
         if self.max_traj_per_env is None:
@@ -271,8 +441,8 @@ class GroupQueue:
         for _ in range(self.max_traj_per_env):
             self.advance_group(create_step)
 
-    def advance_step(self, step):
-        if self.current_step is None:
+    def advance_step(self, step, admit_step_groups: bool = True):
+        if self.current_step is None and admit_step_groups:
             # first time into advance_step, generate extra groups for async training
             for _ in range(self.async_generation_ratio):
                 self._advance_step(step)
@@ -280,15 +450,19 @@ class GroupQueue:
             # remove outdated groups for async training
             expired_episodes = []
             for episode_id, group in self.groups.items():
-                if step - group.create_step > self.async_generation_ratio:
+                if step - group.create_step > self.staleness_tolerance:
                     expired_episodes.append(episode_id)
             for episode_id in expired_episodes:
-                self.groups.pop(episode_id)
+                group = self.groups.pop(episode_id)
+                self.record_discarded_group(group, "version_expired_buffered", step)
+                if len(group.rollouts) < group.running_rollouts:
+                    self.retired_groups[episode_id] = group
                 if self.env_monitor:
                     self.env_monitor.cleanup_episode(self.group_id, episode_id)
 
         self.current_step = step
-        self._advance_step(step)
+        if admit_step_groups:
+            self._advance_step(step)
         self.progress.set()
 
     async def get_episode_id(self, env_id: Optional[int] = None) -> Optional[int]:
@@ -302,8 +476,8 @@ class GroupQueue:
             episode_id to process, or None if shutting down
         """
         while not self.quit:
-            # iterate over groups in order
-            for episode_id, group in self.groups.items():
+            # Version priority is only based on policy age; no reward or training value enters here.
+            for episode_id, group in self._ordered_groups():
                 if group.running_rollouts < self.group_size + self.group_size_redundancy:
                     group.running_rollouts += 1
 
@@ -324,7 +498,19 @@ class GroupQueue:
         return None
 
     def put(self, episode_id, start_step, rollout):
-        if episode_id not in self.groups: # ignore rollouts from outdated episode
+        if episode_id not in self.groups:
+            group = self.retired_groups.get(episode_id)
+            if group is not None:
+                group.rollouts.append(rollout)
+                is_version_stale = (
+                    self.current_step is not None
+                    and self.current_step - group.create_step > self.staleness_tolerance
+                )
+                reason = "version_expired_late_return" if is_version_stale else "redundancy_late_return"
+                self.record_discarded_rollout(rollout, group, reason, self.current_step)
+                if len(group.rollouts) >= group.running_rollouts:
+                    self.retired_groups.pop(episode_id, None)
+            # A retired episode has already been consumed or expired.
             return
         group = self.groups[episode_id]
         assert start_step >= group.create_step, f"{start_step=} {group.create_step=}"
@@ -336,10 +522,12 @@ class GroupQueue:
             elif self.group_filter.filter(group_id=self.group_id, episode_id=episode_id, group=group.rollouts):
                 logger.info(f"filter rollout group {group.group_id} episode {group.episode_id}")
                 self.group_filter_count += 1
+                self.record_filtered_group(group)
                 self.groups.pop(episode_id)
                 if self.env_monitor:
                     self.env_monitor.cleanup_episode(self.group_id, episode_id)
-                self.advance_group(create_step=self.current_step)
+                if self.fixed_step_admission:
+                    self.advance_group(create_step=self.current_step)
             else:
                 self.complete.set()
                 self.progress_bar.update(self.group_size)
@@ -349,10 +537,18 @@ class GroupQueue:
             while not self.groups:
                 self.complete.clear()
                 await self.complete.wait()
-            episode_id = next(iter(self.groups)) # must consume the first group (smallest episode_id)
+            if self.scheduling_policy == "version_priority":
+                episode_id = min(
+                    self.groups,
+                    key=lambda key: (self.groups[key].create_step, self.groups[key].episode_id),
+                )
+            else:
+                episode_id = next(iter(self.groups)) # preserve original FIFO behavior
             group = self.groups[episode_id]
             if len(group.rollouts) >= self.group_size:
                 self.groups.pop(episode_id)
+                if len(group.rollouts) < group.running_rollouts:
+                    self.retired_groups[episode_id] = group
                 if self.env_monitor:
                     self.env_monitor.cleanup_episode(self.group_id, episode_id)
                 return group
@@ -375,10 +571,37 @@ class GroupQueueManager:
 
         if self.mode == "train":
             self.async_generation_ratio = config.async_generation_ratio
+            configured_tolerance = getattr(config, "trajectory_staleness_tolerance", None)
+            self.staleness_tolerance = (
+                int(configured_tolerance)
+                if configured_tolerance is not None
+                else int(self.async_generation_ratio)
+            )
             self.max_traj_per_env = env_manager_config.max_traj_per_env if config.rollout_batch_size > 0 else None
         else:
             self.async_generation_ratio = 0
+            self.staleness_tolerance = 0
             self.max_traj_per_env = env_manager_config.max_traj_per_env if config.val_batch_size > 0 else None
+
+        self.scheduling_policy = (
+            getattr(config, "trajectory_scheduling_policy", "fifo") if self.mode == "train" else "fifo"
+        )
+        self.admission_policy = (
+            getattr(config, "trajectory_admission_policy", "step") if self.mode == "train" else "step"
+        )
+        if self.admission_policy not in ("step", "outstanding_watermark"):
+            raise ValueError(f"Unsupported trajectory_admission_policy: {self.admission_policy}")
+        configured_watermark = getattr(config, "max_outstanding_trajectories", None)
+        if self.admission_policy == "outstanding_watermark":
+            default_watermark = math.ceil(
+                (1 + float(self.async_generation_ratio)) * int(config.rollout_batch_size)
+            )
+            self.max_outstanding_trajectories = int(configured_watermark or default_watermark)
+        else:
+            self.max_outstanding_trajectories = None
+        self.admission_cursor = 0
+        self.admitted_trajectories_total = 0
+        self.admission_throttled_total = 0
 
         # Initialize env activity monitor first (before creating GroupQueues)
         self.group_queue: Dict[int, GroupQueue] = {}
@@ -399,8 +622,11 @@ class GroupQueueManager:
                         group_size_redundancy=env_manager_config.group_size_redundancy,
                         max_traj_per_env=self.max_traj_per_env,
                         async_generation_ratio=self.async_generation_ratio,
+                        staleness_tolerance=self.staleness_tolerance,
                         group_filter=self.group_filter,
                         env_monitor=self.env_monitor,
+                        scheduling_policy=self.scheduling_policy,
+                        fixed_step_admission=self.admission_policy == "step",
                     )
 
         # Start monitoring after all GroupQueues are created
@@ -411,12 +637,324 @@ class GroupQueueManager:
         self.total = 0
         self.waiting = 0
 
+    def _pending_ready_snapshot(self, observed_step: Optional[int]) -> Dict[str, Any]:
+        ready = 0
+        oldest_age = 0
+        age_counts: Dict[int, int] = {}
+        for task in self.pending_gets:
+            if task.cancelled() or not task.done():
+                continue
+            try:
+                group = task.result()
+            except Exception:
+                continue
+            count = len(group.rollouts)
+            age = max(0, int(observed_step) - group.create_step) if observed_step is not None else 0
+            ready += count
+            oldest_age = max(oldest_age, age)
+            age_counts[age] = age_counts.get(age, 0) + count
+        return {
+            "ready_trajectories": ready,
+            "oldest_version_age": oldest_age,
+            "age_counts": age_counts,
+        }
+
+    def _outstanding_snapshot(self, observed_step: Optional[int] = None) -> Dict[str, Any]:
+        if observed_step is None:
+            steps = [queue.current_step for queue in self.group_queue.values() if queue.current_step is not None]
+            observed_step = max(steps) if steps else None
+        snapshot = {
+            "active_groups": 0,
+            "ready_trajectories": 0,
+            "running_trajectories": 0,
+            "reserved_trajectories": 0,
+            "retired_running_trajectories": 0,
+            "outstanding_trajectories": 0,
+            "oldest_version_age": 0,
+            "age_counts": {},
+        }
+        for queue in self.group_queue.values():
+            queue_snapshot = queue.outstanding_snapshot(observed_step)
+            for key in (
+                "active_groups",
+                "ready_trajectories",
+                "running_trajectories",
+                "reserved_trajectories",
+                "retired_running_trajectories",
+                "outstanding_trajectories",
+            ):
+                snapshot[key] += queue_snapshot[key]
+            snapshot["oldest_version_age"] = max(
+                snapshot["oldest_version_age"], queue_snapshot["oldest_version_age"]
+            )
+            for age, count in queue_snapshot["age_counts"].items():
+                snapshot["age_counts"][age] = snapshot["age_counts"].get(age, 0) + count
+        pending = self._pending_ready_snapshot(observed_step)
+        snapshot["ready_trajectories"] += pending["ready_trajectories"]
+        snapshot["outstanding_trajectories"] += pending["ready_trajectories"]
+        snapshot["oldest_version_age"] = max(
+            snapshot["oldest_version_age"], pending["oldest_version_age"]
+        )
+        for age, count in pending["age_counts"].items():
+            snapshot["age_counts"][age] = snapshot["age_counts"].get(age, 0) + count
+        return snapshot
+
+    def _refill_to_watermark(self, create_step: int):
+        if self.admission_policy != "outstanding_watermark" or not self.group_queue:
+            return
+        queues = [queue for queue in self.group_queue.values() if not queue.quit]
+        if not queues:
+            return
+        width = queues[0].admission_width
+        if self.max_outstanding_trajectories < width:
+            raise ValueError(
+                "max_outstanding_trajectories must be at least one rollout group "
+                f"({width})"
+            )
+        outstanding = self._outstanding_snapshot(create_step)["outstanding_trajectories"]
+        admitted = 0
+        touched = set()
+        while outstanding + width <= self.max_outstanding_trajectories:
+            queue = queues[self.admission_cursor % len(queues)]
+            self.admission_cursor += 1
+            queue.advance_group(create_step)
+            touched.add(queue.group_id)
+            outstanding += width
+            admitted += width
+        for group_id in touched:
+            self.group_queue[group_id].progress.set()
+        self.admitted_trajectories_total += admitted
+        if admitted == 0 and outstanding + width > self.max_outstanding_trajectories:
+            self.admission_throttled_total += 1
+
     def collect_metrics(self):
-        group_filter_count = 0
+        outstanding = self._outstanding_snapshot()
+        filter_metrics = {
+            "scheduler/async_generation_ratio": self.async_generation_ratio,
+            "scheduler/trajectory_staleness_tolerance": self.staleness_tolerance,
+            "scheduler/version_priority_enabled": int(self.scheduling_policy == "version_priority"),
+            "scheduler/watermark_admission_enabled": int(self.admission_policy == "outstanding_watermark"),
+            "scheduler/max_outstanding_trajectories": self.max_outstanding_trajectories or 0,
+            "scheduler/outstanding_trajectories": outstanding["outstanding_trajectories"],
+            "scheduler/outstanding_active_groups": outstanding["active_groups"],
+            "scheduler/outstanding_ready_trajectories": outstanding["ready_trajectories"],
+            "scheduler/outstanding_running_trajectories": outstanding["running_trajectories"],
+            "scheduler/outstanding_reserved_trajectories": outstanding["reserved_trajectories"],
+            "scheduler/outstanding_retired_running_trajectories": outstanding["retired_running_trajectories"],
+            "scheduler/outstanding_oldest_version_age": outstanding["oldest_version_age"],
+            "scheduler/admitted_trajectories_total": self.admitted_trajectories_total,
+            "scheduler/admission_throttled_total": self.admission_throttled_total,
+            "scheduler/group_filter_count": 0,
+            "scheduler/group_filter_rollouts": 0,
+            "scheduler/group_filter_actions": 0.0,
+            "scheduler/group_filter_actions_ge_1": 0.0,
+            "scheduler/group_filter_actions_ge_2": 0.0,
+            "scheduler/group_filter_actions_ge_3": 0.0,
+            "scheduler/group_filter_actions_ge_4": 0.0,
+            "scheduler/group_filter_inference_calls": 0.0,
+            "scheduler/group_filter_tool_calls": 0.0,
+            "scheduler/group_filter_prompt_tokens": 0.0,
+            "scheduler/group_filter_response_tokens": 0.0,
+            "scheduler/group_filter_inference_tokens": 0.0,
+            "scheduler/group_filter_env_seconds": 0.0,
+        }
+        new_discard_records = []
         for group_queue in self.group_queue.values():
-            group_filter_count += group_queue.group_filter_count
-            group_queue.group_filter_count = 0
-        return {"scheduler/group_filter_count": group_filter_count}
+            new_discard_records.extend(group_queue.collect_new_discard_records())
+            filter_metrics["scheduler/group_filter_count"] += group_queue.group_filter_count
+            filter_metrics["scheduler/group_filter_rollouts"] += group_queue.group_filter_rollout_count
+            filter_metrics["scheduler/group_filter_actions"] += group_queue.group_filter_actions
+            filter_metrics["scheduler/group_filter_actions_ge_1"] += group_queue.group_filter_actions_ge_1
+            filter_metrics["scheduler/group_filter_actions_ge_2"] += group_queue.group_filter_actions_ge_2
+            filter_metrics["scheduler/group_filter_actions_ge_3"] += group_queue.group_filter_actions_ge_3
+            filter_metrics["scheduler/group_filter_actions_ge_4"] += group_queue.group_filter_actions_ge_4
+            filter_metrics["scheduler/group_filter_inference_calls"] += group_queue.group_filter_inference_calls
+            filter_metrics["scheduler/group_filter_tool_calls"] += group_queue.group_filter_tool_calls
+            filter_metrics["scheduler/group_filter_prompt_tokens"] += group_queue.group_filter_prompt_tokens
+            filter_metrics["scheduler/group_filter_response_tokens"] += group_queue.group_filter_response_tokens
+            filter_metrics["scheduler/group_filter_inference_tokens"] += group_queue.group_filter_inference_tokens
+            filter_metrics["scheduler/group_filter_env_seconds"] += group_queue.group_filter_env_seconds
+            group_queue.reset_filter_metrics()
+        for age in range(4):
+            filter_metrics[f"scheduler/outstanding_version_age_{age}"] = outstanding["age_counts"].get(age, 0)
+        filter_metrics["scheduler/outstanding_version_age_ge_4"] = sum(
+            count for age, count in outstanding["age_counts"].items() if age >= 4
+        )
+        near_expiry_age = max(0, self.staleness_tolerance - 1)
+        filter_metrics["scheduler/outstanding_near_expiry_trajectories"] = sum(
+            count for age, count in outstanding["age_counts"].items() if age >= near_expiry_age
+        )
+        discard_metrics, _ = self._aggregate_discard_records(new_discard_records, "scheduler/async_discard")
+        filter_metrics.update(discard_metrics)
+        return filter_metrics
+
+    @staticmethod
+    def _aggregate_discard_records(records: List[Dict[str, Any]], prefix: str):
+        actions_histogram: Dict[str, int] = {}
+        inference_histogram: Dict[str, int] = {}
+        tool_histogram: Dict[str, int] = {}
+        for record in records:
+            for histogram, field in (
+                (actions_histogram, "actions_completed"),
+                (inference_histogram, "inference_calls"),
+                (tool_histogram, "tool_calls"),
+            ):
+                bucket = str(int(record.get(field, 0)))
+                histogram[bucket] = histogram.get(bucket, 0) + 1
+
+        metrics = {
+            f"{prefix}/trajectories": len(records),
+            f"{prefix}/version_stale_trajectories": sum(
+                str(record.get("discard_reason", "")).startswith("version_") for record in records
+            ),
+            f"{prefix}/redundancy_trajectories": sum(
+                str(record.get("discard_reason", "")).startswith("redundancy_") for record in records
+            ),
+            f"{prefix}/actions": sum(int(record.get("actions_completed", 0)) for record in records),
+            f"{prefix}/inference_calls": sum(int(record.get("inference_calls", 0)) for record in records),
+            f"{prefix}/tool_calls": sum(int(record.get("tool_calls", 0)) for record in records),
+            f"{prefix}/prompt_tokens": sum(int(record.get("prompt_tokens", 0)) for record in records),
+            f"{prefix}/response_tokens": sum(int(record.get("response_tokens", 0)) for record in records),
+            f"{prefix}/inference_tokens": sum(int(record.get("inference_tokens", 0)) for record in records),
+            f"{prefix}/env_seconds": sum(float(record.get("env_seconds", 0.0)) for record in records),
+        }
+        for threshold in (1, 2, 3, 4, 8):
+            metrics[f"{prefix}/trajectories_actions_ge_{threshold}"] = sum(
+                int(record.get("actions_completed", 0)) >= threshold for record in records
+            )
+            metrics[f"{prefix}/trajectories_inference_ge_{threshold}"] = sum(
+                int(record.get("inference_calls", 0)) >= threshold for record in records
+            )
+        for threshold in (1, 2, 4):
+            metrics[f"{prefix}/trajectories_tool_calls_ge_{threshold}"] = sum(
+                int(record.get("tool_calls", 0)) >= threshold for record in records
+            )
+        return metrics, {
+            "actions_completed": actions_histogram,
+            "inference_calls": inference_histogram,
+            "tool_calls": tool_histogram,
+        }
+
+    @staticmethod
+    def _first_non_tensor_value(rollout: DataProto, key: str, default=None):
+        values = rollout.non_tensor_batch.get(key) if rollout.non_tensor_batch else None
+        if values is None or len(values) == 0:
+            return default
+        value = values[0]
+        return value.item() if hasattr(value, "item") else value
+
+    def _completed_rollout_record(self, rollout: DataProto, group: GroupData) -> Dict[str, Any]:
+        metric = GroupQueue._metric_by_suffix
+        env_id = self._first_non_tensor_value(rollout, "env_ids", -1)
+        return {
+            "trajectory_id": str(self._first_non_tensor_value(rollout, "traj_id", "unknown")),
+            "category": "completed_unconsumed",
+            "discard_reason": "pipeline_shutdown",
+            "group_id": int(group.group_id),
+            "episode_id": int(group.episode_id),
+            "env_id": int(env_id),
+            "version_start": int(metric(rollout, "/traj_version_start", group.create_step)),
+            "version_end": int(metric(rollout, "/traj_version_end", group.create_step)),
+            "version_age": int(metric(rollout, "/traj_version_age", 0)),
+            "reset_completed": True,
+            "completed": True,
+            "truncated": bool(metric(rollout, "/traj_truncated", 0)),
+            "actions_completed": int(metric(rollout, "/traj_actions_completed", 0)),
+            "inference_calls": int(metric(rollout, "/traj_inference_calls", 0)),
+            "tool_calls": int(metric(rollout, "/traj_tool_calls", 0)),
+            "prompt_tokens": int(metric(rollout, "/traj_prompt_tokens_total", 0)),
+            "response_tokens": int(metric(rollout, "/traj_response_tokens_total", 0)),
+            "inference_tokens": int(metric(rollout, "/traj_inference_tokens_total", 0)),
+            "generate_seconds": float(metric(rollout, "/traj_generate_seconds_total", 0)),
+            "env_seconds": float(metric(rollout, "/traj_env_seconds_total", 0)),
+        }
+
+    def collect_shutdown_waste(self, inflight_records: List[Dict[str, Any]]):
+        records = []
+        for group_queue in self.group_queue.values():
+            for group in group_queue.groups.values():
+                for rollout in group.rollouts:
+                    if rollout is not None:
+                        records.append(self._completed_rollout_record(rollout, group))
+
+        records.extend(record for record in inflight_records if record is not None)
+        records.sort(
+            key=lambda item: (
+                -int(item.get("actions_completed", 0)),
+                -int(item.get("inference_calls", 0)),
+                str(item.get("trajectory_id", "")),
+            )
+        )
+
+        actions_histogram: Dict[str, int] = {}
+        inference_histogram: Dict[str, int] = {}
+        tool_histogram: Dict[str, int] = {}
+        for record in records:
+            for histogram, field in (
+                (actions_histogram, "actions_completed"),
+                (inference_histogram, "inference_calls"),
+                (tool_histogram, "tool_calls"),
+            ):
+                bucket = str(int(record.get(field, 0)))
+                histogram[bucket] = histogram.get(bucket, 0) + 1
+
+        metrics = {
+            "terminal_waste/trajectories": len(records),
+            "terminal_waste/completed_unconsumed": sum(
+                record.get("category") == "completed_unconsumed" for record in records
+            ),
+            "terminal_waste/completed_not_submitted": sum(
+                record.get("category") == "completed_not_submitted" for record in records
+            ),
+            "terminal_waste/inflight": sum(
+                record.get("category") == "inflight_at_shutdown" for record in records
+            ),
+            "terminal_waste/reset_only": sum(int(record.get("inference_calls", 0)) == 0 for record in records),
+            "terminal_waste/actions": sum(int(record.get("actions_completed", 0)) for record in records),
+            "terminal_waste/inference_calls": sum(int(record.get("inference_calls", 0)) for record in records),
+            "terminal_waste/tool_calls": sum(int(record.get("tool_calls", 0)) for record in records),
+            "terminal_waste/prompt_tokens": sum(int(record.get("prompt_tokens", 0)) for record in records),
+            "terminal_waste/response_tokens": sum(int(record.get("response_tokens", 0)) for record in records),
+            "terminal_waste/inference_tokens": sum(int(record.get("inference_tokens", 0)) for record in records),
+            "terminal_waste/env_seconds": sum(float(record.get("env_seconds", 0.0)) for record in records),
+        }
+        for threshold in (1, 2, 3, 4, 8):
+            metrics[f"terminal_waste/trajectories_actions_ge_{threshold}"] = sum(
+                int(record.get("actions_completed", 0)) >= threshold for record in records
+            )
+            metrics[f"terminal_waste/trajectories_inference_ge_{threshold}"] = sum(
+                int(record.get("inference_calls", 0)) >= threshold for record in records
+            )
+        for threshold in (1, 2, 4):
+            metrics[f"terminal_waste/trajectories_tool_calls_ge_{threshold}"] = sum(
+                int(record.get("tool_calls", 0)) >= threshold for record in records
+            )
+        async_discard_records = [
+            record
+            for group_queue in self.group_queue.values()
+            for record in group_queue.discard_records
+        ]
+        async_discard_records.sort(
+            key=lambda item: (-int(item.get("actions_completed", 0)), str(item.get("discard_reason", "")))
+        )
+        async_metrics, async_histograms = self._aggregate_discard_records(
+            async_discard_records, "async_waste"
+        )
+        metrics.update(async_metrics)
+        return {
+            "metrics": metrics,
+            "histograms": {
+                "actions_completed": actions_histogram,
+                "inference_calls": inference_histogram,
+                "tool_calls": tool_histogram,
+            },
+            "records": records,
+            "async_discard": {
+                "metrics": async_metrics,
+                "histograms": async_histograms,
+                "records": async_discard_records,
+            },
+        }
 
     def clear(self):
         self.rollout_complete = {}
@@ -427,8 +965,11 @@ class GroupQueueManager:
             group_queue.clear()
 
     def advance_step(self, step):
+        fixed_step_admission = self.admission_policy == "step"
         for group_queue in self.group_queue.values():
-            group_queue.advance_step(step)
+            group_queue.advance_step(step, admit_step_groups=fixed_step_admission)
+        if not fixed_step_admission:
+            self._refill_to_watermark(step)
 
     async def get_episode_id(self, group_id, env_id=None):
         """
@@ -479,6 +1020,10 @@ class GroupQueueManager:
         self.group_queue[group_id].put(episode_id, start_step, rollout)
         self.waiting -= 1
         self.total += 1
+        if self.admission_policy == "outstanding_watermark":
+            current_step = self.group_queue[group_id].current_step
+            if current_step is not None:
+                self._refill_to_watermark(current_step)
 
     async def get_batch(self, batch_size, current_step) -> List[DataProto]:
         """
@@ -514,7 +1059,18 @@ class GroupQueueManager:
 
                     done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                     while done and (batch_size < 0 or len(ret) < batch_size):
-                        d = done.pop()
+                        if self.scheduling_policy == "version_priority":
+                            d = min(
+                                done,
+                                key=lambda task: (
+                                    task.result().create_step,
+                                    task.result().episode_id,
+                                    task.result().group_id,
+                                ),
+                            )
+                            done.remove(d)
+                        else:
+                            d = done.pop()
                         group = await d
                         group_rollout = group.rollouts
                         self.total -= len(group_rollout)
@@ -524,12 +1080,19 @@ class GroupQueueManager:
                             self.rollout_complete[d.get_name()] = True
                             continue
 
-                        if current_step - group.create_step > self.async_generation_ratio:
+                        if current_step - group.create_step > self.staleness_tolerance:
+                            self.group_queue[group.group_id].record_discarded_group(
+                                group, "version_stale_at_consume", current_step
+                            )
                             logger.info(f"ignore rollout, current_step({current_step}) - create_step({group.create_step}) "
-                                        f"exceed async_generation_ratio({self.async_generation_ratio}) "
+                                        f"exceed trajectory_staleness_tolerance({self.staleness_tolerance}) "
                                         f"{group.group_id=} {group.episode_id=}")
                             continue
 
+                        for rollout in group_rollout[self.group_size:]:
+                            self.group_queue[group.group_id].record_discarded_rollout(
+                                rollout, group, "redundancy_trim", current_step
+                            )
                         group_rollout = group_rollout[:self.group_size]
                         ret.extend(group_rollout)
                         progress_bar.update(len(group_rollout))
@@ -538,6 +1101,7 @@ class GroupQueueManager:
                     if done:
                         self.pending_gets.update(done)
                 self.pending_gets.update(pending)
+                self._refill_to_watermark(current_step)
 
             await wait_a_episode()
         get_batch_return_start_time = time.time()
@@ -561,6 +1125,8 @@ class RolloutScheduler(RolloutMockMixin):
             rollout()
         ray.get(train_rollout_scheduler.shutdown.remote())
     """
+    shutdown_timeout_seconds = 30.0
+
     def __init__(self, config, env_manager_config: EnvManagerConfig, resource_manager, infer_cluster, mode, collator=None):
         self.config = config
         self.env_manager_config = env_manager_config
@@ -617,12 +1183,61 @@ class RolloutScheduler(RolloutMockMixin):
 
     async def shutdown(self):
         if self.rollout_task is None:
-            return
-        await asyncio.gather(*self.es_manager.stop(blocking=False))
+            return None
+
+        timeout_seconds = self.shutdown_timeout_seconds
+        timeout_stages = []
+        worker_snapshots = []
+
+        # Snapshot first: an environment can be blocked in an external sandbox call
+        # long after the learner has stopped consuming trajectories.
+        try:
+            worker_snapshots = await asyncio.wait_for(
+                asyncio.gather(*self.es_manager.collect_trajectory_progress(blocking=False)),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            timeout_stages.append("snapshot")
+            logger.warning("timed out collecting terminal trajectory snapshots")
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*self.es_manager.stop(blocking=False)),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            timeout_stages.append("worker_stop")
+            logger.warning("timed out stopping environment workers")
+
+        try:
+            await asyncio.wait_for(self.rollout_task, timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            timeout_stages.append("rollout_loop")
+            logger.warning("timed out waiting for rollout loop shutdown")
+
+        inflight_records = [
+            record
+            for worker_records in worker_snapshots
+            for record in worker_records
+        ]
+        shutdown_report = await self.env_output_queue.collect_shutdown_waste.remote(inflight_records)
         await self.env_output_queue.shutdown.remote()
-        await self.router_manager.shutdown.remote()
-        await self.rollout_task
+        try:
+            await asyncio.wait_for(
+                self.router_manager.shutdown.remote(),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            timeout_stages.append("router")
+            logger.warning("timed out stopping rollout router")
+
+        shutdown_report["shutdown"] = {
+            "timeout_seconds": timeout_seconds,
+            "timeout_stages": timeout_stages,
+        }
+        shutdown_report["metrics"]["terminal_waste/shutdown_timeouts"] = len(timeout_stages)
         self.rollout_task = None
+        return shutdown_report
 
     async def suspend(self):
         await self.router_manager.suspend.remote()
@@ -659,7 +1274,14 @@ class RolloutScheduler(RolloutMockMixin):
 
         # start env manager
         if self.rollout_task is None:
-            seed = random.randint(0, 1000000) if self.mode == "train" else self.config.seed
+            if self.mode == "train":
+                seed = (
+                    self.config.rollout_seed
+                    if self.config.rollout_seed is not None
+                    else random.randint(0, 1000000)
+                )
+            else:
+                seed = self.config.seed
             self.rollout_task = asyncio.create_task(self._run_rollout_loop(seed))
 
         await asyncio.gather(*self.es_manager.update_step(global_step, inject_trace_context({}), blocking=False))

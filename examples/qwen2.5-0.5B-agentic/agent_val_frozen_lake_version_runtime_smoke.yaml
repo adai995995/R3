@@ -1,0 +1,71 @@
+defaults:
+  - agent_val_frozen_lake_async
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: version_runtime_frozenlake_smoke
+logging_dir: ./output/logs
+output_dir: ./output/version_runtime_frozenlake_smoke
+render_save_dir: ./output/version_runtime_frozenlake_smoke/render
+track_with: stdout
+tracker_kwargs: {}
+checkpoint_config:
+  type: file_system
+  output_dir: ./output/version_runtime_frozenlake_smoke/checkpoints
+
+max_steps: 3
+logging_steps: 1
+eval_steps: 1000
+save_steps: 10000
+enable_checkpointing: false
+save_final_checkpoint: false
+resume_from_checkpoint: false
+
+async_generation_ratio: 1
+trajectory_staleness_tolerance: 2
+trajectory_scheduling_policy: version_priority
+trajectory_admission_policy: outstanding_watermark
+max_outstanding_trajectories: 24
+max_running_requests: 2
+
+rollout_batch_size: 16
+val_batch_size: 4
+sequence_length: 4096
+max_tokens_per_step: 64
+
+actor_train:
+  training_args:
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 4
+    warmup_steps: 0
+  device_mapping: list(range(0,4))
+
+actor_infer:
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.75
+      block_size: 16
+      load_format: auto
+  device_mapping: list(range(4,8))
+
+reference:
+  device_mapping: list(range(0,4))
+
+train_env_manager:
+  max_env_num_per_worker: 16
+  num_env_groups: 4
+  group_size: 4
+  tags: [FrozenLake]
+  num_groups_partition: [4]
+
+val_env_manager:
+  max_env_num_per_worker: 4
+  num_env_groups: 4
+  group_size: 1
+  tags: [FrozenLake]
+  num_groups_partition: [4]

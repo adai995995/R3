@@ -1,4 +1,5 @@
 import asyncio
+import heapq
 import itertools
 import math
 import time
@@ -23,6 +24,22 @@ from roll.utils.logging import get_logger
 
 
 logger = get_logger()
+
+def _create_sampling_params_for_sglang(gen_kwargs: dict):
+    return dict(
+        max_new_tokens=gen_kwargs["max_new_tokens"],
+        min_new_tokens=gen_kwargs.get("min_new_tokens", 0),
+        ignore_eos=gen_kwargs.get("ignore_eos", False),
+        temperature=gen_kwargs["temperature"],
+        top_p=gen_kwargs["top_p"],
+        top_k=gen_kwargs["top_k"],
+        stop_token_ids=gen_kwargs["eos_token_id"],
+        repetition_penalty=gen_kwargs["repetition_penalty"],
+        n=gen_kwargs["num_return_sequences"],
+        stop=gen_kwargs["stop_strings"],
+        no_stop_trim=gen_kwargs.get("include_stop_str_in_output", True),
+    )
+
 
 def is_report_data_finished(data: DataProto) -> bool:
     finish_reasons = data.meta_info.get("finish_reasons", [])
@@ -143,8 +160,8 @@ class RouterManager:
             proxy = SglangProxy(proxy, meta)
         return RouterClient(proxy, meta)
 
-    async def generate_request(self, payload, request_id, uid):
-        return await self.router.generate_request(payload=payload, request_id=request_id, uid=uid)
+    async def generate_request(self, payload, request_id, uid, priority=None):
+        return await self.router.generate_request(payload=payload, request_id=request_id, uid=uid, priority=priority)
 
     async def abort_requests(self, request_ids, uid):
         return await self.router.abort_requests(request_ids, uid)
@@ -448,7 +465,7 @@ class RouterProxy:
     Proxy to RouterManager
     """
     @abstractmethod
-    async def generate_request(self, payload, request_id, uid):
+    async def generate_request(self, payload, request_id, uid, priority=None):
         pass
 
     @abstractmethod
@@ -459,7 +476,7 @@ class RouterProxy:
     async def on_request_routed(self, request_id):
         pass
 
-    def generate_request_sync(self, payload, request_id, uid):
+    def generate_request_sync(self, payload, request_id, uid, priority=None):
         raise NotImplementedError
 
     def on_send_request_sync(self, request_id):
@@ -472,8 +489,8 @@ class InprocProxy(RouterProxy):
     def __init__(self, router_manager: RouterManager):
         self.router_manager = router_manager
 
-    async def generate_request(self, payload, request_id, uid):
-        return await self.router_manager.generate_request(payload=payload, request_id=request_id, uid=uid)
+    async def generate_request(self, payload, request_id, uid, priority=None):
+        return await self.router_manager.generate_request(payload=payload, request_id=request_id, uid=uid, priority=priority)
 
     async def on_send_request(self, request_id):
         return await self.router_manager.on_send_request(request_id)
@@ -485,8 +502,8 @@ class RayProxy(RouterProxy):
     def __init__(self, router_manager: RouterManager):
         self.router_manager = router_manager
 
-    async def generate_request(self, payload, request_id, uid):
-        return await self.router_manager.generate_request.remote(payload=payload, request_id=request_id, uid=uid)
+    async def generate_request(self, payload, request_id, uid, priority=None):
+        return await self.router_manager.generate_request.remote(payload=payload, request_id=request_id, uid=uid, priority=priority)
 
     async def on_send_request(self, request_id):
         return await self.router_manager.on_send_request.remote(request_id)
@@ -494,8 +511,8 @@ class RayProxy(RouterProxy):
     async def on_request_routed(self, request_id):
         return await self.router_manager.on_request_routed.remote(request_id)
 
-    def generate_request_sync(self, payload, request_id, uid):
-        return ray.get(self.router_manager.generate_request.remote(payload=payload, request_id=request_id, uid=uid))
+    def generate_request_sync(self, payload, request_id, uid, priority=None):
+        return ray.get(self.router_manager.generate_request.remote(payload=payload, request_id=request_id, uid=uid, priority=priority))
 
     def on_send_request_sync(self, request_id):
         return ray.get(self.router_manager.on_send_request.remote(request_id))
@@ -512,7 +529,7 @@ class SglangProxy(RouterProxy):
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(None))
         self.client_sync = httpx.Client(timeout=httpx.Timeout(None))
 
-    async def generate_request(self, payload, request_id, uid):
+    async def generate_request(self, payload, request_id, uid, priority=None):
         from roll.distributed.strategy.sglang_strategy import postprocess_generate
         assert "multi_modal_data" not in payload
         url = f"http://{self.router_ip}:{self.router_port}/generate"
@@ -528,7 +545,7 @@ class SglangProxy(RouterProxy):
     async def on_request_routed(self, request_id):
         return await self.proxy.on_request_routed(request_id)
 
-    def generate_request_sync(self, payload, request_id, uid):
+    def generate_request_sync(self, payload, request_id, uid, priority=None):
         from roll.distributed.strategy.sglang_strategy import postprocess_generate
         assert "multi_modal_data" not in payload
         url = f"http://{self.router_ip}:{self.router_port}/generate"
@@ -591,8 +608,7 @@ class RouterClient:
 
         match self.strategy_name:
             case "sglang":
-                from roll.distributed.strategy.sglang_strategy import create_sampling_params_for_sglang
-                sampling_params = create_sampling_params_for_sglang(gen_kwargs=generation_config)
+                sampling_params = _create_sampling_params_for_sglang(gen_kwargs=generation_config)
                 payload["sampling_params"] = sampling_params
                 payload["return_logprob"] = generation_config.get("logprobs", 0) is not None
             case "vllm":
@@ -636,7 +652,8 @@ class RouterClient:
         if not await self.proxy.on_send_request(request_id):
             return None # shutdown
         try:
-            response = await self.proxy.generate_request(payload=payload, request_id=request_id, uid=uid)
+            priority = req.meta_info.get("trajectory_priority")
+            response = await self.proxy.generate_request(payload=payload, request_id=request_id, uid=uid, priority=priority)
         finally:
             await self.proxy.on_request_routed(request_id)
 
@@ -648,7 +665,8 @@ class RouterClient:
         if not self.proxy.on_send_request_sync(request_id):
             return None # shutdown
         try:
-            response = self.proxy.generate_request_sync(payload=payload, request_id=request_id, uid=uid)
+            priority = req.meta_info.get("trajectory_priority")
+            response = self.proxy.generate_request_sync(payload=payload, request_id=request_id, uid=uid, priority=priority)
         finally:
             self.proxy.on_request_routed_sync(request_id)
 
@@ -666,7 +684,7 @@ class Router:
         pass
 
     @abstractmethod
-    async def generate_request(self, payload, request_id, uid):
+    async def generate_request(self, payload, request_id, uid, priority=None):
         pass
 
     @abstractmethod
@@ -734,7 +752,7 @@ class SglangRouter(Router):
         await wait_sglang_router_ready(self.router_process, f"http://{self.router_ip}:{self.router_port}")
         await wait_sglang_router_workflow(f"http://{self.router_ip}:{self.router_port}", self.worker_urls)
 
-    async def generate_request(self, payload, request_id, uid):
+    async def generate_request(self, payload, request_id, uid, priority=None):
         raise RuntimeError("SglangRouter.generate_request is not expected to be called directly, use RouterClient.")
 
     async def abort_requests(self, request_ids, uid):
@@ -858,7 +876,7 @@ class PromptAffinityRouter(Router):
     def __repr__(self):
         return f"worker loads: {self.worker_loads}"
 
-    async def generate_request(self, payload, request_id, uid):
+    async def generate_request(self, payload, request_id, uid, priority=None):
         credit = payload["sampling_params"]["n"]
         dp_rank = None
         if uid not in self.id_to_dp_rank:
@@ -959,8 +977,13 @@ class EnvAffinityRouter(Router):
         # Active DP ranks for request routing
         self.active_dp_ranks: Set[int] = set(range(len(self.workers)))  # All ranks initially active
         self.routing_lock = asyncio.Lock()  # Protect routing updates
+        self.max_running_requests = self.router_args.max_running_requests
+        self.priority_sequence = itertools.count()
+        self.priority_waiters = [[] for _ in self.workers]
+        self.priority_inflight = [0 for _ in self.workers]
+        self.priority_conditions = [asyncio.Condition() for _ in self.workers]
 
-    async def generate_request(self, payload, request_id, uid):
+    async def generate_request(self, payload, request_id, uid, priority=None):
         src_rank = uid
         # Atomic routing assignment under lock to prevent TOCTOU race with shrink/expand
         async with self.routing_lock:
@@ -969,6 +992,8 @@ class EnvAffinityRouter(Router):
                 dp_rank = self._get_least_active_dp_rank()
                 self.src_rank2_dp_rank[src_rank] = dp_rank
             dp_rank = self.src_rank2_dp_rank[src_rank]
+
+        has_priority_slot = await self._acquire_priority_slot(dp_rank, priority, request_id)
 
         self.request_id_2_src_rank[request_id] = src_rank
         self.running_requests[dp_rank].add(request_id)
@@ -979,6 +1004,41 @@ class EnvAffinityRouter(Router):
             self.running_requests[dp_rank].remove(request_id)
             # Cleanup tracking (on both success and abort paths)
             self.request_id_2_src_rank.pop(request_id, None)
+            if has_priority_slot:
+                await self._release_priority_slot(dp_rank)
+
+    async def _acquire_priority_slot(self, dp_rank: int, priority, request_id: str) -> bool:
+        if priority is None or self.max_running_requests <= 0:
+            return False
+        condition = self.priority_conditions[dp_rank]
+        entry = (int(priority), next(self.priority_sequence), request_id)
+        async with condition:
+            heapq.heappush(self.priority_waiters[dp_rank], entry)
+            try:
+                while (
+                    self.priority_waiters[dp_rank][0] != entry
+                    or self.priority_inflight[dp_rank] >= self.max_running_requests
+                ):
+                    await condition.wait()
+                heapq.heappop(self.priority_waiters[dp_rank])
+                self.priority_inflight[dp_rank] += 1
+                condition.notify_all()
+                return True
+            except BaseException:
+                try:
+                    self.priority_waiters[dp_rank].remove(entry)
+                    heapq.heapify(self.priority_waiters[dp_rank])
+                except ValueError:
+                    pass
+                condition.notify_all()
+                raise
+
+    async def _release_priority_slot(self, dp_rank: int):
+        condition = self.priority_conditions[dp_rank]
+        async with condition:
+            self.priority_inflight[dp_rank] -= 1
+            assert self.priority_inflight[dp_rank] >= 0
+            condition.notify_all()
 
     async def abort_requests(self, request_ids, uid):
         raise NotImplementedError

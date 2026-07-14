@@ -9,10 +9,8 @@ from torch.nn.parameter import Parameter
 from sglang.srt.layers.quantization.fp8 import (
     Fp8Config,
     _is_fp8_fnuz,
-    _is_cpu,
+    _is_cuda,
     _is_hip,
-    _use_hip_int4,
-    _use_aiter,
 )
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
@@ -21,7 +19,10 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 
+from sglang.srt.layers.quantization.fp8 import use_hip_int4 as _use_hip_int4, use_aiter_moe as _use_aiter
 from roll.utils.fp8 import per_block_fp8_quant
+
+_is_cpu = not _is_cuda
 from roll.utils.logging import get_logger
 
 logger = get_logger()

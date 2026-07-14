@@ -1,0 +1,178 @@
+defaults:
+  - ../config/traj_envs@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "agentic_rollout_swe_smoke_vllm_3act"
+seed: 42
+
+logging_dir: ./output/logs
+output_dir: ./output_swe_smoke_vllm_3act
+model_name: ${exp_name}-${now:%Y%m%d_%H%M%S}
+rollout_dump_dir: ./output_swe_smoke_vllm_3act/rollout_dump
+track_with: stdout
+tracker_kwargs: {}
+system_envs:
+  USE_MODELSCOPE: '1'
+
+
+num_gpus_per_node: 8
+rpc_timeout: 72000
+
+max_steps: 1
+save_steps: 1
+logging_steps: 1
+eval_steps: 1
+resume_from_checkpoint: false
+
+rollout_batch_size: 1
+val_batch_size: 1
+sequence_length: 32768
+
+max_tokens_per_step: 512
+
+advantage_clip: 0.2
+ppo_epochs: 1
+adv_estimator: "step_reinforce"
+batch_adjust_mode: "random_sample"
+step_reward_gamma: 1.0
+
+#pg_clip: 0.1
+#dual_clip_loss: True
+init_kl_coef: 0.0
+whiten_advantages: true
+entropy_loss_coef: 0
+max_grad_norm: 1.0
+
+
+pretrain: Qwen/Qwen2.5-0.5B-Instruct
+reward_pretrain: Qwen/Qwen2.5-0.5B-Instruct
+
+actor_train:
+  model_args:
+    flash_attn: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+actor_infer:
+  model_args:
+    flash_attn: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_length: 32768
+    max_new_tokens: ${max_tokens_per_step} # single-turn response length
+    top_p: 1.0
+    top_k: 50
+    num_beams: 1
+    temperature: 1.0
+    num_return_sequences: 1
+    stop_strings: []
+    include_stop_str_in_output: true
+  data_args:
+    template: qwen3_coder
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.35
+      max_model_len: 32768
+      max_num_batched_tokens: 32768
+      enable_prefix_caching: true
+      enforce_eager: true
+      VLLM_USE_V1: 1
+      load_format: auto
+  device_mapping: list(range(0,1))
+
+reward_normalization:
+  grouping: traj_group_id # tags(env_type)/traj_group_id(group)/batch(rollout_batch)... group_by reward/adv
+  method: mean
+  # norm_mean_type: batch
+  # norm_std_type: group
+
+train_env_manager:
+  max_env_num_per_worker: 1
+  num_env_groups: 1
+  # under the same group, the env config and env seed are ensured to be equal
+  group_size: 1
+  tags: [swebench_native_verified]
+  num_groups_partition: [1] # If not set, all env names divide nums equally. Under the same group, the env config and env seed (prompt) are equal in each generation
+  system_envs:
+    # if you cannot get python env in rock due to connetion error, try to use this, may expire in the future
+    ROCK_RTENV_PYTHON_V31114_INSTALL_CMD: 'mkdir -p runtime-env/bin; ln -sf /opt/miniconda3/bin/python3 runtime-env/bin/python; ln -sf /opt/miniconda3/bin/python3 runtime-env/bin/python3; ln -sf /opt/miniconda3/bin/pip3 runtime-env/bin/pip; runtime-env/bin/python --version'
+    ROCK_RTENV_NODE_V22180_INSTALL_CMD: 'mkdir -p runtime-env/bin runtime-env/lib/node_modules; ln -sf /usr/local/bin/node runtime-env/bin/node; ln -sf /usr/local/bin/npm runtime-env/bin/npm; if [ -x /usr/local/bin/npx ]; then ln -sf /usr/local/bin/npx runtime-env/bin/npx; fi; runtime-env/bin/node --version; runtime-env/bin/npm --version'
+val_env_manager:
+  max_env_num_per_worker: 1
+  num_env_groups: 1
+  group_size: 1 # should be set to 1 because val temperature is set to 0 and same prompt leads to same output
+  tags: [swebench_native_verified]
+  num_groups_partition: [1] # TODO: If not set, all env names divide nums equally. Under the same group, the env config and env seed (prompt) are equal in each generation
+  system_envs:
+    # if you cannot get python env in rock due to connetion error, try to use this, may expire in the future
+    ROCK_RTENV_PYTHON_V31114_INSTALL_CMD: 'mkdir -p runtime-env/bin; ln -sf /opt/miniconda3/bin/python3 runtime-env/bin/python; ln -sf /opt/miniconda3/bin/python3 runtime-env/bin/python3; ln -sf /opt/miniconda3/bin/pip3 runtime-env/bin/pip; runtime-env/bin/python --version'
+    ROCK_RTENV_NODE_V22180_INSTALL_CMD: 'mkdir -p runtime-env/bin runtime-env/lib/node_modules; ln -sf /usr/local/bin/node runtime-env/bin/node; ln -sf /usr/local/bin/npm runtime-env/bin/npm; if [ -x /usr/local/bin/npx ]; then ln -sf /usr/local/bin/npx runtime-env/bin/npx; fi; runtime-env/bin/node --version; runtime-env/bin/npm --version'
+
+max_actions_per_traj: 3
+env_manager_cls: roll.pipeline.agentic.env_manager.agent_native_env_manager.AgentNativeStepEnvManager
+
+agent_config_common:
+  agent_type: "default"
+  run_cmd: 'iflow -p <<PROMPT>> --yolo'
+  # Dependency pre-installation; modify based on your sandbox image
+  pre_init_cmds:
+    - command: "apt-get update"
+      timeout_seconds: 600
+    - command: "apt-get install -y curl git wget xz-utils"
+      timeout_seconds: 600
+    - command: "apt-get install -y build-essential libc6-dev patch procps"
+      timeout_seconds: 600
+    # Install helper tools like 'uv'  
+    - command: "wget -q https://xrl-sandbox-bucket.oss-cn-hangzhou.aliyuncs.com/uv-files/uv-x86_64-unknown-linux-gnu.tar.gz -O /tmp/uv.tar.gz && tar -xzf /tmp/uv.tar.gz --strip-components=1 -C /opt/miniconda3/bin && /opt/miniconda3/bin/uv --version"
+      timeout_seconds: 600
+  model_service_config:
+    type: "local"
+    enabled: True
+    start_cmd: '/opt/miniconda3/bin/rock model-service start --type \${type}'
+    stop_cmd: '/opt/miniconda3/bin/rock model-service stop'
+    watch_agent_cmd: '/opt/miniconda3/bin/rock model-service watch-agent --pid \${pid}'
+    anti_call_llm_cmd: 'PYTHONWARNINGS=ignore /opt/miniconda3/bin/rock model-service anti-call-llm --index \${index} --response \${response_payload}'
+    anti_call_llm_cmd_file: 'PYTHONWARNINGS=ignore /opt/miniconda3/bin/rock model-service anti-call-llm --index \${index} --response-file \${response_file}'
+    anti_call_llm_cmd_no_response: 'PYTHONWARNINGS=ignore /opt/miniconda3/bin/rock model-service anti-call-llm --index \${index}'
+  runtime_env_config:
+    type: node
+    npm_registry: "https://registry.npmmirror.com"
+    # you can install your own version
+    custom_install_cmd: "mkdir -p runtime-env/bin runtime-env/lib/node_modules && npm config set prefix \"$PWD/runtime-env\" && wget --retry-connrefused --tries=10 --waitretry=2 -O ~/iflow-cli.tgz 'http://cloud.iflow.cn/iflow-cli/iflow-ai-iflow-cli-for-roll-0-4-4-v5.tgz' && npm i -g ~/iflow-cli.tgz && command -v iflow && iflow --help >/dev/null"
+  env:
+    IFLOW_apiKey: "test"
+    IFLOW_baseUrl: "http://localhost:8080/v1"
+    IFLOW_modelName: "ROME"
+    IFLOW_searchApiKey: "88888888"
+    IFLOW_selectedAuthType: "openai-compatible"
+    IFLOW_disableAutoUpdate: "true"
+    IFLOW_tokensLimit: "128000"
+    IFLOW_shellTimeout: "360000"
+    IFLOW_coreTools: "Edit,exit_plan_mode,glob,list_directory,multi_edit,plan,read plan,read_file,read_many_files,save_memory,Search,Shell,task,web_fetch,web_search,write_file,xml_escape"
+    
+
+custom_envs:
+  swebench_native_verified:
+    env_type: "rock_tb_native_env"
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    agent_system_template: "agent_system_template placeholder"
+    agent_template: "agent_template placeholder"
+    env_config:
+      dataset_name: /ROLL/data/swe_bench_verified_example.jsonl
+      tools: ~
+      max_steps: ${max_actions_per_traj}
+      mode: "val"
+      sandbox_base_url: http://localhost:8080 # change to your own service address if needed
+      user_id: "xxx"
+      experiment_id: "test_tb_native"
+      test_files: ["/terminal-bench-datasets/datasets/swebench-verified"]
+      agent_config: ${agent_config_common}

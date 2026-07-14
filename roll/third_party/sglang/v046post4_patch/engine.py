@@ -41,8 +41,14 @@ def _set_envs_and_config(server_args: ServerArgs):
 def run_scheduler_process(*args, **kwargs):
     sglang_version = Version(sglang.__version__)
     if sglang_version >= Version("0.4.6.post4"):
-        from roll.third_party.sglang import fp8
-        fp8.monkey_patch_fp8()
+        try:
+            from roll.third_party.sglang import fp8
+            fp8.monkey_patch_fp8()
+        except Exception as exc:
+            warnings.warn(
+                f"skip fp8 monkey patch for sglang {sglang.__version__}: {exc}",
+                stacklevel=2,
+            )
     else:
         warnings.warn(
             f"sglang version {sglang.__version__} < 0.4.6.post4, "

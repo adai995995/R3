@@ -27,15 +27,43 @@ from megatron.core.tensor_parallel import (
     reduce_from_tensor_model_parallel_region,
 )
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
-from megatron.core.transformer.moe.moe_utils import (
-    clear_aux_losses_tracker,
-    get_moe_layer_wise_logging_tracker,
-    reduce_aux_losses_tracker_across_ranks,
-)
-from megatron.core.transformer.moe.router_replay import (
-    RouterReplay,
-    RouterReplayAction,
-)
+try:
+    from megatron.core.transformer.moe.moe_utils import (
+        clear_aux_losses_tracker,
+        get_moe_layer_wise_logging_tracker,
+        reduce_aux_losses_tracker_across_ranks,
+    )
+except ImportError:
+    from megatron.core.transformer.moe.moe_utils import (
+        clear_aux_losses_tracker,
+        reduce_aux_losses_tracker_across_ranks,
+    )
+
+    def get_moe_layer_wise_logging_tracker():
+        return {}
+try:
+    from megatron.core.transformer.moe.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+except ModuleNotFoundError:
+    class RouterReplayAction:
+        RECORD = "RECORD"
+        REPLAY_FORWARD = "REPLAY_FORWARD"
+        REPLAY_BACKWARD = "REPLAY_BACKWARD"
+
+    class RouterReplay:
+        @staticmethod
+        def set_global_router_replay_action(*args, **kwargs):
+            return None
+
+        @staticmethod
+        def clear_global_router_replay_action(*args, **kwargs):
+            return None
+
+        @staticmethod
+        def clear_global_indices(*args, **kwargs):
+            return None
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from transformers.utils import is_peft_available
 
@@ -60,11 +88,22 @@ from roll.third_party.megatron.offload_states_patch import (
     reload_megatron_no_grad_module,
 )
 from roll.third_party.megatron.optimizer import get_megatron_optimizer
-from roll.third_party.megatron.router_replay_utils import (
-    RouterReplayHelper,
-    merge_router_topk_indices,
-    set_router_replay_data,
-)
+try:
+    from roll.third_party.megatron.router_replay_utils import (
+        RouterReplayHelper,
+        merge_router_topk_indices,
+        set_router_replay_data,
+    )
+except ModuleNotFoundError:
+    class RouterReplayHelper:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    def merge_router_topk_indices(*args, **kwargs):
+        return None
+
+    def set_router_replay_data(*args, **kwargs):
+        return None
 from roll.third_party.megatron.tensor_parallel import vocab_parallel_entropy
 from roll.third_party.megatron.util import unwrap_model
 from roll.utils.constants import (

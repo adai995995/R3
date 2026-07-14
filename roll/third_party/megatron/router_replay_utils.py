@@ -17,10 +17,19 @@ from megatron.core.transformer.transformer_block import get_num_layers_to_build
 
 from roll.third_party.megatron.util import postprocess_packed_seqs, preprocess_packed_seqs
 # from roll.third_party.megatron.router_replay_patch import RouterReplay, RouterReplayAction
-from megatron.core.transformer.moe.router_replay import (
-    RouterReplay,
-    RouterReplayAction,
-)
+try:
+    from megatron.core.transformer.moe.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+except ModuleNotFoundError:
+    class RouterReplayAction:
+        RECORD = "RECORD"
+        REPLAY_FORWARD = "REPLAY_FORWARD"
+        REPLAY_BACKWARD = "REPLAY_BACKWARD"
+
+    class RouterReplay:
+        global_router_replay_instances = []
 
 
 def get_routed_experts_dtype(max_expert_idx: int) -> torch.dtype:

@@ -119,6 +119,10 @@ class LLMProxyConfig:
 class EnvManagerConfig(WorkerConfig):
     llm_proxy: LLMProxyConfig = field(default_factory=LLMProxyConfig, metadata={"help": "llm proxy config."})
     num_env_groups: int = field(default=128, metadata={"help": "Number of environment groups during training."})
+    group_seed_base: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional deterministic base seed for environment groups."},
+    )
     group_size: int = field(
         default=1, metadata={"help": "Under the same group, the env config and env seed are ensured to be equal"}
     )
@@ -324,6 +328,19 @@ class AgenticConfig(PPOConfig):
             self.train_env_manager.max_traj_per_env = traj_per_env
         logger.info(f"train_env_manager.max_traj_per_env: {self.train_env_manager.max_traj_per_env}")
         assert self.train_env_manager.max_traj_per_env >= traj_per_env, f"max_traj_per_env must be >= {traj_per_env}"
+        if self.trajectory_admission_policy == "outstanding_watermark":
+            assert self.rollout_batch_size > 0, (
+                "outstanding_watermark admission requires a finite positive rollout_batch_size"
+            )
+            if self.max_outstanding_trajectories is not None:
+                min_group_width = (
+                    self.train_env_manager.group_size
+                    + self.train_env_manager.group_size_redundancy
+                )
+                assert self.max_outstanding_trajectories >= min_group_width, (
+                    "max_outstanding_trajectories must admit at least one complete rollout group "
+                    f"({min_group_width})"
+                )
 
         # Validate rollout_batch_size is compatible with group_size
         # The scheduler collects trajectories in complete groups to maintain variance reduction properties
@@ -400,7 +417,10 @@ class AgenticConfig(PPOConfig):
                 env_config = {**cfg_template.env_config}
 
                 if group_id not in group_seeds:
-                    group_seeds[group_id] = random.randint(0, 2**31 - 1)
+                    if env_manager_config.group_seed_base is None:
+                        group_seeds[group_id] = random.randint(0, 2**31 - 1)
+                    else:
+                        group_seeds[group_id] = env_manager_config.group_seed_base + group_id
                 entry = {}
                 entry.update(cfg_template)
                 entry.pop("env_config", None)

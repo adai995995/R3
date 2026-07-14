@@ -38,6 +38,14 @@ class GeneratingArguments:
         default=8192,
         metadata={"help": "The maximum numbers of tokens to generate, ignoring the number of tokens in the prompt."},
     )
+    min_new_tokens: Optional[int] = field(
+        default=0,
+        metadata={"help": "The minimum number of new tokens to generate before honoring stop conditions."},
+    )
+    ignore_eos: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether to ignore EOS tokens during generation."},
+    )
     repetition_penalty: Optional[float] = field(
         default=1.0,
         metadata={"help": "The parameter for repetition penalty. 1.0 means no penalty."},

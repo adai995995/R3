@@ -106,9 +106,15 @@ class BasePipeline:
 
         metrics = self.state.log_history[-1]
         metrics["system/step"] = global_step
-        if global_step > 0 and (
-            global_step % self.pipeline_config.save_steps == 0 or global_step == self.pipeline_config.max_steps - 1
-        ):
+        if not self.pipeline_config.enable_checkpointing:
+            return
+
+        save_on_interval = (
+            self.pipeline_config.save_steps > 0
+            and global_step % self.pipeline_config.save_steps == 0
+        )
+        save_on_last_step = is_last_step and self.pipeline_config.save_final_checkpoint
+        if global_step > 0 and (save_on_interval or save_on_last_step):
             ckpt_metrics_refss = []
             for cluster in self.checkpoint_clusters:
                 ckpt_metrics_refss.append(

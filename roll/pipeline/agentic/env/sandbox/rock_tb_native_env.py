@@ -320,10 +320,13 @@ class RockTBNativeEnv(Env):
             self.truncated = True
 
         action_is_valid = info.get("action_is_valid", False)
+        num_tool_calls = int(info.get("num_tool_calls", 0))
         metrics = {
             "env_timeout": self.env_timeout,
             "env_reset_failed": self.env_reset_failed,
             "action_is_valid": action_is_valid,
+            "have_tool_call": bool(info.get("have_tool_call", False)),
+            "num_tool_calls": num_tool_calls,
             "success": self.reward > 0,
             "raw_reward": self.reward,
             "current_step": self.current_step,
@@ -332,6 +335,8 @@ class RockTBNativeEnv(Env):
 
         metrics_agg_mode = {
             "action_is_valid": "mean",
+            "have_tool_call": "sum",
+            "num_tool_calls": "sum",
             "success": "last",
             "raw_reward": "last",
         }

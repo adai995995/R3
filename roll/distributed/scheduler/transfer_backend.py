@@ -9,7 +9,10 @@ import numpy as np
 import sys
 
 if sys.version_info < (3, 13):
-    import transfer_queue as tq
+    try:
+        import transfer_queue as tq
+    except ImportError:
+        tq = None
 else:
     tq = None
 from omegaconf import OmegaConf

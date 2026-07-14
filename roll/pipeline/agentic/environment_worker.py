@@ -162,6 +162,18 @@ class EnvironmentWorker(Worker):
         pool.shutdown()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, clear_cache=False)
+    async def collect_trajectory_progress(self):
+        snapshots = []
+        for env_manager in self.env_managers.values():
+            getter = getattr(env_manager, "get_progress_snapshot", None)
+            if getter is None:
+                continue
+            snapshot = getter()
+            if snapshot is not None:
+                snapshots.append(snapshot)
+        return snapshots
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, clear_cache=False)
     async def update_step(self, global_step, trace_meta):
         for env_manager in self.env_managers.values():
             env_manager.update_step(global_step, trace_meta)
