@@ -1,5 +1,9 @@
 # Version-Boundary-Aware AgenticRL Runtime
 
+> Implementation status: the unified boundary-plan, plan-driven KV working-set rebuild and
+> trace-driven testbed are implemented and validated. See `UnifiedVersionRuntimePrototype.md` for
+> the current code paths, metrics and initial controlled results.
+
 ## 1. Idea Summary
 
 在全异步、训练与推理全分离的 AgenticRL 系统中，Actor 参数会周期性地从版本 `v` 更新到版本 `v+1`。这一版本边界同时破坏两类已经投入的系统资源：
@@ -98,7 +102,40 @@ new_count = max(0, target_outstanding - current_outstanding)
 
 该机制控制的是每轮新增轨迹数量，而不是改变哪些已完成样本进入 RL 算法。
 
-#### 4.1.1 Closed-Loop Rollout Load Control
+#### 4.1.1 Version-Age and Progress-Bucketed Supply Prediction
+
+单一全局 finish ratio 会把不同状态的 carry-over trajectory 混为一类。一个刚启动、
+`version_age=1` 的 group 与一个已经完成多次 action、`version_age=2` 的 group，在下一个
+版本窗口内成为可训练数据的概率并不相同。Stage B 因此按以下二维状态学习完成率：
+
+```text
+version age:     0, 1, 2, 3, >=4
+action progress: 0, 1, 2-3, 4-7, >=8
+```
+
+由于 learner 按 trajectory group 原子消费，progress 也在 group 粒度定义。系统从所有
+候选中取进度最高的 `group_size` 条轨迹，并使用其平均 action 数作为 bucket；同时记录
+第 `group_size` 高的 frontier 作为诊断下界。这样既考虑 redundancy，又不会让单条深轨迹
+完全掩盖其余未启动候选。
+
+每个 bucket 维护独立 EWMA：
+
+```text
+finish_ratio[age, progress]
+    = EWMA(groups becoming trainable in the next version window / cohort size)
+
+predicted_existing_supply
+    = valid_ready
+    + sum(bucket_population * finish_ratio[age, progress])
+```
+
+监督事件必须是 `became_trainable`，而不是 `learner_consumed`。后者受 batch size 和 ready
+queue 排队截断，会把已经完成但尚未被 learner 取走的数据错误标记为未完成。样本数不足的
+bucket 回退到全局 finish EWMA，防止冷启动时的小样本比例直接控制 admission。
+
+该预测器只估计 runtime supply，不改变 trajectory 的动作、reward、训练权重或 group 语义。
+
+#### 4.1.2 Closed-Loop Rollout Load Control
 
 Admission 本质上是 producer-consumer 之间的闭环负载控制，而不是固定 queue-size
 调参。系统需要同时避免两个方向的失衡：
@@ -322,6 +359,12 @@ The current MVP has implemented and validated:
 - A one-shot admission budget computed at each policy-version boundary.
 - Initial adaptive supply estimation using valid ready trajectories, unfinished carry-over
   trajectories, an EWMA finish ratio and a configurable reserve.
+- Stage B completion prediction bucketed by policy-version age and group action progress, with a
+  global EWMA cold-start fallback and minimum per-bucket sample threshold.
+- Group-level progress uses the mean of the top `group_size` candidates; frontier, maximum action
+  and snapshot coverage are retained as boundary diagnostics.
+- Finish-rate supervision now comes from `became_trainable` events rather than learner consumption,
+  so ready-queue backlog does not bias completion probability downward.
 - Per-version admission budget, usage, expected supply, actual supply and prediction-error metrics.
 - A dynamic reserve controller using learner-wait, stale-discard and supply-prediction EWMAs.
 - Hysteresis controls that require persistent same-direction pressure and impose a cooldown after
@@ -403,16 +446,88 @@ outweighed the stale penalty inside a short window, so unconstrained hill climbi
 load too aggressively. The next controller should use constrained optimization: maximize useful
 response throughput only while a stale-work or minimum-compute-efficiency budget is satisfied.
 
+### Constrained Admission and Progress-Floor Validation
+
+The runtime now uses constrained utility hill climbing. A reserve increase is rejected when the
+aggregate observation window falls below a configurable minimum compute efficiency. Window values
+are computed from total useful tokens, stale tokens and elapsed time, rather than averaging
+per-version ratios. This prevents a short or small version from receiving the same weight as a
+long, expensive version.
+
+The progress-floor supply estimate also discounts salvageable in-flight trajectories by the
+observed finish ratio. A forced-underload WebShop run used `reserve=0`, `finish_ratio=0`, a maximum
+of 12 outstanding trajectories and four real train/update steps. The floor triggered twice and
+admitted eight trajectories in total. All four steps completed, 16 trajectories were consumed and
+no stale trajectory was discarded. This validates the deadlock-recovery path under real separated
+Megatron training and vLLM rollout.
+
+### Post-Update KV Rebuild Prototype
+
+At each version resume, `EnvAffinityRouter` now opens a bounded rebuild wave. During this wave it
+places prompts online so that requests with a large common prefix are not assigned concurrently to
+the same worker. After the wave, normal environment-to-worker affinity resumes. The policy changes
+only runtime placement; it does not change trajectory admission, sampled actions or learner data.
+
+The initial vLLM request-level metric was invalid: vLLM 0.8.4 V1 declares
+`RequestOutput.num_cached_tokens` but does not populate it. The runtime now reads the scheduler's
+native prefix-cache block counters through a custom stat logger. The authoritative metrics are:
+
+```text
+router/kv_query_blocks
+router/kv_hit_blocks
+router/kv_saved_prefill_tokens       = hit_blocks * block_size
+router/kv_cacheable_reprefill_tokens = (query_blocks - hit_blocks) * block_size
+router/kv_block_hit_ratio
+router/kv_cache_resets
+```
+
+`saved_prefill_tokens` is exact for reusable full cache blocks. The incomplete prompt tail and the
+mandatory last-block recomputation in vLLM are outside the cacheable-block denominator. Request-level
+cached-token metrics are omitted when the engine cannot provide them; they are no longer reported
+as a misleading zero.
+
+A real four-step, single-seed WebShop A/B with training and one parameter update per step produced:
+
+```text
+policy    cacheable query tok  saved prefill tok  block hit  response tok/s  step wall
+FIFO                 393,408            275,120      69.93%          124.67     58.40 s
+rebuild              447,360            314,112      70.21%          127.25     55.54 s
+```
+
+After normalization, rebuild improved block hit rate by only 0.28 percentage points and observed
+response-token throughput by 2.1%. This is a mechanism-validation result, not a performance claim:
+the run is short, asynchronous completion changes the realized prompt workload, and WebShop has a
+large shared system prefix that already yields about 70% block hits under FIFO. Multi-seed and
+lower-baseline-hit workloads are needed to establish whether rebuild batching has useful headroom.
+
+### Stage A Unified Scheduling Prototype
+
+The runtime now propagates structured trajectory state on every inference turn and orders saturated
+per-worker queues lexicographically by policy version, whether the trajectory has already started,
+remaining hard action budget and FIFO sequence. This is a system-only priority: reward, task success
+and estimated training value are not inputs.
+
+Soft locality is epoch-scoped. A trajectory's affinity is valid only after a successful request in
+the current cache epoch; every version resume increments the epoch. For each request the router
+compares the affinity worker with the least-loaded worker. Affinity wins while its request pressure
+is within `soft_locality_load_slack`; otherwise load overrides locality. This keeps the decision
+local and avoids querying all inference-engine caches.
+
+Three real WebShop validations completed: a normal four-step run, a four-step load-override run and
+a two-step single-slot queue stress run. The load run observed seven affinity overrides over 156
+decisions and about 51 microseconds of routing CPU time per request. The single-slot run forced 73
+of 88 requests into the priority path and completed both train steps. These validate functionality,
+not performance; the next experiment must compare FIFO, version-only, version-progress and full
+routing under the same sustained stale-pressure workload.
+
 The following components remain to be implemented:
 
 - End-to-end validation and tuning of the hysteretic dynamic reserve controller.
-- A constrained utility controller with an explicit stale-work budget and aggregate-window credit
-  assignment, replacing unconstrained per-window hill climbing.
-- A forced-underload end-to-end test that verifies progress-floor activation and recovery.
-- More accurate adaptive capacity prediction based on trajectory remaining work and worker load.
-- Post-update cache-rebuild batch construction.
-- KV prefix metadata and current-version trajectory-to-worker affinity.
-- Joint version urgency, KV locality and worker-load routing.
+- Longer multi-seed calibration of the Stage B bucket estimator and workload-dependent bucket edges.
+- Adaptive capacity prediction that also incorporates worker load and tool-latency state.
+- Multi-seed validation and first-wave-specific KV accounting for post-update rebuild routing.
+- Current-version KV residency metadata beyond environment-to-worker affinity.
+- End-to-end ablation of version-progress priority, soft locality and worker-load routing.
 - Broader long-running A/B experiments across additional staleness tolerances, workloads and seeds.
 
 ## 9. Main Experimental Questions

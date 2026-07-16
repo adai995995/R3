@@ -179,8 +179,7 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
         if getattr(self.pipeline_config, "trajectory_scheduling_policy", "fifo") == "version_priority":
-            # Lower versions are closer to expiry and receive service first when the router is saturated.
-            lm_input.meta_info["trajectory_priority"] = self.trajectory_version
+            lm_input.meta_info["trajectory_priority"] = self._trajectory_runtime_state()
 
         content = self.rollout_cache.history[-1]
         input_messages = content['observation']
@@ -505,6 +504,19 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         env_metric = {f"env/{rollout_cache.tag}/{k}": v for k, v in env_metric.items()}
         env_metric["env/response_length"] = response_length
         batch.meta_info = {"metrics": env_metric}
+        trajectory_progress = {
+            "traj_actions_completed": int(rollout_cache.step),
+            "traj_inference_calls": int(inference_calls),
+            "traj_tool_calls": int(tool_calls),
+            "traj_prompt_tokens_total": total_prompt_tokens,
+            "traj_response_tokens_total": total_response_tokens,
+            "traj_inference_tokens_total": total_inference_tokens,
+            "traj_generate_seconds_total": float(timing_metric["traj_time_generate_sum"]),
+            "traj_env_seconds_total": float(timing_metric["traj_time_env_total"]),
+        }
+        batch_size = batch.batch.batch_size[0]
+        for key, value in trajectory_progress.items():
+            batch.non_tensor_batch[key] = np.array([value] * batch_size, dtype=object)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         start_step = self.log_stats["current_step"][0]

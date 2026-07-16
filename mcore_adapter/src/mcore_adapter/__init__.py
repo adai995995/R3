@@ -1,5 +1,14 @@
-from .models import McaGPTModel, McaModelConfig
-from .trainer import McaTrainer
+try:
+    from .models import McaGPTModel, McaModelConfig
+except (ModuleNotFoundError, ImportError):
+    McaGPTModel = None
+    McaModelConfig = None
+
+try:
+    from .trainer import McaTrainer
+except (ModuleNotFoundError, ImportError):
+    McaTrainer = None
+
 from .training_args import Seq2SeqTrainingArguments, TrainingArguments
 
 

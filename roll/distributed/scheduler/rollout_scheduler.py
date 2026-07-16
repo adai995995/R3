@@ -1,4 +1,5 @@
 import asyncio
+import json
 import math
 import random
 import time
@@ -27,6 +28,339 @@ from roll.utils.telemetry import (
 )
 
 logger = get_logger()
+
+
+def compute_dynamic_reserve(
+    reserve: int,
+    version: int,
+    learner_wait_ewma: float,
+    stale_ewma: float,
+    prediction_error_ewma: float,
+    *,
+    reserve_min: int,
+    reserve_max: int,
+    additive_step: int,
+    multiplicative_decay: float,
+    warmup_versions: int,
+    wait_high: float,
+    stale_high: float,
+    prediction_error_margin: float,
+) -> Tuple[int, int]:
+    """Return the next reserve and a numeric reason code for metrics."""
+    if version < warmup_versions:
+        return reserve, 4  # warmup
+
+    step = max(1, additive_step)
+    if stale_ewma > stale_high:
+        decayed = math.floor((reserve * multiplicative_decay) / step) * step
+        return max(reserve_min, decayed), 2  # stale pressure
+    if prediction_error_ewma < -prediction_error_margin:
+        decayed = math.floor((reserve * multiplicative_decay) / step) * step
+        return max(reserve_min, decayed), 3  # supply over-prediction
+    if learner_wait_ewma > wait_high:
+        return min(reserve_max, reserve + step), 1  # learner starvation
+    return reserve, 0  # deadband hold
+
+
+def apply_dynamic_reserve_hysteresis(
+    reserve: int,
+    candidate_reserve: int,
+    candidate_reason: int,
+    pending_direction: int,
+    pending_count: int,
+    cooldown_remaining: int,
+    *,
+    signal_patience: int,
+    cooldown_versions: int,
+) -> Tuple[int, int, int, int, int]:
+    """Confirm persistent pressure and prevent consecutive reserve changes."""
+    if candidate_reason in (4, 5):
+        return reserve, candidate_reason, 0, 0, cooldown_remaining
+    if cooldown_remaining > 0:
+        return reserve, 6, 0, 0, cooldown_remaining - 1
+
+    direction = (candidate_reserve > reserve) - (candidate_reserve < reserve)
+    if direction == 0:
+        return reserve, 0, 0, 0, 0
+
+    confirmed = pending_count + 1 if direction == pending_direction else 1
+    if confirmed < max(1, signal_patience):
+        return reserve, 6, direction, confirmed, 0
+    return candidate_reserve, candidate_reason, 0, 0, max(0, cooldown_versions)
+
+
+def compute_effective_rollout_utility(
+    consumed_response_tokens: int,
+    consumed_inference_tokens: int,
+    stale_inference_tokens: int,
+    elapsed_seconds: float,
+    waste_weight: float,
+) -> Tuple[float, float, float, float]:
+    """Return useful output rate discounted by the fraction of wasted inference work."""
+    elapsed = max(float(elapsed_seconds), 1e-6)
+    response_rate = max(0, int(consumed_response_tokens)) / elapsed
+    consumed_work = max(0, int(consumed_inference_tokens))
+    stale_work = max(0, int(stale_inference_tokens))
+    weighted_work = consumed_work + max(0.0, waste_weight) * stale_work
+    compute_efficiency = consumed_work / weighted_work if weighted_work > 0 else 1.0
+    stale_rate = stale_work / elapsed
+    return response_rate * compute_efficiency, response_rate, stale_rate, compute_efficiency
+
+
+def update_utility_hill_climb(
+    reserve: int,
+    direction: int,
+    utility: float,
+    previous_utility: Optional[float],
+    *,
+    reserve_min: int,
+    reserve_max: int,
+    additive_step: int,
+    improvement_margin: float,
+) -> Tuple[int, int, int]:
+    """Move one reserve step using windowed perturb-and-observe feedback."""
+    direction = 1 if direction >= 0 else -1
+    if previous_utility is None:
+        reason = 7  # establish baseline, then probe
+    else:
+        relative_delta = (utility - previous_utility) / max(abs(previous_utility), 1e-6)
+        if relative_delta < -max(0.0, improvement_margin):
+            direction *= -1
+            reason = 9  # utility regressed, reverse
+        elif relative_delta > max(0.0, improvement_margin):
+            reason = 8  # utility improved, continue
+        else:
+            reason = 10  # utility deadband, continue bounded probe
+
+    step = max(1, additive_step)
+    candidate = reserve + direction * step
+    if candidate < reserve_min or candidate > reserve_max:
+        direction *= -1
+        candidate = reserve + direction * step
+    return min(reserve_max, max(reserve_min, candidate)), direction, reason
+
+
+def update_constrained_utility_hill_climb(
+    reserve: int,
+    direction: int,
+    utility: float,
+    previous_utility: Optional[float],
+    compute_efficiency: float,
+    *,
+    min_compute_efficiency: float,
+    reserve_min: int,
+    reserve_max: int,
+    additive_step: int,
+    improvement_margin: float,
+) -> Tuple[int, int, int]:
+    """Optimize useful throughput while treating compute efficiency as a hard constraint."""
+    if compute_efficiency < min_compute_efficiency:
+        step = max(1, additive_step)
+        return max(reserve_min, reserve - step), -1, 11
+    return update_utility_hill_climb(
+        reserve,
+        direction,
+        utility,
+        previous_utility,
+        reserve_min=reserve_min,
+        reserve_max=reserve_max,
+        additive_step=additive_step,
+        improvement_margin=improvement_margin,
+    )
+
+
+def compute_progress_topup_groups(
+    missing_trajectories: int,
+    valid_potential: int,
+    outstanding_trajectories: int,
+    max_outstanding_trajectories: int,
+    group_size: int,
+    admission_width: int,
+) -> int:
+    """Return the minimum bounded group count needed to preserve learner progress."""
+    deficit = max(0, missing_trajectories - valid_potential)
+    needed = math.ceil(deficit / max(1, group_size))
+    available = max(
+        0,
+        (max_outstanding_trajectories - outstanding_trajectories)
+        // max(1, admission_width),
+    )
+    return min(needed, available)
+
+
+FINISH_RATE_AGE_BUCKETS = ("age_0", "age_1", "age_2", "age_3", "age_ge_4")
+FINISH_RATE_PROGRESS_BUCKETS = (
+    "actions_0",
+    "actions_1",
+    "actions_2_3",
+    "actions_4_7",
+    "actions_ge_8",
+)
+FINISH_RATE_BUCKET_KEYS = tuple(
+    f"{age}__{progress}"
+    for age in FINISH_RATE_AGE_BUCKETS
+    for progress in FINISH_RATE_PROGRESS_BUCKETS
+)
+
+
+def finish_rate_bucket(version_age: int, actions_completed: int) -> str:
+    """Map a carry-over group to a stable version-age and progress bucket."""
+    age = max(0, int(version_age))
+    if age >= 4:
+        age_bucket = "age_ge_4"
+    else:
+        age_bucket = f"age_{age}"
+
+    actions = max(0, int(actions_completed))
+    if actions >= 8:
+        progress_bucket = "actions_ge_8"
+    elif actions >= 4:
+        progress_bucket = "actions_4_7"
+    elif actions >= 2:
+        progress_bucket = "actions_2_3"
+    else:
+        progress_bucket = f"actions_{actions}"
+    return f"{age_bucket}__{progress_bucket}"
+
+
+def update_bucketed_finish_ratios(
+    ratios: Dict[str, float],
+    sample_counts: Dict[str, int],
+    cohort_counts: Dict[str, int],
+    completed_counts: Dict[str, int],
+    ewma_alpha: float,
+) -> None:
+    """Update per-cohort completion EWMAs from one policy-version window."""
+    alpha = min(1.0, max(0.0, float(ewma_alpha)))
+    for bucket, cohort_count in cohort_counts.items():
+        cohort_count = max(0, int(cohort_count))
+        if cohort_count == 0:
+            continue
+        completed = min(cohort_count, max(0, int(completed_counts.get(bucket, 0))))
+        observed_ratio = completed / cohort_count
+        previous = ratios.get(bucket)
+        ratios[bucket] = (
+            observed_ratio
+            if previous is None
+            else alpha * observed_ratio + (1 - alpha) * previous
+        )
+        sample_counts[bucket] = sample_counts.get(bucket, 0) + cohort_count
+
+
+def predict_bucketed_finish_supply(
+    cohort_counts: Dict[str, int],
+    ratios: Dict[str, float],
+    sample_counts: Dict[str, int],
+    fallback_ratio: float,
+    min_bucket_samples: int,
+) -> Tuple[float, int, int]:
+    """Predict completions and report learned-bucket versus fallback population."""
+    expected = 0.0
+    learned_population = 0
+    fallback_population = 0
+    threshold = max(1, int(min_bucket_samples))
+    for bucket, count in cohort_counts.items():
+        count = max(0, int(count))
+        if sample_counts.get(bucket, 0) >= threshold and bucket in ratios:
+            ratio = ratios[bucket]
+            learned_population += count
+        else:
+            ratio = fallback_ratio
+            fallback_population += count
+        expected += count * min(1.0, max(0.0, float(ratio)))
+    return expected, learned_population, fallback_population
+
+
+@dataclass(frozen=True)
+class VersionRuntimePlan:
+    """One policy-version decision shared by admission and inference routing."""
+
+    version: int
+    learner_demand: int
+    safety_reserve: int
+    expected_existing_supply: float
+    outstanding_trajectories: int
+    admission_budget: int
+    admission_budget_trainable: int
+    priority_deadline_version: int
+    rebuild_candidate_groups: Tuple[str, ...]
+    rebuild_target_trajectories: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "version": self.version,
+            "learner_demand": self.learner_demand,
+            "safety_reserve": self.safety_reserve,
+            "expected_existing_supply": self.expected_existing_supply,
+            "outstanding_trajectories": self.outstanding_trajectories,
+            "admission_budget": self.admission_budget,
+            "admission_budget_trainable": self.admission_budget_trainable,
+            "priority_deadline_version": self.priority_deadline_version,
+            "rebuild_candidate_groups": list(self.rebuild_candidate_groups),
+            "rebuild_target_trajectories": self.rebuild_target_trajectories,
+        }
+
+
+def build_version_runtime_plan(
+    *,
+    version: int,
+    learner_demand: int,
+    safety_reserve: int,
+    expected_existing_supply: float,
+    outstanding_trajectories: int,
+    max_outstanding_trajectories: int,
+    admission_width: int,
+    group_size: int,
+    staleness_tolerance: int,
+    invested_candidate_groups: List[Tuple[int, int, int, int, int]],
+) -> VersionRuntimePlan:
+    """Build the boundary plan consumed by both the queue manager and Router.
+
+    Candidate tuples are ``(group_id, episode_id, version_age, progress, invested)``.
+    They are ordered by deadline first and invested progress second. This only
+    changes runtime timing; it does not inspect rewards or learner-side values.
+    """
+    width = max(1, int(admission_width))
+    trainable_width = max(1, int(group_size))
+    demand = max(0, int(learner_demand)) + max(0, int(safety_reserve))
+    deficit = max(0.0, demand - max(0.0, float(expected_existing_supply)))
+    desired_groups = math.ceil(deficit / trainable_width)
+    available_groups = max(
+        0,
+        (max(0, int(max_outstanding_trajectories))
+         - max(0, int(outstanding_trajectories)))
+        // width,
+    )
+    admitted_groups = min(desired_groups, available_groups)
+    ordered_candidates = sorted(
+        invested_candidate_groups,
+        key=lambda item: (-int(item[2]), -int(item[3]), int(item[0]), int(item[1])),
+    )
+    candidate_keys = tuple(
+        f"{int(group_id)}:{int(episode_id)}"
+        for group_id, episode_id, _, _, _ in ordered_candidates
+    )
+    return VersionRuntimePlan(
+        version=int(version),
+        learner_demand=max(0, int(learner_demand)),
+        safety_reserve=max(0, int(safety_reserve)),
+        expected_existing_supply=max(0.0, float(expected_existing_supply)),
+        outstanding_trajectories=max(0, int(outstanding_trajectories)),
+        admission_budget=admitted_groups * width,
+        admission_budget_trainable=admitted_groups * trainable_width,
+        priority_deadline_version=int(version) + max(0, int(staleness_tolerance)),
+        rebuild_candidate_groups=candidate_keys,
+        rebuild_target_trajectories=sum(
+            max(0, int(invested)) for _, _, _, _, invested in ordered_candidates
+        ),
+    )
+
+
+def consume_utility_settle(settle_remaining: int) -> Tuple[bool, int]:
+    """Return whether to record this observation and the next settle counter."""
+    if settle_remaining > 0:
+        return False, settle_remaining - 1
+    return True, 0
 
 
 class EnvActivityMonitor:
@@ -264,7 +598,9 @@ class GroupQueue:
         self.groups: Dict[int, GroupData] = {}
         self.retired_groups: Dict[int, GroupData] = {}
         self.discard_records: List[Dict[str, Any]] = []
-        self.discard_metrics_cursor = 0
+        self.discard_record_indices: Dict[Tuple[int, int, int], int] = {}
+        self.dirty_discard_indices = set()
+        self.progress_snapshots: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
         self.progress = asyncio.Event()
         self.complete = asyncio.Event()
@@ -277,7 +613,9 @@ class GroupQueue:
         self.groups.clear()
         self.retired_groups.clear()
         self.discard_records.clear()
-        self.discard_metrics_cursor = 0
+        self.discard_record_indices.clear()
+        self.dirty_discard_indices.clear()
+        self.progress_snapshots.clear()
 
         self.progress = asyncio.Event()
         self.complete = asyncio.Event()
@@ -294,11 +632,83 @@ class GroupQueue:
         metrics = rollout.meta_info.get("metrics", {}) if rollout.meta_info else {}
         for key, value in metrics.items():
             if key.endswith(suffix):
+                if hasattr(value, "tolist"):
+                    value = value.tolist()
+                if isinstance(value, (list, tuple)):
+                    numeric_values = []
+                    for item in value:
+                        if hasattr(item, "item"):
+                            item = item.item()
+                        try:
+                            numeric_values.append(float(item))
+                        except (TypeError, ValueError):
+                            continue
+                    if numeric_values:
+                        # Trajectory totals can be duplicated by DataProto.concat.
+                        return max(numeric_values)
                 try:
                     return float(value)
                 except (TypeError, ValueError):
-                    return default
-        return default
+                    break
+
+        # DataProto metadata is not guaranteed to survive every concat/Ray boundary.
+        # The final sample carries the same counters in structured trajectory data.
+        values = rollout.non_tensor_batch.get("trajectory_data") if rollout.non_tensor_batch else None
+        trajectory_data = None
+        if values is not None:
+            for value in reversed(values):
+                value = value.item() if hasattr(value, "item") else value
+                if value is None or value == "":
+                    continue
+                try:
+                    trajectory_data = json.loads(value) if isinstance(value, str) else value
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(trajectory_data, dict):
+                    break
+                trajectory_data = None
+
+        if trajectory_data is None:
+            return default
+
+        waste_info = trajectory_data.get("waste_info", {})
+        version_info = trajectory_data.get("version_info", {})
+        waste_fields = {
+            "/traj_completed": "completed",
+            "/traj_truncated": "truncated",
+            "/traj_reset_failed": "reset_failed",
+            "/traj_env_timeout": "env_timeout",
+            "/traj_actions_completed": "actions_completed",
+            "/traj_inference_calls": "inference_calls",
+            "/traj_tool_calls": "tool_calls",
+            "/traj_prompt_tokens_total": "prompt_tokens_total",
+            "/traj_response_tokens_total": "response_tokens_total",
+            "/traj_inference_tokens_total": "inference_tokens_total",
+            "/traj_env_seconds_total": "env_seconds_total",
+            "/traj_generate_seconds_total": "generate_seconds_total",
+        }
+        version_fields = {
+            "/traj_version_start": "version_start",
+            "/traj_version_end": "version_end",
+            "/traj_version_age": "version_age",
+            "/traj_stale_tolerance": "stale_tolerance",
+        }
+        if suffix in waste_fields:
+            value = waste_info.get(waste_fields[suffix], default)
+        elif suffix in version_fields:
+            value = version_info.get(version_fields[suffix], default)
+        elif suffix.startswith("/traj_actions_ge_"):
+            try:
+                threshold = int(suffix.rsplit("_", 1)[-1])
+                value = int(waste_info.get("actions_completed", 0)) >= threshold
+            except ValueError:
+                value = default
+        else:
+            value = default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
 
     def record_filtered_group(self, group: GroupData):
         for rollout in group.rollouts:
@@ -325,6 +735,39 @@ class GroupQueue:
         value = values[0]
         return value.item() if hasattr(value, "item") else value
 
+    @staticmethod
+    def _tensor_progress(rollout: DataProto) -> Dict[str, int]:
+        try:
+            response_mask = rollout.batch["response_mask"] > 0
+            response_tokens = int(response_mask.sum().item())
+        except (KeyError, AttributeError, TypeError):
+            return {}
+        if response_tokens <= 0:
+            return {}
+        segment_starts = response_mask.clone()
+        if response_mask.shape[-1] > 1:
+            segment_starts[..., 1:] &= ~response_mask[..., :-1]
+        inference_calls = int(segment_starts.sum().item())
+        try:
+            attention_mask = rollout.batch["attention_mask"] > 0
+            sequence_length = min(attention_mask.shape[-1], segment_starts.shape[-1])
+            prefix_lengths = attention_mask[..., :sequence_length].cumsum(dim=-1) - 1
+            prompt_tokens = int(
+                prefix_lengths[segment_starts[..., :sequence_length]].sum().item()
+            )
+        except (KeyError, AttributeError, TypeError):
+            try:
+                prompt_tokens = int(rollout.batch["prompt_mask"].sum().item())
+            except (KeyError, AttributeError, TypeError):
+                prompt_tokens = 0
+        return {
+            "actions_completed": inference_calls,
+            "inference_calls": inference_calls,
+            "prompt_tokens": prompt_tokens,
+            "response_tokens": response_tokens,
+            "inference_tokens": prompt_tokens + response_tokens,
+        }
+
     def record_discarded_rollout(
         self,
         rollout: Optional[DataProto],
@@ -338,7 +781,7 @@ class GroupQueue:
         step = self.current_step if observed_step is None else observed_step
         step = group.create_step if step is None else step
         env_id = self._first_non_tensor_value(rollout, "env_ids", -1)
-        self.discard_records.append({
+        record = {
             "trajectory_id": str(self._first_non_tensor_value(rollout, "traj_id", "unknown")),
             "category": "async_discard",
             "discard_reason": reason,
@@ -359,16 +802,106 @@ class GroupQueue:
             "inference_tokens": int(metric(rollout, "/traj_inference_tokens_total", 0)),
             "generate_seconds": float(metric(rollout, "/traj_generate_seconds_total", 0)),
             "env_seconds": float(metric(rollout, "/traj_env_seconds_total", 0)),
-        })
+        }
+        tensor_progress = self._tensor_progress(rollout)
+        for field, value in tensor_progress.items():
+            record[field] = max(record[field], value)
+        if tensor_progress:
+            record["completed"] = True
+        direct_progress_fields = {
+            "actions_completed": "traj_actions_completed",
+            "inference_calls": "traj_inference_calls",
+            "tool_calls": "traj_tool_calls",
+            "prompt_tokens": "traj_prompt_tokens_total",
+            "response_tokens": "traj_response_tokens_total",
+            "inference_tokens": "traj_inference_tokens_total",
+            "generate_seconds": "traj_generate_seconds_total",
+            "env_seconds": "traj_env_seconds_total",
+        }
+        for field, key in direct_progress_fields.items():
+            value = self._first_non_tensor_value(rollout, key, 0)
+            try:
+                record[field] = max(record[field], float(value))
+            except (TypeError, ValueError):
+                continue
+        snapshot = self.progress_snapshots.get((int(group.episode_id), int(env_id)))
+        if snapshot is not None:
+            for field in (
+                "actions_completed",
+                "inference_calls",
+                "tool_calls",
+                "prompt_tokens",
+                "response_tokens",
+                "inference_tokens",
+                "generate_seconds",
+                "env_seconds",
+            ):
+                record[field] = max(record[field], snapshot.get(field, 0))
+            for field in ("completed", "truncated", "reset_completed"):
+                record[field] = bool(record[field] or snapshot.get(field, False))
+            record["version_start"] = int(snapshot.get("version_start", record["version_start"]))
+            record["version_end"] = int(snapshot.get("version_end", record["version_end"]))
+
+        record_key = (int(group.group_id), int(group.episode_id), int(env_id))
+        existing_index = self.discard_record_indices.get(record_key)
+        if existing_index is None:
+            existing_index = len(self.discard_records)
+            self.discard_record_indices[record_key] = existing_index
+            self.discard_records.append(record)
+        else:
+            existing = self.discard_records[existing_index]
+            for field in (
+                "actions_completed",
+                "inference_calls",
+                "tool_calls",
+                "prompt_tokens",
+                "response_tokens",
+                "inference_tokens",
+                "generate_seconds",
+                "env_seconds",
+            ):
+                record[field] = max(record[field], existing.get(field, 0))
+            if reason == "version_expired_late_return":
+                record["discard_reason"] = reason
+            self.discard_records[existing_index] = record
+        self.dirty_discard_indices.add(existing_index)
 
     def record_discarded_group(self, group: GroupData, reason: str, observed_step: Optional[int] = None):
         for rollout in group.rollouts:
             self.record_discarded_rollout(rollout, group, reason, observed_step)
 
     def collect_new_discard_records(self) -> List[Dict[str, Any]]:
-        records = self.discard_records[self.discard_metrics_cursor:]
-        self.discard_metrics_cursor = len(self.discard_records)
+        records = [self.discard_records[index] for index in sorted(self.dirty_discard_indices)]
+        self.dirty_discard_indices.clear()
         return records
+
+    def update_progress_snapshots(self, snapshots: List[Dict[str, Any]]):
+        for snapshot in snapshots:
+            if int(snapshot.get("group_id", -1)) != self.group_id:
+                continue
+            key = (int(snapshot.get("episode_id", -1)), int(snapshot.get("env_id", -1)))
+            existing = self.progress_snapshots.get(key)
+            if existing is None:
+                self.progress_snapshots[key] = snapshot
+                continue
+            merged = dict(existing)
+            for field in (
+                "actions_completed",
+                "inference_calls",
+                "tool_calls",
+                "prompt_tokens",
+                "response_tokens",
+                "inference_tokens",
+                "generate_seconds",
+                "env_seconds",
+            ):
+                merged[field] = max(existing.get(field, 0), snapshot.get(field, 0))
+            for field in ("completed", "truncated", "reset_completed"):
+                merged[field] = bool(existing.get(field, False) or snapshot.get(field, False))
+            merged["version_end"] = max(
+                int(existing.get("version_end", 0)), int(snapshot.get("version_end", 0))
+            )
+            self.progress_snapshots[key] = merged
 
     def reset_filter_metrics(self):
         self.group_filter_count = 0
@@ -398,6 +931,50 @@ class GroupQueue:
                 key=lambda item: (item[1].create_step, item[1].episode_id),
             )
         return self.groups.items()
+
+    def trainable_progress_summary(self, group: GroupData) -> Dict[str, int]:
+        """Summarize progress across the best candidates that can make the group trainable."""
+        actions_by_env: Dict[Any, int] = {}
+        for (episode_id, env_id), progress in self.progress_snapshots.items():
+            if episode_id != group.episode_id:
+                continue
+            actions_by_env[env_id] = max(
+                actions_by_env.get(env_id, 0),
+                int(progress.get("actions_completed", 0)),
+            )
+
+        anonymous_index = 0
+        for rollout in group.rollouts:
+            if rollout is None:
+                continue
+            env_id = self._first_non_tensor_value(rollout, "env_ids", None)
+            if env_id is None:
+                env_id = f"completed_{anonymous_index}"
+                anonymous_index += 1
+            actions = int(self._metric_by_suffix(rollout, "/traj_actions_completed", 0))
+            tensor_progress = self._tensor_progress(rollout)
+            actions = max(actions, int(tensor_progress.get("actions_completed", 0)))
+            actions_by_env[env_id] = max(actions_by_env.get(env_id, 0), actions)
+
+        candidate_actions = sorted(actions_by_env.values(), reverse=True)
+        candidate_actions.extend([0] * max(0, self.group_size - len(candidate_actions)))
+        trainable_actions = candidate_actions[:self.group_size]
+        if not trainable_actions:
+            return {
+                "mean_actions": 0,
+                "frontier_actions": 0,
+                "max_actions": 0,
+                "observed_candidates": 0,
+            }
+        return {
+            "mean_actions": sum(trainable_actions) // len(trainable_actions),
+            "frontier_actions": trainable_actions[-1],
+            "max_actions": trainable_actions[0],
+            "observed_candidates": min(len(actions_by_env), self.group_size),
+        }
+
+    def trainable_frontier_actions(self, group: GroupData) -> int:
+        return self.trainable_progress_summary(group)["frontier_actions"]
 
     def outstanding_snapshot(self, observed_step: Optional[int] = None) -> Dict[str, Any]:
         step = self.current_step if observed_step is None else observed_step
@@ -511,7 +1088,7 @@ class GroupQueue:
                 if len(group.rollouts) >= group.running_rollouts:
                     self.retired_groups.pop(episode_id, None)
             # A retired episode has already been consumed or expired.
-            return
+            return False
         group = self.groups[episode_id]
         assert start_step >= group.create_step, f"{start_step=} {group.create_step=}"
         group.rollouts.append(rollout)
@@ -519,6 +1096,7 @@ class GroupQueue:
             if all(rollout is None for rollout in group.rollouts):
                 logger.info(f"GroupQueue: group {self.group_id} exit")
                 self.complete.set()
+                return False
             elif self.group_filter.filter(group_id=self.group_id, episode_id=episode_id, group=group.rollouts):
                 logger.info(f"filter rollout group {group.group_id} episode {group.episode_id}")
                 self.group_filter_count += 1
@@ -528,9 +1106,12 @@ class GroupQueue:
                     self.env_monitor.cleanup_episode(self.group_id, episode_id)
                 if self.fixed_step_admission:
                     self.advance_group(create_step=self.current_step)
+                return False
             else:
                 self.complete.set()
                 self.progress_bar.update(self.group_size)
+                return True
+        return False
 
     async def get(self) -> GroupData:
         while True:
@@ -589,10 +1170,10 @@ class GroupQueueManager:
         self.admission_policy = (
             getattr(config, "trajectory_admission_policy", "step") if self.mode == "train" else "step"
         )
-        if self.admission_policy not in ("step", "outstanding_watermark"):
+        if self.admission_policy not in ("step", "outstanding_watermark", "version_adaptive"):
             raise ValueError(f"Unsupported trajectory_admission_policy: {self.admission_policy}")
         configured_watermark = getattr(config, "max_outstanding_trajectories", None)
-        if self.admission_policy == "outstanding_watermark":
+        if self.admission_policy in ("outstanding_watermark", "version_adaptive"):
             default_watermark = math.ceil(
                 (1 + float(self.async_generation_ratio)) * int(config.rollout_batch_size)
             )
@@ -602,6 +1183,134 @@ class GroupQueueManager:
         self.admission_cursor = 0
         self.admitted_trajectories_total = 0
         self.admission_throttled_total = 0
+        self.rollout_batch_size = int(config.rollout_batch_size) if self.mode == "train" else 0
+        self.adaptive_reserve = int(getattr(config, "adaptive_admission_reserve_trajectories", 0))
+        self.version_adaptive_progress_floor_enabled = bool(
+            getattr(config, "version_adaptive_progress_floor_enabled", False)
+        )
+        self.adaptive_finish_ratio = float(
+            getattr(config, "adaptive_admission_initial_finish_ratio", 0.5)
+        )
+        self.adaptive_ewma_alpha = float(getattr(config, "adaptive_admission_ewma_alpha", 0.5))
+        self.bucketed_finish_enabled = bool(
+            getattr(config, "adaptive_admission_bucketed_finish_enabled", False)
+        )
+        self.bucketed_finish_min_samples = int(
+            getattr(config, "adaptive_admission_bucket_min_samples", 4)
+        )
+        self.bucketed_finish_ratios: Dict[str, float] = {}
+        self.bucketed_finish_sample_counts: Dict[str, int] = {}
+        self.dynamic_reserve_enabled = bool(
+            getattr(config, "dynamic_admission_reserve_enabled", False)
+        )
+        self.dynamic_reserve_min = int(getattr(config, "dynamic_admission_reserve_min", 0))
+        self.dynamic_reserve_max = int(getattr(config, "dynamic_admission_reserve_max", 8))
+        self.dynamic_reserve_additive_step = int(
+            getattr(config, "dynamic_admission_reserve_additive_step", 2)
+        )
+        self.dynamic_reserve_decay = float(
+            getattr(config, "dynamic_admission_reserve_multiplicative_decay", 0.5)
+        )
+        self.dynamic_reserve_warmup_versions = int(
+            getattr(config, "dynamic_admission_reserve_warmup_versions", 2)
+        )
+        self.dynamic_reserve_wait_high = float(
+            getattr(config, "dynamic_admission_reserve_wait_high_seconds", 2.0)
+        )
+        self.dynamic_reserve_stale_high = float(
+            getattr(config, "dynamic_admission_reserve_stale_high", 0.25)
+        )
+        self.dynamic_reserve_prediction_error_margin = float(
+            getattr(config, "dynamic_admission_reserve_prediction_error_margin", 1.0)
+        )
+        self.dynamic_reserve_ewma_alpha = float(
+            getattr(config, "dynamic_admission_reserve_ewma_alpha", 0.5)
+        )
+        self.dynamic_reserve_signal_patience = int(
+            getattr(config, "dynamic_admission_reserve_signal_patience", 2)
+        )
+        self.dynamic_reserve_cooldown_versions = int(
+            getattr(config, "dynamic_admission_reserve_cooldown_versions", 2)
+        )
+        self.dynamic_reserve_controller = str(
+            getattr(config, "dynamic_admission_reserve_controller", "threshold_aimd")
+        )
+        self.dynamic_utility_window_versions = int(
+            getattr(config, "dynamic_admission_utility_window_versions", 4)
+        )
+        self.dynamic_utility_waste_weight = float(
+            getattr(config, "dynamic_admission_utility_waste_weight", 1.0)
+        )
+        self.dynamic_utility_improvement_margin = float(
+            getattr(config, "dynamic_admission_utility_improvement_margin", 0.05)
+        )
+        self.dynamic_utility_settle_versions = int(
+            getattr(config, "dynamic_admission_utility_settle_versions", 2)
+        )
+        self.dynamic_utility_min_compute_efficiency = float(
+            getattr(config, "dynamic_admission_utility_min_compute_efficiency", 0.95)
+        )
+        self.dynamic_learner_wait_ewma: Optional[float] = None
+        self.dynamic_stale_ewma: Optional[float] = None
+        self.dynamic_prediction_error_ewma: Optional[float] = None
+        self.dynamic_reserve_update_reason = 5 if not self.dynamic_reserve_enabled else 4
+        self.dynamic_reserve_pending_direction = 0
+        self.dynamic_reserve_pending_count = 0
+        self.dynamic_reserve_cooldown_remaining = 0
+        self.dynamic_utility_direction = 1
+        self.dynamic_utility_window_sum = 0.0
+        self.dynamic_utility_window_count = 0
+        self.dynamic_utility_window_response_tokens = 0
+        self.dynamic_utility_window_consumed_tokens = 0
+        self.dynamic_utility_window_stale_tokens = 0
+        self.dynamic_utility_window_seconds = 0.0
+        self.dynamic_utility_previous_window: Optional[float] = None
+        self.dynamic_utility_last_window = 0.0
+        self.dynamic_utility_last_window_efficiency = 1.0
+        self.dynamic_utility_sample = 0.0
+        self.dynamic_useful_token_rate = 0.0
+        self.dynamic_stale_token_rate = 0.0
+        self.dynamic_compute_efficiency = 1.0
+        self.dynamic_last_observation_time = time.monotonic()
+        self.dynamic_utility_settle_remaining = 0
+        self.version_progress_topup_events = 0
+        self.version_progress_topup_trajectories = 0
+        self.dynamic_reserve_increase_total = 0
+        self.dynamic_reserve_decrease_total = 0
+        self.dynamic_reserve_hold_total = 0
+        self.version_admission_version = -1
+        self.version_admission_budget = 0
+        self.version_admission_budget_trainable = 0
+        self.version_admission_used = 0
+        self.version_admission_remaining = 0
+        self.version_valid_ready_at_boundary = 0
+        self.version_salvageable_inflight_at_boundary = 0
+        self.version_invested_inflight_at_boundary = 0
+        self.version_reserved_unstarted_at_boundary = 0
+        self.version_near_expiry_at_boundary = 0
+        self.version_expected_existing_supply = 0.0
+        self.version_actual_existing_supply = 0
+        self.version_actual_existing_consumed = 0
+        self.version_admission_prediction_error = 0.0
+        self.version_expected_inflight_supply = 0.0
+        self.version_bucket_learned_population = 0
+        self.version_bucket_fallback_population = 0
+        self.version_unfinished_bucket_counts: Dict[str, int] = {}
+        self.version_progress_observed_candidates = 0
+        self.version_progress_mean_actions_sum = 0
+        self.version_progress_frontier_actions_sum = 0
+        self.version_progress_max_actions = 0
+        self.version_runtime_plan: Optional[VersionRuntimePlan] = None
+        self._tracked_existing_groups = set()
+        self._tracked_unfinished_groups = set()
+        self._tracked_unfinished_group_buckets: Dict[Tuple[int, int], str] = {}
+        self._tracked_unfinished_bucket_counts: Dict[str, int] = {}
+        self._tracked_unfinished_bucket_completed: Dict[str, int] = {}
+        self._tracked_existing_consumed = 0
+        self._tracked_unfinished_consumed = 0
+        self._tracked_unfinished_completed = 0
+        self.consumed_records: List[Dict[str, Any]] = []
+        self.new_consumed_records: List[Dict[str, Any]] = []
 
         # Initialize env activity monitor first (before creating GroupQueues)
         self.group_queue: Dict[int, GroupQueue] = {}
@@ -699,6 +1408,411 @@ class GroupQueueManager:
             snapshot["age_counts"][age] = snapshot["age_counts"].get(age, 0) + count
         return snapshot
 
+    def _version_supply_snapshot(self, observed_step: int) -> Dict[str, Any]:
+        ready = 0
+        unfinished = 0
+        invested_inflight = 0
+        reserved_unstarted = 0
+        near_expiry = 0
+        existing_groups = set()
+        unfinished_groups = set()
+        unfinished_group_buckets: Dict[Tuple[int, int], str] = {}
+        invested_candidate_groups: List[Tuple[int, int, int, int, int]] = []
+        unfinished_bucket_counts: Dict[str, int] = {}
+        unfinished_progress_observed_candidates = 0
+        unfinished_progress_mean_actions_sum = 0
+        unfinished_progress_frontier_actions_sum = 0
+        unfinished_progress_max_actions = 0
+        near_expiry_age = max(0, self.staleness_tolerance - 1)
+
+        for group_id, queue in self.group_queue.items():
+            for episode_id, group in queue.groups.items():
+                age = max(0, observed_step - group.create_step)
+                if age > self.staleness_tolerance:
+                    continue
+                key = (group_id, episode_id)
+                existing_groups.add(key)
+                if len(group.rollouts) >= self.group_size:
+                    ready += self.group_size
+                else:
+                    unfinished += self.group_size
+                    unfinished_groups.add(key)
+                    progress = queue.trainable_progress_summary(group)
+                    bucket = finish_rate_bucket(age, progress["mean_actions"])
+                    unfinished_group_buckets[key] = bucket
+                    unfinished_bucket_counts[bucket] = (
+                        unfinished_bucket_counts.get(bucket, 0) + self.group_size
+                    )
+                    unfinished_progress_observed_candidates += progress["observed_candidates"]
+                    unfinished_progress_mean_actions_sum += progress["mean_actions"]
+                    unfinished_progress_frontier_actions_sum += progress["frontier_actions"]
+                    unfinished_progress_max_actions = max(
+                        unfinished_progress_max_actions, progress["max_actions"]
+                    )
+                    invested = min(
+                        self.group_size,
+                        max(len(group.rollouts), group.running_rollouts),
+                    )
+                    invested_inflight += invested
+                    if invested > 0:
+                        invested_candidate_groups.append(
+                            (
+                                group_id,
+                                episode_id,
+                                age,
+                                progress["mean_actions"],
+                                invested,
+                            )
+                        )
+                    reserved_unstarted += self.group_size - invested
+                if age >= near_expiry_age:
+                    near_expiry += self.group_size
+
+        # A completed GroupQueue.get task has already removed its group from queue.groups.
+        for task in self.pending_gets:
+            if task.cancelled() or not task.done():
+                continue
+            try:
+                group = task.result()
+            except Exception:
+                continue
+            age = max(0, observed_step - group.create_step)
+            if age > self.staleness_tolerance:
+                continue
+            key = (group.group_id, group.episode_id)
+            if key in existing_groups:
+                continue
+            existing_groups.add(key)
+            ready += self.group_size
+            if age >= near_expiry_age:
+                near_expiry += self.group_size
+
+        return {
+            "valid_ready": ready,
+            "salvageable_inflight": unfinished,
+            "invested_inflight": invested_inflight,
+            "reserved_unstarted": reserved_unstarted,
+            "near_expiry": near_expiry,
+            "existing_groups": existing_groups,
+            "unfinished_groups": unfinished_groups,
+            "unfinished_group_buckets": unfinished_group_buckets,
+            "invested_candidate_groups": invested_candidate_groups,
+            "unfinished_bucket_counts": unfinished_bucket_counts,
+            "unfinished_progress_observed_candidates": unfinished_progress_observed_candidates,
+            "unfinished_progress_mean_actions_sum": unfinished_progress_mean_actions_sum,
+            "unfinished_progress_frontier_actions_sum": unfinished_progress_frontier_actions_sum,
+            "unfinished_progress_max_actions": unfinished_progress_max_actions,
+        }
+
+    def _record_version_adaptive_consumption(self, group: GroupData, count: int):
+        if self.admission_policy != "version_adaptive":
+            return
+        key = (group.group_id, group.episode_id)
+        if key in self._tracked_existing_groups:
+            self._tracked_existing_consumed += count
+        if key in self._tracked_unfinished_groups:
+            self._tracked_unfinished_consumed += count
+
+    def _record_version_adaptive_completion(self, group_id: int, episode_id: int):
+        if self.admission_policy != "version_adaptive":
+            return
+        key = (group_id, episode_id)
+        if key not in self._tracked_unfinished_groups:
+            return
+        self._tracked_unfinished_completed += self.group_size
+        bucket = self._tracked_unfinished_group_buckets.get(key)
+        if bucket is not None:
+            self._tracked_unfinished_bucket_completed[bucket] = (
+                self._tracked_unfinished_bucket_completed.get(bucket, 0) + self.group_size
+            )
+
+    def _predict_unfinished_supply(self, supply: Dict[str, Any]) -> Tuple[float, int, int]:
+        if not self.bucketed_finish_enabled:
+            expected = self.adaptive_finish_ratio * supply["salvageable_inflight"]
+            return expected, 0, supply["salvageable_inflight"]
+        return predict_bucketed_finish_supply(
+            supply["unfinished_bucket_counts"],
+            self.bucketed_finish_ratios,
+            self.bucketed_finish_sample_counts,
+            self.adaptive_finish_ratio,
+            self.bucketed_finish_min_samples,
+        )
+
+    def _update_ewma(self, current: Optional[float], sample: float) -> float:
+        if current is None:
+            return float(sample)
+        alpha = self.dynamic_reserve_ewma_alpha
+        return alpha * float(sample) + (1 - alpha) * current
+
+    def record_learner_wait(self, wait_seconds: float):
+        if self.mode != "train":
+            return
+        self.dynamic_learner_wait_ewma = self._update_ewma(
+            self.dynamic_learner_wait_ewma, max(0.0, wait_seconds)
+        )
+
+    def _update_dynamic_reserve(self, version: int):
+        if not self.dynamic_reserve_enabled or self.admission_policy != "version_adaptive":
+            self.dynamic_reserve_update_reason = 5
+            return
+        if self.dynamic_reserve_controller == "utility_hill_climb":
+            self._update_utility_reserve(version)
+            return
+        previous = self.adaptive_reserve
+        candidate, candidate_reason = compute_dynamic_reserve(
+            previous,
+            version,
+            self.dynamic_learner_wait_ewma or 0.0,
+            self.dynamic_stale_ewma or 0.0,
+            self.dynamic_prediction_error_ewma or 0.0,
+            reserve_min=self.dynamic_reserve_min,
+            reserve_max=self.dynamic_reserve_max,
+            additive_step=self.dynamic_reserve_additive_step,
+            multiplicative_decay=self.dynamic_reserve_decay,
+            warmup_versions=self.dynamic_reserve_warmup_versions,
+            wait_high=self.dynamic_reserve_wait_high,
+            stale_high=self.dynamic_reserve_stale_high,
+            prediction_error_margin=self.dynamic_reserve_prediction_error_margin,
+        )
+        updated, reason, pending_direction, pending_count, cooldown_remaining = (
+            apply_dynamic_reserve_hysteresis(
+                previous,
+                candidate,
+                candidate_reason,
+                self.dynamic_reserve_pending_direction,
+                self.dynamic_reserve_pending_count,
+                self.dynamic_reserve_cooldown_remaining,
+                signal_patience=self.dynamic_reserve_signal_patience,
+                cooldown_versions=self.dynamic_reserve_cooldown_versions,
+            )
+        )
+        self.adaptive_reserve = updated
+        self.dynamic_reserve_update_reason = reason
+        self.dynamic_reserve_pending_direction = pending_direction
+        self.dynamic_reserve_pending_count = pending_count
+        self.dynamic_reserve_cooldown_remaining = cooldown_remaining
+        if updated > previous:
+            self.dynamic_reserve_increase_total += 1
+        elif updated < previous:
+            self.dynamic_reserve_decrease_total += 1
+        else:
+            self.dynamic_reserve_hold_total += 1
+
+    def _update_utility_reserve(self, version: int):
+        previous = self.adaptive_reserve
+        if version < self.dynamic_reserve_warmup_versions:
+            self.dynamic_utility_window_sum = 0.0
+            self.dynamic_utility_window_count = 0
+            self._reset_utility_window_totals()
+            self.dynamic_reserve_update_reason = 4
+            self.dynamic_reserve_hold_total += 1
+            return
+        if self.dynamic_utility_window_count < self.dynamic_utility_window_versions:
+            self.dynamic_reserve_update_reason = 6
+            self.dynamic_reserve_hold_total += 1
+            return
+
+        window_utility, _, _, window_efficiency = compute_effective_rollout_utility(
+            self.dynamic_utility_window_response_tokens,
+            self.dynamic_utility_window_consumed_tokens,
+            self.dynamic_utility_window_stale_tokens,
+            self.dynamic_utility_window_seconds,
+            self.dynamic_utility_waste_weight,
+        )
+        updated, direction, reason = update_constrained_utility_hill_climb(
+            previous,
+            self.dynamic_utility_direction,
+            window_utility,
+            self.dynamic_utility_previous_window,
+            window_efficiency,
+            min_compute_efficiency=self.dynamic_utility_min_compute_efficiency,
+            reserve_min=self.dynamic_reserve_min,
+            reserve_max=self.dynamic_reserve_max,
+            additive_step=self.dynamic_reserve_additive_step,
+            improvement_margin=self.dynamic_utility_improvement_margin,
+        )
+        self.dynamic_utility_previous_window = window_utility
+        self.dynamic_utility_last_window = window_utility
+        self.dynamic_utility_last_window_efficiency = window_efficiency
+        self.dynamic_utility_window_sum = 0.0
+        self.dynamic_utility_window_count = 0
+        self._reset_utility_window_totals()
+        self.dynamic_utility_direction = direction
+        self.adaptive_reserve = updated
+        self.dynamic_reserve_update_reason = reason
+        if updated != previous:
+            self.dynamic_utility_settle_remaining = self.dynamic_utility_settle_versions
+        if updated > previous:
+            self.dynamic_reserve_increase_total += 1
+        elif updated < previous:
+            self.dynamic_reserve_decrease_total += 1
+        else:
+            self.dynamic_reserve_hold_total += 1
+
+    def _reset_utility_window_totals(self):
+        self.dynamic_utility_window_response_tokens = 0
+        self.dynamic_utility_window_consumed_tokens = 0
+        self.dynamic_utility_window_stale_tokens = 0
+        self.dynamic_utility_window_seconds = 0.0
+
+    def _admit_version_budget(self, create_step: int):
+        queues = [queue for queue in self.group_queue.values() if not queue.quit]
+        if not queues:
+            return
+        width = queues[0].admission_width
+        touched = set()
+        while self.version_admission_remaining >= width:
+            queue = queues[self.admission_cursor % len(queues)]
+            self.admission_cursor += 1
+            queue.advance_group(create_step)
+            touched.add(queue.group_id)
+            self.version_admission_remaining -= width
+            self.version_admission_used += width
+            self.admitted_trajectories_total += width
+        for group_id in touched:
+            self.group_queue[group_id].progress.set()
+
+    def _ensure_version_progress(self, current_step: int, missing_trajectories: int):
+        if (
+            not self.version_adaptive_progress_floor_enabled
+            or self.admission_policy != "version_adaptive"
+            or missing_trajectories <= 0
+            or not self.group_queue
+        ):
+            return
+        supply = self._version_supply_snapshot(current_step)
+        expected_inflight, _, _ = self._predict_unfinished_supply(supply)
+        expected_inflight = int(round(expected_inflight))
+        potential = supply["valid_ready"] + expected_inflight
+        queues = [queue for queue in self.group_queue.values() if not queue.quit]
+        if not queues:
+            return
+        width = queues[0].admission_width
+        outstanding = self._outstanding_snapshot(current_step)["outstanding_trajectories"]
+        admitted_groups = compute_progress_topup_groups(
+            missing_trajectories,
+            potential,
+            outstanding,
+            self.max_outstanding_trajectories,
+            self.group_size,
+            width,
+        )
+        touched = set()
+        for _ in range(admitted_groups):
+            queue = queues[self.admission_cursor % len(queues)]
+            self.admission_cursor += 1
+            queue.advance_group(current_step)
+            touched.add(queue.group_id)
+        for group_id in touched:
+            self.group_queue[group_id].progress.set()
+        admitted = admitted_groups * width
+        if admitted:
+            self.admitted_trajectories_total += admitted
+            self.version_progress_topup_events += 1
+            self.version_progress_topup_trajectories += admitted
+
+    def _reset_version_admission(self, create_step: int):
+        if self.admission_policy != "version_adaptive" or not self.group_queue:
+            return
+
+        self.version_actual_existing_consumed = self._tracked_existing_consumed
+        self.version_actual_existing_supply = (
+            self.version_valid_ready_at_boundary + self._tracked_unfinished_completed
+        )
+        self.version_admission_prediction_error = (
+            self.version_actual_existing_supply - self.version_expected_existing_supply
+        )
+        if self.version_admission_version >= 0:
+            self.dynamic_prediction_error_ewma = self._update_ewma(
+                self.dynamic_prediction_error_ewma,
+                self.version_admission_prediction_error,
+            )
+        if self.version_salvageable_inflight_at_boundary > 0:
+            observed_finish_ratio = min(
+                1.0,
+                self._tracked_unfinished_completed
+                / self.version_salvageable_inflight_at_boundary,
+            )
+            self.adaptive_finish_ratio = (
+                self.adaptive_ewma_alpha * observed_finish_ratio
+                + (1 - self.adaptive_ewma_alpha) * self.adaptive_finish_ratio
+            )
+        if self.bucketed_finish_enabled:
+            update_bucketed_finish_ratios(
+                self.bucketed_finish_ratios,
+                self.bucketed_finish_sample_counts,
+                self._tracked_unfinished_bucket_counts,
+                self._tracked_unfinished_bucket_completed,
+                self.adaptive_ewma_alpha,
+            )
+
+        self._update_dynamic_reserve(create_step)
+
+        supply = self._version_supply_snapshot(create_step)
+        self.version_admission_version = create_step
+        self.version_valid_ready_at_boundary = supply["valid_ready"]
+        self.version_salvageable_inflight_at_boundary = supply["salvageable_inflight"]
+        self.version_invested_inflight_at_boundary = supply["invested_inflight"]
+        self.version_reserved_unstarted_at_boundary = supply["reserved_unstarted"]
+        self.version_near_expiry_at_boundary = supply["near_expiry"]
+        self.version_unfinished_bucket_counts = dict(supply["unfinished_bucket_counts"])
+        self.version_progress_observed_candidates = supply[
+            "unfinished_progress_observed_candidates"
+        ]
+        self.version_progress_mean_actions_sum = supply[
+            "unfinished_progress_mean_actions_sum"
+        ]
+        self.version_progress_frontier_actions_sum = supply[
+            "unfinished_progress_frontier_actions_sum"
+        ]
+        self.version_progress_max_actions = supply["unfinished_progress_max_actions"]
+        (
+            self.version_expected_inflight_supply,
+            self.version_bucket_learned_population,
+            self.version_bucket_fallback_population,
+        ) = self._predict_unfinished_supply(supply)
+        self.version_expected_existing_supply = (
+            self.version_valid_ready_at_boundary
+            + self.version_expected_inflight_supply
+        )
+
+        width = next(iter(self.group_queue.values())).admission_width
+        outstanding = self._outstanding_snapshot(create_step)["outstanding_trajectories"]
+        self.version_runtime_plan = build_version_runtime_plan(
+            version=create_step,
+            learner_demand=self.rollout_batch_size,
+            safety_reserve=self.adaptive_reserve,
+            expected_existing_supply=self.version_expected_existing_supply,
+            outstanding_trajectories=outstanding,
+            max_outstanding_trajectories=self.max_outstanding_trajectories,
+            admission_width=width,
+            group_size=self.group_size,
+            staleness_tolerance=self.staleness_tolerance,
+            invested_candidate_groups=supply["invested_candidate_groups"],
+        )
+        self.version_admission_budget = self.version_runtime_plan.admission_budget
+        self.version_admission_budget_trainable = (
+            self.version_runtime_plan.admission_budget_trainable
+        )
+        self.version_admission_used = 0
+        self.version_admission_remaining = self.version_admission_budget
+        demand = self.rollout_batch_size + self.adaptive_reserve
+        desired_groups = math.ceil(
+            max(0.0, demand - self.version_expected_existing_supply) / self.group_size
+        )
+        if self.version_admission_budget // width < desired_groups:
+            self.admission_throttled_total += 1
+
+        self._tracked_existing_groups = supply["existing_groups"]
+        self._tracked_unfinished_groups = supply["unfinished_groups"]
+        self._tracked_unfinished_group_buckets = supply["unfinished_group_buckets"]
+        self._tracked_unfinished_bucket_counts = supply["unfinished_bucket_counts"]
+        self._tracked_unfinished_bucket_completed = {}
+        self._tracked_existing_consumed = 0
+        self._tracked_unfinished_consumed = 0
+        self._tracked_unfinished_completed = 0
+        self._admit_version_budget(create_step)
+
     def _refill_to_watermark(self, create_step: int):
         if self.admission_policy != "outstanding_watermark" or not self.group_queue:
             return
@@ -734,6 +1848,9 @@ class GroupQueueManager:
             "scheduler/trajectory_staleness_tolerance": self.staleness_tolerance,
             "scheduler/version_priority_enabled": int(self.scheduling_policy == "version_priority"),
             "scheduler/watermark_admission_enabled": int(self.admission_policy == "outstanding_watermark"),
+            "scheduler/version_adaptive_admission_enabled": int(
+                self.admission_policy == "version_adaptive"
+            ),
             "scheduler/max_outstanding_trajectories": self.max_outstanding_trajectories or 0,
             "scheduler/outstanding_trajectories": outstanding["outstanding_trajectories"],
             "scheduler/outstanding_active_groups": outstanding["active_groups"],
@@ -744,6 +1861,88 @@ class GroupQueueManager:
             "scheduler/outstanding_oldest_version_age": outstanding["oldest_version_age"],
             "scheduler/admitted_trajectories_total": self.admitted_trajectories_total,
             "scheduler/admission_throttled_total": self.admission_throttled_total,
+            "scheduler/version_admission_version": self.version_admission_version,
+            "scheduler/version_admission_budget": self.version_admission_budget,
+            "scheduler/version_admission_budget_trainable": self.version_admission_budget_trainable,
+            "scheduler/version_admission_used": self.version_admission_used,
+            "scheduler/version_admission_remaining": self.version_admission_remaining,
+            "scheduler/version_runtime_plan_enabled": int(
+                self.version_runtime_plan is not None
+            ),
+            "scheduler/version_runtime_rebuild_candidates": (
+                len(self.version_runtime_plan.rebuild_candidate_groups)
+                if self.version_runtime_plan is not None else 0
+            ),
+            "scheduler/version_runtime_rebuild_target": (
+                self.version_runtime_plan.rebuild_target_trajectories
+                if self.version_runtime_plan is not None else 0
+            ),
+            "scheduler/version_runtime_priority_deadline": (
+                self.version_runtime_plan.priority_deadline_version
+                if self.version_runtime_plan is not None else 0
+            ),
+            "scheduler/version_progress_topup_events": self.version_progress_topup_events,
+            "scheduler/version_progress_topup_trajectories": (
+                self.version_progress_topup_trajectories
+            ),
+            "scheduler/valid_ready_at_version_boundary": self.version_valid_ready_at_boundary,
+            "scheduler/salvageable_inflight_at_version_boundary": (
+                self.version_salvageable_inflight_at_boundary
+            ),
+            "scheduler/invested_inflight_at_version_boundary": (
+                self.version_invested_inflight_at_boundary
+            ),
+            "scheduler/reserved_unstarted_at_version_boundary": (
+                self.version_reserved_unstarted_at_boundary
+            ),
+            "scheduler/near_expiry_at_version_boundary": self.version_near_expiry_at_boundary,
+            "scheduler/expected_existing_supply": self.version_expected_existing_supply,
+            "scheduler/actual_existing_supply": self.version_actual_existing_supply,
+            "scheduler/actual_existing_consumed": self.version_actual_existing_consumed,
+            "scheduler/admission_prediction_error": self.version_admission_prediction_error,
+            "scheduler/adaptive_finish_ratio": self.adaptive_finish_ratio,
+            "scheduler/bucketed_finish_enabled": int(self.bucketed_finish_enabled),
+            "scheduler/bucketed_expected_inflight_supply": self.version_expected_inflight_supply,
+            "scheduler/bucketed_learned_population": self.version_bucket_learned_population,
+            "scheduler/bucketed_fallback_population": self.version_bucket_fallback_population,
+            "scheduler/boundary_progress_observed_candidates": (
+                self.version_progress_observed_candidates
+            ),
+            "scheduler/boundary_progress_mean_actions_sum": (
+                self.version_progress_mean_actions_sum
+            ),
+            "scheduler/boundary_progress_frontier_actions_sum": (
+                self.version_progress_frontier_actions_sum
+            ),
+            "scheduler/boundary_progress_max_actions": self.version_progress_max_actions,
+            "scheduler/dynamic_reserve_enabled": int(self.dynamic_reserve_enabled),
+            "scheduler/dynamic_utility_controller_enabled": int(
+                self.dynamic_reserve_controller == "utility_hill_climb"
+            ),
+            "scheduler/dynamic_reserve": self.adaptive_reserve,
+            "scheduler/dynamic_reserve_update_reason": self.dynamic_reserve_update_reason,
+            "scheduler/dynamic_reserve_pending_direction": self.dynamic_reserve_pending_direction,
+            "scheduler/dynamic_reserve_pending_count": self.dynamic_reserve_pending_count,
+            "scheduler/dynamic_reserve_cooldown_remaining": (
+                self.dynamic_reserve_cooldown_remaining
+            ),
+            "scheduler/dynamic_learner_wait_ewma": self.dynamic_learner_wait_ewma or 0.0,
+            "scheduler/dynamic_stale_ewma": self.dynamic_stale_ewma or 0.0,
+            "scheduler/dynamic_prediction_error_ewma": self.dynamic_prediction_error_ewma or 0.0,
+            "scheduler/dynamic_reserve_increase_total": self.dynamic_reserve_increase_total,
+            "scheduler/dynamic_reserve_decrease_total": self.dynamic_reserve_decrease_total,
+            "scheduler/dynamic_reserve_hold_total": self.dynamic_reserve_hold_total,
+            "scheduler/dynamic_utility_direction": self.dynamic_utility_direction,
+            "scheduler/dynamic_utility_window_count": self.dynamic_utility_window_count,
+            "scheduler/dynamic_utility_settle_remaining": self.dynamic_utility_settle_remaining,
+            "scheduler/dynamic_utility_last_window": self.dynamic_utility_last_window,
+            "scheduler/dynamic_utility_last_window_efficiency": (
+                self.dynamic_utility_last_window_efficiency
+            ),
+            "scheduler/dynamic_utility_sample": self.dynamic_utility_sample,
+            "scheduler/dynamic_useful_token_rate": self.dynamic_useful_token_rate,
+            "scheduler/dynamic_stale_token_rate": self.dynamic_stale_token_rate,
+            "scheduler/dynamic_compute_efficiency": self.dynamic_compute_efficiency,
             "scheduler/group_filter_count": 0,
             "scheduler/group_filter_rollouts": 0,
             "scheduler/group_filter_actions": 0.0,
@@ -758,6 +1957,16 @@ class GroupQueueManager:
             "scheduler/group_filter_inference_tokens": 0.0,
             "scheduler/group_filter_env_seconds": 0.0,
         }
+        for bucket in FINISH_RATE_BUCKET_KEYS:
+            filter_metrics[f"scheduler/finish_ratio/{bucket}"] = self.bucketed_finish_ratios.get(
+                bucket, self.adaptive_finish_ratio
+            )
+            filter_metrics[f"scheduler/finish_ratio_samples/{bucket}"] = (
+                self.bucketed_finish_sample_counts.get(bucket, 0)
+            )
+            filter_metrics[f"scheduler/carryover_at_boundary/{bucket}"] = (
+                self.version_unfinished_bucket_counts.get(bucket, 0)
+            )
         new_discard_records = []
         for group_queue in self.group_queue.values():
             new_discard_records.extend(group_queue.collect_new_discard_records())
@@ -786,7 +1995,93 @@ class GroupQueueManager:
         )
         discard_metrics, _ = self._aggregate_discard_records(new_discard_records, "scheduler/async_discard")
         filter_metrics.update(discard_metrics)
+        stale_count = discard_metrics["scheduler/async_discard/version_stale_trajectories"]
+        self.dynamic_stale_ewma = self._update_ewma(self.dynamic_stale_ewma, stale_count)
+        filter_metrics["scheduler/dynamic_stale_ewma"] = self.dynamic_stale_ewma
+        consumed_metrics, _ = self._aggregate_consumed_records(
+            self.new_consumed_records, "scheduler/consumed"
+        )
+        filter_metrics.update(consumed_metrics)
+        now = time.monotonic()
+        observation_seconds = max(1e-6, now - self.dynamic_last_observation_time)
+        self.dynamic_last_observation_time = now
+        stale_tokens = sum(
+            int(record.get("inference_tokens", 0))
+            for record in new_discard_records
+            if str(record.get("discard_reason", "")).startswith("version_")
+        )
+        utility, useful_rate, stale_rate, compute_efficiency = compute_effective_rollout_utility(
+            consumed_metrics["scheduler/consumed/response_tokens"],
+            consumed_metrics["scheduler/consumed/inference_tokens"],
+            stale_tokens,
+            observation_seconds,
+            self.dynamic_utility_waste_weight,
+        )
+        self.dynamic_utility_sample = utility
+        self.dynamic_useful_token_rate = useful_rate
+        self.dynamic_stale_token_rate = stale_rate
+        self.dynamic_compute_efficiency = compute_efficiency
+        if self.dynamic_reserve_enabled and self.dynamic_reserve_controller == "utility_hill_climb":
+            should_record, self.dynamic_utility_settle_remaining = consume_utility_settle(
+                self.dynamic_utility_settle_remaining
+            )
+            if should_record:
+                self.dynamic_utility_window_sum += utility
+                self.dynamic_utility_window_count += 1
+                self.dynamic_utility_window_response_tokens += int(
+                    consumed_metrics["scheduler/consumed/response_tokens"]
+                )
+                self.dynamic_utility_window_consumed_tokens += int(
+                    consumed_metrics["scheduler/consumed/inference_tokens"]
+                )
+                self.dynamic_utility_window_stale_tokens += stale_tokens
+                self.dynamic_utility_window_seconds += observation_seconds
+        filter_metrics["scheduler/dynamic_observation_seconds"] = observation_seconds
+        filter_metrics["scheduler/dynamic_utility_sample"] = utility
+        filter_metrics["scheduler/dynamic_useful_token_rate"] = useful_rate
+        filter_metrics["scheduler/dynamic_useful_response_token_rate"] = useful_rate
+        filter_metrics["scheduler/dynamic_stale_token_rate"] = stale_rate
+        filter_metrics["scheduler/dynamic_compute_efficiency"] = compute_efficiency
+        filter_metrics["scheduler/dynamic_utility_window_count"] = self.dynamic_utility_window_count
+        filter_metrics["scheduler/dynamic_utility_settle_remaining"] = (
+            self.dynamic_utility_settle_remaining
+        )
+        self.new_consumed_records = []
         return filter_metrics
+
+    @staticmethod
+    def _aggregate_consumed_records(records: List[Dict[str, Any]], prefix: str):
+        age_histogram: Dict[str, int] = {}
+        actions_histogram: Dict[str, int] = {}
+        for record in records:
+            age = str(int(record.get("version_age", 0)))
+            actions = str(int(record.get("actions_completed", 0)))
+            age_histogram[age] = age_histogram.get(age, 0) + 1
+            actions_histogram[actions] = actions_histogram.get(actions, 0) + 1
+
+        count = len(records)
+        metrics = {
+            f"{prefix}/trajectories": count,
+            f"{prefix}/version_age_sum": sum(int(record.get("version_age", 0)) for record in records),
+            f"{prefix}/version_age_max": max(
+                (int(record.get("version_age", 0)) for record in records), default=0
+            ),
+            f"{prefix}/actions": sum(int(record.get("actions_completed", 0)) for record in records),
+            f"{prefix}/prompt_tokens": sum(int(record.get("prompt_tokens", 0)) for record in records),
+            f"{prefix}/response_tokens": sum(int(record.get("response_tokens", 0)) for record in records),
+            f"{prefix}/inference_tokens": sum(int(record.get("inference_tokens", 0)) for record in records),
+        }
+        for age in range(4):
+            metrics[f"{prefix}/version_age_{age}"] = sum(
+                int(record.get("version_age", 0)) == age for record in records
+            )
+        metrics[f"{prefix}/version_age_ge_4"] = sum(
+            int(record.get("version_age", 0)) >= 4 for record in records
+        )
+        return metrics, {
+            "version_age": age_histogram,
+            "actions_completed": actions_histogram,
+        }
 
     @staticmethod
     def _aggregate_discard_records(records: List[Dict[str, Any]], prefix: str):
@@ -843,11 +2138,13 @@ class GroupQueueManager:
         value = values[0]
         return value.item() if hasattr(value, "item") else value
 
-    def _completed_rollout_record(self, rollout: DataProto, group: GroupData) -> Dict[str, Any]:
+    @staticmethod
+    def _completed_rollout_record(rollout: DataProto, group: GroupData) -> Dict[str, Any]:
         metric = GroupQueue._metric_by_suffix
-        env_id = self._first_non_tensor_value(rollout, "env_ids", -1)
-        return {
-            "trajectory_id": str(self._first_non_tensor_value(rollout, "traj_id", "unknown")),
+        first_value = GroupQueue._first_non_tensor_value
+        env_id = first_value(rollout, "env_ids", -1)
+        record = {
+            "trajectory_id": str(first_value(rollout, "traj_id", "unknown")),
             "category": "completed_unconsumed",
             "discard_reason": "pipeline_shutdown",
             "group_id": int(group.group_id),
@@ -868,6 +2165,26 @@ class GroupQueueManager:
             "generate_seconds": float(metric(rollout, "/traj_generate_seconds_total", 0)),
             "env_seconds": float(metric(rollout, "/traj_env_seconds_total", 0)),
         }
+        tensor_progress = GroupQueue._tensor_progress(rollout)
+        for field, value in tensor_progress.items():
+            record[field] = max(record[field], value)
+        direct_progress_fields = {
+            "actions_completed": "traj_actions_completed",
+            "inference_calls": "traj_inference_calls",
+            "tool_calls": "traj_tool_calls",
+            "prompt_tokens": "traj_prompt_tokens_total",
+            "response_tokens": "traj_response_tokens_total",
+            "inference_tokens": "traj_inference_tokens_total",
+            "generate_seconds": "traj_generate_seconds_total",
+            "env_seconds": "traj_env_seconds_total",
+        }
+        for field, key in direct_progress_fields.items():
+            value = first_value(rollout, key, 0)
+            try:
+                record[field] = max(record[field], float(value))
+            except (TypeError, ValueError):
+                continue
+        return record
 
     def collect_shutdown_waste(self, inflight_records: List[Dict[str, Any]]):
         records = []
@@ -941,6 +2258,10 @@ class GroupQueueManager:
             async_discard_records, "async_waste"
         )
         metrics.update(async_metrics)
+        consumed_metrics, consumed_histograms = self._aggregate_consumed_records(
+            self.consumed_records, "consumed"
+        )
+        metrics.update(consumed_metrics)
         return {
             "metrics": metrics,
             "histograms": {
@@ -953,6 +2274,11 @@ class GroupQueueManager:
                 "metrics": async_metrics,
                 "histograms": async_histograms,
                 "records": async_discard_records,
+            },
+            "consumed": {
+                "metrics": consumed_metrics,
+                "histograms": consumed_histograms,
+                "records": self.consumed_records,
             },
         }
 
@@ -968,8 +2294,17 @@ class GroupQueueManager:
         fixed_step_admission = self.admission_policy == "step"
         for group_queue in self.group_queue.values():
             group_queue.advance_step(step, admit_step_groups=fixed_step_admission)
-        if not fixed_step_admission:
+        if self.admission_policy == "outstanding_watermark":
             self._refill_to_watermark(step)
+        elif self.admission_policy == "version_adaptive":
+            self._reset_version_admission(step)
+        if self.version_runtime_plan is not None:
+            return self.version_runtime_plan.to_dict()
+        return {"version": int(step)}
+
+    def update_trajectory_progress(self, snapshots: List[Dict[str, Any]]):
+        for group_queue in self.group_queue.values():
+            group_queue.update_progress_snapshots(snapshots)
 
     async def get_episode_id(self, group_id, env_id=None):
         """
@@ -1017,7 +2352,9 @@ class GroupQueueManager:
             self.env_monitor.record_activity(group_id, env_id, episode_id, rollout)
 
         self.waiting += 1
-        self.group_queue[group_id].put(episode_id, start_step, rollout)
+        became_trainable = self.group_queue[group_id].put(episode_id, start_step, rollout)
+        if became_trainable:
+            self._record_version_adaptive_completion(group_id, episode_id)
         self.waiting -= 1
         self.total += 1
         if self.admission_policy == "outstanding_watermark":
@@ -1042,6 +2379,7 @@ class GroupQueueManager:
                 break
 
             async def wait_a_episode():
+                self._ensure_version_progress(current_step, batch_size - len(ret))
                 # Only wait for new episode when there are no pending GroupQueue.get,
                 # this way we can avoid starvation of some env.
                 if not self.pending_gets:
@@ -1094,6 +2432,17 @@ class GroupQueueManager:
                                 rollout, group, "redundancy_trim", current_step
                             )
                         group_rollout = group_rollout[:self.group_size]
+                        self._record_version_adaptive_consumption(group, len(group_rollout))
+                        for rollout in group_rollout:
+                            consumed_record = self._completed_rollout_record(rollout, group)
+                            consumed_record.update(
+                                category="consumed",
+                                discard_reason="",
+                                consumed_at_step=int(current_step),
+                                version_age=max(0, int(current_step) - int(group.create_step)),
+                            )
+                            self.consumed_records.append(consumed_record)
+                            self.new_consumed_records.append(consumed_record)
                         ret.extend(group_rollout)
                         progress_bar.update(len(group_rollout))
 
@@ -1241,8 +2590,20 @@ class RolloutScheduler(RolloutMockMixin):
 
     async def suspend(self):
         await self.router_manager.suspend.remote()
+        await self._snapshot_trajectory_progress()
         await self.router_manager.abort_all.remote()
         await self.router_manager.wait_complete.remote()
+
+    async def _snapshot_trajectory_progress(self):
+        worker_snapshots = await asyncio.gather(
+            *self.es_manager.collect_trajectory_progress(blocking=False)
+        )
+        progress_snapshots = [
+            snapshot
+            for worker_records in worker_snapshots
+            for snapshot in worker_records
+        ]
+        await self.env_output_queue.update_trajectory_progress.remote(progress_snapshots)
 
     async def _run_rollout_loop(self, seed):
         await asyncio.gather(*self.es_manager.run_rollout_loop(seed, blocking=False))
@@ -1284,15 +2645,21 @@ class RolloutScheduler(RolloutMockMixin):
                 seed = self.config.seed
             self.rollout_task = asyncio.create_task(self._run_rollout_loop(seed))
 
+        await self._snapshot_trajectory_progress()
         await asyncio.gather(*self.es_manager.update_step(global_step, inject_trace_context({}), blocking=False))
-        await self.env_output_queue.advance_step.remote(global_step)
-        await self.router_manager.resume.remote()
+        runtime_plan = await self.env_output_queue.advance_step.remote(global_step)
+        await self.router_manager.resume.remote(runtime_plan)
 
+        learner_wait_start = time.time()
         get_task = asyncio.create_task(self._get_batch(batch_size, global_step))
         await asyncio.wait({get_task, self.rollout_task}, return_when=asyncio.FIRST_COMPLETED)
         if self.rollout_task.done() and self.rollout_task.exception() is not None:
             await self.rollout_task
         data_batch = await get_task
+        if self.mode == "train":
+            await self.env_output_queue.record_learner_wait.remote(
+                time.time() - learner_wait_start
+            )
         if batch_size <= 0:
             await self.rollout_task
             self.rollout_task = None
@@ -1308,6 +2675,7 @@ class RolloutScheduler(RolloutMockMixin):
             append_to_dict(metrics, d_item.meta_info["metrics"])
         if get_batch_return_start_time is not None:
             metrics["time/get_batch_cost_gqm"] = time.time() - get_batch_return_start_time
+        metrics.update(await self.router_manager.collect_request_metrics.remote())
         metrics.update(await self.env_output_queue.collect_metrics.remote())
         batch = DataProto.concat(data_batch)
         batch.meta_info["metrics"] = metrics

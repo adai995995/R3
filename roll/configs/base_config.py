@@ -531,12 +531,13 @@ class PPOConfig(BaseConfig):
             )
         },
     )
-    trajectory_admission_policy: Literal["step", "outstanding_watermark"] = field(
+    trajectory_admission_policy: Literal["step", "outstanding_watermark", "version_adaptive"] = field(
         default="step",
         metadata={
             "help": (
                 "Admission policy for agentic trajectories. step preserves the original fixed "
-                "per-learner-step behavior; outstanding_watermark caps total producer debt."
+                "per-learner-step behavior; outstanding_watermark caps total producer debt; "
+                "version_adaptive computes a one-shot admission budget at each policy version."
             )
         },
     )
@@ -545,7 +546,135 @@ class PPOConfig(BaseConfig):
         metadata={
             "help": (
                 "Maximum completed, running, or reserved agentic trajectories under watermark "
-                "admission. Defaults to (1 + async_generation_ratio) * rollout_batch_size."
+                "or version-adaptive admission. Defaults to "
+                "(1 + async_generation_ratio) * rollout_batch_size."
+            )
+        },
+    )
+    adaptive_admission_reserve_trajectories: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Extra trainable-trajectory demand added to rollout_batch_size when computing "
+                "a version-adaptive admission budget."
+            )
+        },
+    )
+    version_adaptive_progress_floor_enabled: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Admit the minimum additional work needed to avoid a version-adaptive learner "
+                "deadlock when predicted carry-over supply fails to complete."
+            )
+        },
+    )
+    adaptive_admission_initial_finish_ratio: float = field(
+        default=0.5,
+        metadata={
+            "help": (
+                "Initial estimate of the fraction of unfinished carry-over trajectories that "
+                "will become trainable during the next policy version."
+            )
+        },
+    )
+    adaptive_admission_ewma_alpha: float = field(
+        default=0.5,
+        metadata={
+            "help": "EWMA weight assigned to the latest observed carry-over finish ratio."
+        },
+    )
+    adaptive_admission_bucketed_finish_enabled: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Predict carry-over completion with version-age by action-progress buckets. "
+                "Buckets without enough observations fall back to the global finish EWMA."
+            )
+        },
+    )
+    adaptive_admission_bucket_min_samples: int = field(
+        default=4,
+        metadata={
+            "help": "Minimum trajectory observations before a bucket replaces the global finish EWMA."
+        },
+    )
+    dynamic_admission_reserve_enabled: bool = field(
+        default=False,
+        metadata={"help": "Dynamically tune version-adaptive admission reserve at version boundaries."},
+    )
+    dynamic_admission_reserve_min: int = field(
+        default=0,
+        metadata={"help": "Minimum dynamic admission reserve in trajectories."},
+    )
+    dynamic_admission_reserve_max: int = field(
+        default=8,
+        metadata={"help": "Maximum dynamic admission reserve in trajectories."},
+    )
+    dynamic_admission_reserve_additive_step: int = field(
+        default=2,
+        metadata={"help": "Additive reserve increase when the learner waits for rollout data."},
+    )
+    dynamic_admission_reserve_multiplicative_decay: float = field(
+        default=0.5,
+        metadata={"help": "Multiplicative reserve decay under stale or supply pressure."},
+    )
+    dynamic_admission_reserve_warmup_versions: int = field(
+        default=2,
+        metadata={"help": "Number of initial versions that keep the configured reserve unchanged."},
+    )
+    dynamic_admission_reserve_wait_high_seconds: float = field(
+        default=2.0,
+        metadata={"help": "Learner batch-wait EWMA threshold that triggers reserve growth."},
+    )
+    dynamic_admission_reserve_stale_high: float = field(
+        default=0.25,
+        metadata={"help": "Stale-discard EWMA threshold that triggers reserve decay."},
+    )
+    dynamic_admission_reserve_prediction_error_margin: float = field(
+        default=1.0,
+        metadata={"help": "Negative supply-prediction EWMA margin that triggers reserve decay."},
+    )
+    dynamic_admission_reserve_ewma_alpha: float = field(
+        default=0.5,
+        metadata={"help": "EWMA weight for dynamic reserve feedback signals."},
+    )
+    dynamic_admission_reserve_signal_patience: int = field(
+        default=2,
+        metadata={"help": "Consecutive same-direction signals required before changing reserve."},
+    )
+    dynamic_admission_reserve_cooldown_versions: int = field(
+        default=2,
+        metadata={"help": "Version boundaries held after each dynamic reserve change."},
+    )
+    dynamic_admission_reserve_controller: Literal[
+        "threshold_aimd", "utility_hill_climb"
+    ] = field(
+        default="threshold_aimd",
+        metadata={"help": "Feedback controller used to tune version-adaptive reserve."},
+    )
+    dynamic_admission_utility_window_versions: int = field(
+        default=4,
+        metadata={"help": "Completed control observations per utility comparison window."},
+    )
+    dynamic_admission_utility_waste_weight: float = field(
+        default=1.0,
+        metadata={"help": "Penalty applied to stale inference tokens/s in rollout utility."},
+    )
+    dynamic_admission_utility_improvement_margin: float = field(
+        default=0.05,
+        metadata={"help": "Relative utility deadband for hill-climb direction decisions."},
+    )
+    dynamic_admission_utility_settle_versions: int = field(
+        default=2,
+        metadata={"help": "Post-change observations excluded from utility credit assignment."},
+    )
+    dynamic_admission_utility_min_compute_efficiency: float = field(
+        default=0.95,
+        metadata={
+            "help": (
+                "Hard lower bound on consumed inference work divided by consumed plus stale "
+                "inference work; utility control reduces reserve when the bound is violated."
             )
         },
     )

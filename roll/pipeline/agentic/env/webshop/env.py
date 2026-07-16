@@ -1,4 +1,5 @@
 import random
+import re
 import string
 from typing import Optional, Union, Any
 
@@ -30,14 +31,21 @@ class WebShopEnv(Env, WebAgentTextEnv):
         """
         Adapter for WebAgentTextEnv to conform to the BaseLanguageBasedEnv interface.
         """
-        self.env_instruction = ("You are web shopping. I will give you instructions about what to do. "
-                            "You have to follow the instructions. Every round I will give you an observation and "
-                            "a list of available actions, you have to respond an action based on the state and instruction. "
-                            "You can use search action if search is available. You can click one of the buttons in clickables. "
-                            "An action should be of the following structure: search[keywords] click[value] If the action is not valid, perform nothing. "
-                            "Keywords in search are up to you, but the value in click must be a value in the list of available actions. "
-                            "Remember that your keywords in search should be carefully designed. "
-                            "Your response should use the following format Thought: I think ... Action: click[something]")
+        self.env_instruction = (
+            "You are web shopping. I will give you instructions about what to do. "
+            "You have to follow the instructions. Every round I will give you an observation and "
+            "a list of available actions, and you must respond with one action based on the state and instruction. "
+            "An action must be either search[keywords] or click[value]. "
+            "Use at most 6 space-separated keywords in a search query. Search for the product category and only "
+            "one or two distinctive attributes; do not put every constraint or the price into the query. "
+            "If a search returns no clickable products, simplify the keywords and search again. "
+            "When product links are available, click one of them. On a product page, select the required options "
+            "from the available click actions and then click Buy Now when the requirements are satisfied. "
+            "The value in click[value] must exactly match one of the available click actions. "
+            "Never output Action: nothing while search or click actions are available. "
+            "Your response must use the format Thought: I think ... Action: search[keywords] or "
+            "Thought: I think ... Action: click[value]."
+        )
         if env_instruction is not None:
             self.env_instruction = env_instruction
 
@@ -85,6 +93,10 @@ class WebShopEnv(Env, WebAgentTextEnv):
         metrics_agg_mode = {
             "action_is_effective": "mean",
             "action_is_valid": "mean",
+            "search_action": "mean",
+            "click_action": "mean",
+            "buy_action": "mean",
+            "invalid_action": "mean",
             "success": "last",
             "format_penalty": "mean",
         }
@@ -97,6 +109,10 @@ class WebShopEnv(Env, WebAgentTextEnv):
             metrics = {
                 "action_is_effective": False,
                 "action_is_valid": False,
+                "search_action": False,
+                "click_action": False,
+                "buy_action": False,
+                "invalid_action": True,
                 "success": False,
                 "format_penalty": self.format_penalty
             }
@@ -109,12 +125,17 @@ class WebShopEnv(Env, WebAgentTextEnv):
             truncated = self.step_count >= self.max_steps
             return self.render(), self.format_penalty, truncated, truncated, info
 
+        parsed_action = action_info["action"].strip().lower()
         state, reward, done, info = WebAgentTextEnv.step(self, action_info["action"])
         self.prepare_render_cache(self.observation)
         metrics = {
             "action_is_effective": tuple(self.get_available_actions())
             == ("click[back to search]", "click[< prev]", "click[next >]"),
             "action_is_valid": True,
+            "search_action": parsed_action.startswith("search["),
+            "click_action": parsed_action.startswith("click["),
+            "buy_action": parsed_action == "click[buy now]",
+            "invalid_action": False,
             "success": done,
             "format_penalty": 0
         }
@@ -135,7 +156,16 @@ class WebShopEnv(Env, WebAgentTextEnv):
         return observation + "\n" + "Available actions: " + actions
 
     def parse_action(self, text):
-        return default_parser_action_func(text, self.action_pattern, None, None)
+        action_info = default_parser_action_func(text, self.action_pattern, None, self.special_token_list)
+        action_content = action_info["action_content"]
+        match = re.search(r"(?:Action:\s*)?(search\[[^\]\r\n]*\]|click\[[^\]\r\n]*\])", action_content, re.IGNORECASE)
+        if match is None:
+            action_info["action"] = None
+            return action_info
+
+        action_info["action"] = match.group(1).strip()
+        action_info["think_content"] = action_content[: match.start()].strip()
+        return action_info
 
     def render(self, mode=None):
         """

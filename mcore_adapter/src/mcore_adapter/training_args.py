@@ -2,7 +2,11 @@ import json
 from dataclasses import dataclass, field, fields
 from typing import Literal, Optional, Union
 
-from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+try:
+    from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+except ModuleNotFoundError:
+    class PipelineParallelLayerLayout:
+        pass
 from transformers import Seq2SeqTrainingArguments as HFSeq2SeqTrainingArguments
 from transformers import TrainingArguments as HFTrainingArguments
 

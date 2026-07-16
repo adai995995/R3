@@ -35,6 +35,42 @@ from roll.platforms import current_platform
 logger = get_logger()
 
 
+class _PrefixCacheDeltaLogger:
+    """Collect exact V1 scheduler prefix-cache deltas between drains."""
+
+    def __init__(self, block_size: int):
+        self.block_size = block_size
+        self.requests = 0
+        self.query_blocks = 0
+        self.hit_blocks = 0
+        self.resets = 0
+
+    def record(self, scheduler_stats, iteration_stats):
+        stats = scheduler_stats.prefix_cache_stats
+        self.requests += int(stats.requests)
+        self.query_blocks += int(stats.queries)
+        self.hit_blocks += int(stats.hits)
+        self.resets += int(bool(stats.reset))
+
+    def log(self):
+        pass
+
+    def drain(self) -> Dict[str, float]:
+        metrics = {
+            "vllm/engine_prefix_cache_requests_delta": self.requests,
+            "vllm/engine_prefix_cache_query_blocks_delta": self.query_blocks,
+            "vllm/engine_prefix_cache_hit_blocks_delta": self.hit_blocks,
+            "vllm/engine_prefix_cache_query_tokens_delta": self.query_blocks * self.block_size,
+            "vllm/engine_prefix_cache_cached_tokens_delta": self.hit_blocks * self.block_size,
+            "vllm/engine_prefix_cache_resets_delta": self.resets,
+        }
+        self.requests = 0
+        self.query_blocks = 0
+        self.hit_blocks = 0
+        self.resets = 0
+        return metrics
+
+
 class VllmStrategy(InferenceStrategy):
     strategy_name = "vllm"
 
@@ -45,6 +81,7 @@ class VllmStrategy(InferenceStrategy):
         self._metrics_snapshots = deque(maxlen=3600)
         self._metrics_snapshot_interval = 1.0  # Snapshot every 1 second
         self._metrics_task = None
+        self._prefix_cache_loggers = []
 
 
     def get_free_port_for_rank(self) -> int:
@@ -142,6 +179,16 @@ class VllmStrategy(InferenceStrategy):
             os.environ["VLLM_PORT"] = str(vllm_port)
 
         self.model = await create_async_llm(resource_placement_groups=self.worker_config.resource_placement_groups, **vllm_config)
+
+        block_size = int(vllm_config.get("block_size") or 16)
+        for engine_loggers in getattr(self.model, "stat_loggers", []):
+            prefix_logger = _PrefixCacheDeltaLogger(block_size)
+            engine_loggers.append(prefix_logger)
+            self._prefix_cache_loggers.append(prefix_logger)
+        if not self._prefix_cache_loggers:
+            logger.warning(
+                "vLLM prefix-cache delta metrics unavailable because stat logging is disabled"
+            )
 
 
         if Version("0.15.0") <= Version(vllm.__version__):
@@ -318,12 +365,18 @@ class VllmStrategy(InferenceStrategy):
             lora_request=lora_request,
         )
         output: Optional[RequestOutput] = None
+        observed_cached_prompt_tokens = None
         # vLLM support partial rollout in v1 from 0.10.1, and will return finished output
         # with finish_reason setted no matter what RequestOutputKind is.
         # For compatibility, the following except block are only for v0 and older version of v1.
         try:
             async for result in result_generator:
                 output = result
+                if result.num_cached_tokens is not None:
+                    observed_cached_prompt_tokens = max(
+                        observed_cached_prompt_tokens or 0,
+                        int(result.num_cached_tokens),
+                    )
         except asyncio.CancelledError:
             if output is None:
                 return {"finish_reasons": ["abort"]}
@@ -348,10 +401,37 @@ class VllmStrategy(InferenceStrategy):
             "output_logprobs": logprobs,
         }
 
+        prompt_tokens = len(
+            payload["input_ids"] if "input_ids" in payload else prompt_token_ids
+        )
+        result["metrics"] = {
+            "vllm/request_prompt_tokens": prompt_tokens,
+        }
+        # V1 0.8.4 declares num_cached_tokens but never populates it. Do not
+        # publish a false zero; engine-level scheduler deltas below are exact.
+        if observed_cached_prompt_tokens is not None:
+            cached_prompt_tokens = min(
+                prompt_tokens, max(0, observed_cached_prompt_tokens)
+            )
+            result["metrics"].update(
+                {
+                    "vllm/request_cached_prompt_tokens": cached_prompt_tokens,
+                    "vllm/request_prefill_tokens": prompt_tokens - cached_prompt_tokens,
+                    "vllm/request_kv_hit_ratio": (
+                        cached_prompt_tokens / prompt_tokens if prompt_tokens else 0.0
+                    ),
+                }
+            )
+        # Concurrent requests share an engine logger. Draining on completion
+        # attributes deltas arbitrarily, but summing responses is exact.
+        for prefix_logger in self._prefix_cache_loggers:
+            for name, value in prefix_logger.drain().items():
+                result["metrics"][name] = result["metrics"].get(name, 0) + value
+
         # Add speculative metrics if available
         spec_metrics = self.get_speculative_metrics()
         if spec_metrics:
-            result["metrics"] = spec_metrics
+            result["metrics"].update(spec_metrics)
 
         return result
 

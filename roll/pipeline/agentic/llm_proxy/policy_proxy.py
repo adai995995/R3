@@ -60,4 +60,7 @@ class PolicyProxy(BaseLLMProxy):
         lm_output.non_tensor_batch = request_repeat.non_tensor_batch
         lm_output.meta_info = request_repeat.meta_info
         lm_output.meta_info.pop("generation_config", None)
+        lm_output.meta_info.setdefault("metrics", {}).update(
+            response_data.meta_info.get("metrics", {})
+        )
         return lm_output

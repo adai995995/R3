@@ -21,11 +21,20 @@ from megatron.core.distributed import DistributedDataParallel, DistributedDataPa
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.transformer.moe.moe_utils import (
-    clear_aux_losses_tracker,
-    get_moe_layer_wise_logging_tracker,
-    reduce_aux_losses_tracker_across_ranks,
-)
+try:
+    from megatron.core.transformer.moe.moe_utils import (
+        clear_aux_losses_tracker,
+        get_moe_layer_wise_logging_tracker,
+        reduce_aux_losses_tracker_across_ranks,
+    )
+except ImportError:
+    from megatron.core.transformer.moe.moe_utils import (
+        clear_aux_losses_tracker,
+        reduce_aux_losses_tracker_across_ranks,
+    )
+
+    def get_moe_layer_wise_logging_tracker():
+        return {}
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from torch._tensor import Tensor
 from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler

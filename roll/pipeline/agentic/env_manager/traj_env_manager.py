@@ -217,6 +217,28 @@ class TrajEnvManager(BaseEnvManager):
 
         return self.rollout_cache
 
+    def _trajectory_runtime_state(self):
+        """Build scheduler metadata using only version and execution progress."""
+        actions_completed = int(self.rollout_cache.step)
+        max_actions = int(self.env_config.max_steps)
+        current_version = int(self.current_step)
+        traj_group_id = (
+            f"{self.rollout_cache.tag}_{self.rollout_cache.group_id}_"
+            f"{self.episode_id}_{self.group_seed}"
+        )
+        return {
+            "trajectory_id": f"{traj_group_id}_{self.rollout_cache.env_id}",
+            "group_id": int(self.rollout_cache.group_id),
+            "episode_id": int(self.episode_id),
+            "policy_version": int(self.trajectory_version),
+            "current_version": current_version,
+            "version_age": max(0, current_version - int(self.trajectory_version)),
+            "actions_completed": actions_completed,
+            "inference_calls": actions_completed,
+            "max_actions": max_actions,
+            "remaining_actions": max(0, max_actions - actions_completed),
+        }
+
     def make_decision(self, rollout_cache: RolloutCache):
         lm_input = self.format_messages(rollout_cache)
         input_ids = lm_input.batch["input_ids"]
@@ -233,7 +255,7 @@ class TrajEnvManager(BaseEnvManager):
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
         if getattr(self.pipeline_config, "trajectory_scheduling_policy", "fifo") == "version_priority":
-            lm_input.meta_info["trajectory_priority"] = self.trajectory_version
+            lm_input.meta_info["trajectory_priority"] = self._trajectory_runtime_state()
 
         input_messages = [item for items in self.rollout_cache.history for item in items["messages"]]
 
@@ -247,6 +269,22 @@ class TrajEnvManager(BaseEnvManager):
         response_ids = lm_output.batch['responses'][0]
         response_ids = response_ids.tolist()
         content = self.rollout_cache.history[-1]
+        request_metrics = lm_output.meta_info.get("metrics", {})
+        if request_metrics:
+            content.setdefault("metrics", {}).update(request_metrics)
+            aggregate_as_sum = {
+                "vllm/request_prompt_tokens",
+                "vllm/request_cached_prompt_tokens",
+                "vllm/request_prefill_tokens",
+                "router/post_update_rebuild_request",
+                "router/post_update_rebuild_lcp_tokens",
+                "router/rebuild_candidate_request",
+                "router/version_runtime_plan_request",
+                "router/working_set_prefix_selected",
+            }
+            content.setdefault("metrics_agg_mode", {}).update(
+                {name: "sum" for name in request_metrics if name in aggregate_as_sum}
+            )
 
         if "infer_logprobs" in lm_output.batch.keys():
             infer_logprobs = lm_output.batch['infer_logprobs'][0][-len(response_ids):]

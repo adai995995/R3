@@ -8,6 +8,7 @@ import httpx
 import weakref
 from abc import abstractmethod
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any, Dict, List, Set
 from urllib.parse import quote
 
@@ -24,6 +25,166 @@ from roll.utils.logging import get_logger
 
 
 logger = get_logger()
+
+
+@dataclass(frozen=True)
+class TrajectoryRuntimeState:
+    trajectory_id: str
+    policy_version: int
+    current_version: int
+    version_age: int
+    actions_completed: int
+    max_actions: int
+    group_id: int = -1
+    episode_id: int = -1
+
+    @property
+    def remaining_actions(self) -> int:
+        return max(0, self.max_actions - self.actions_completed)
+
+    @property
+    def priority_key(self):
+        # Lexicographic, system-only ordering: deadline, invested work, then
+        # distance to the hard action limit. FIFO is appended by the router.
+        return (
+            self.policy_version,
+            int(self.actions_completed == 0),
+            self.remaining_actions,
+        )
+
+    @property
+    def group_key(self) -> str:
+        return f"{self.group_id}:{self.episode_id}"
+
+    @classmethod
+    def from_priority(cls, priority, fallback_id) -> "TrajectoryRuntimeState":
+        if isinstance(priority, dict):
+            policy_version = int(priority.get("policy_version", 0))
+            current_version = int(priority.get("current_version", policy_version))
+            actions_completed = int(priority.get("actions_completed", 0))
+            max_actions = int(priority.get("max_actions", actions_completed))
+            return cls(
+                trajectory_id=str(priority.get("trajectory_id", fallback_id)),
+                policy_version=policy_version,
+                current_version=current_version,
+                version_age=max(
+                    0,
+                    int(priority.get("version_age", current_version - policy_version)),
+                ),
+                actions_completed=max(0, actions_completed),
+                max_actions=max(actions_completed, max_actions),
+                group_id=int(priority.get("group_id", -1)),
+                episode_id=int(priority.get("episode_id", -1)),
+            )
+        policy_version = int(priority or 0)
+        return cls(
+            trajectory_id=str(fallback_id),
+            policy_version=policy_version,
+            current_version=policy_version,
+            version_age=0,
+            actions_completed=0,
+            max_actions=0,
+        )
+
+
+def select_soft_locality_worker(
+    affinity_rank,
+    active_dp_ranks,
+    worker_pressure,
+    cache_valid: bool,
+    load_slack: int,
+):
+    """Choose affinity unless its queue pressure exceeds the least-loaded worker."""
+    candidates = list(active_dp_ranks)
+    if not candidates:
+        raise RuntimeError("No active DP ranks")
+    least_loaded = min(candidates, key=lambda rank: (worker_pressure.get(rank, 0), rank))
+    if (
+        cache_valid
+        and affinity_rank in active_dp_ranks
+        and worker_pressure.get(affinity_rank, 0)
+        <= worker_pressure.get(least_loaded, 0) + max(0, load_slack)
+    ):
+        return affinity_rank, "affinity"
+    if cache_valid and affinity_rank in active_dp_ranks:
+        return least_loaded, "load_override"
+    return least_loaded, "least_loaded"
+
+
+def common_prefix_tokens(left, right, limit: int) -> int:
+    """Count equal leading tokens, bounded to keep rebuild routing inexpensive."""
+    count = 0
+    for left_token, right_token in zip(left, right):
+        if count >= limit or int(left_token) != int(right_token):
+            break
+        count += 1
+    return count
+
+
+def select_rebuild_worker(
+    prompt_tokens,
+    worker_prompts,
+    active_dp_ranks,
+    assigned_counts,
+    prefix_limit: int,
+):
+    """Choose the worker whose current rebuild wave is least prefix-similar."""
+    candidates = list(active_dp_ranks)
+    if not candidates:
+        raise RuntimeError("No active DP ranks")
+
+    def score(dp_rank):
+        similarities = [
+            common_prefix_tokens(prompt_tokens, previous, prefix_limit)
+            for previous in worker_prompts.get(dp_rank, [])
+        ]
+        max_similarity = max(similarities, default=0)
+        return max_similarity, assigned_counts.get(dp_rank, 0), dp_rank
+
+    selected = min(candidates, key=score)
+    similarities = [
+        common_prefix_tokens(prompt_tokens, previous, prefix_limit)
+        for previous in worker_prompts.get(selected, [])
+    ]
+    return selected, max(similarities, default=0)
+
+
+def select_prefix_locality_worker(
+    prompt_tokens,
+    worker_prompts,
+    active_dp_ranks,
+    worker_pressure,
+    load_slack: int,
+    prefix_limit: int,
+):
+    """Prefer the current-version working set unless queue pressure is excessive."""
+    candidates = list(active_dp_ranks)
+    if not candidates:
+        raise RuntimeError("No active DP ranks")
+    least_loaded = min(candidates, key=lambda rank: (worker_pressure.get(rank, 0), rank))
+
+    def cached_tokens(dp_rank):
+        return max(
+            (
+                common_prefix_tokens(prompt_tokens, previous, prefix_limit)
+                for previous in worker_prompts.get(dp_rank, [])
+            ),
+            default=0,
+        )
+
+    best_rank = max(
+        candidates,
+        key=lambda rank: (cached_tokens(rank), -worker_pressure.get(rank, 0), -rank),
+    )
+    best_cached = cached_tokens(best_rank)
+    if best_cached <= 0:
+        return least_loaded, "least_loaded", 0
+    if (
+        worker_pressure.get(best_rank, 0)
+        <= worker_pressure.get(least_loaded, 0) + max(0, load_slack)
+    ):
+        return best_rank, "prefix_locality", best_cached
+    return least_loaded, "prefix_load_override", 0
 
 def _create_sampling_params_for_sglang(gen_kwargs: dict):
     return dict(
@@ -110,6 +271,7 @@ class RouterManager:
         self.empty_notifier = asyncio.Event()
 
         self.partial_gpu_manager = PartialGPUManager(actor_cluster=actor_cluster, router=self.router, num_gpus_per_node=num_gpus_per_node)
+        self.request_metric_totals = defaultdict(float)
 
     async def initialize(self):
         await self.router.initialize()
@@ -161,7 +323,121 @@ class RouterManager:
         return RouterClient(proxy, meta)
 
     async def generate_request(self, payload, request_id, uid, priority=None):
-        return await self.router.generate_request(payload=payload, request_id=request_id, uid=uid, priority=priority)
+        response = await self.router.generate_request(
+            payload=payload, request_id=request_id, uid=uid, priority=priority
+        )
+        request_metrics = response.get("metrics", {})
+        for name, value in request_metrics.items():
+            if isinstance(value, (int, float)):
+                self.request_metric_totals[name] += float(value)
+        if request_metrics.get("router/post_update_rebuild_request", 0):
+            self.request_metric_totals["router/rebuild_prompt_tokens"] += float(
+                request_metrics.get("vllm/request_prompt_tokens", 0)
+            )
+            if "vllm/request_cached_prompt_tokens" in request_metrics:
+                self.request_metric_totals["router/rebuild_cached_prompt_tokens"] += float(
+                    request_metrics["vllm/request_cached_prompt_tokens"]
+                )
+            if "vllm/request_prefill_tokens" in request_metrics:
+                self.request_metric_totals["router/rebuild_prefill_tokens"] += float(
+                    request_metrics["vllm/request_prefill_tokens"]
+                )
+        return response
+
+    def collect_request_metrics(self):
+        metrics = dict(self.request_metric_totals)
+        prompt_tokens = metrics.get("vllm/request_prompt_tokens", 0.0)
+        cached_tokens = metrics.get("vllm/request_cached_prompt_tokens")
+        if cached_tokens is not None:
+            metrics["vllm/interval_kv_hit_ratio"] = (
+                cached_tokens / prompt_tokens if prompt_tokens else 0.0
+            )
+        rebuild_prompt = metrics.get("router/rebuild_prompt_tokens", 0.0)
+        rebuild_cached = metrics.get("router/rebuild_cached_prompt_tokens")
+        if rebuild_cached is not None:
+            metrics["router/rebuild_kv_hit_ratio"] = (
+                rebuild_cached / rebuild_prompt if rebuild_prompt else 0.0
+            )
+        query_blocks = metrics.get(
+            "vllm/engine_prefix_cache_query_blocks_delta", 0.0
+        )
+        hit_blocks = metrics.get(
+            "vllm/engine_prefix_cache_hit_blocks_delta", 0.0
+        )
+        engine_cached_tokens = metrics.get(
+            "vllm/engine_prefix_cache_cached_tokens_delta", 0.0
+        )
+        metrics.update(
+            {
+                "router/kv_cache_requests": metrics.get(
+                    "vllm/engine_prefix_cache_requests_delta", 0.0
+                ),
+                "router/kv_query_blocks": query_blocks,
+                "router/kv_hit_blocks": hit_blocks,
+                "router/kv_query_tokens": metrics.get(
+                    "vllm/engine_prefix_cache_query_tokens_delta", 0.0
+                ),
+                "router/kv_cached_tokens": engine_cached_tokens,
+                "router/kv_saved_prefill_tokens": engine_cached_tokens,
+                "router/kv_cacheable_reprefill_tokens": max(
+                    0.0,
+                    metrics.get(
+                        "vllm/engine_prefix_cache_query_tokens_delta", 0.0
+                    )
+                    - engine_cached_tokens,
+                ),
+                "router/kv_block_hit_ratio": (
+                    hit_blocks / query_blocks if query_blocks else 0.0
+                ),
+                "router/kv_cache_resets": metrics.get(
+                    "vllm/engine_prefix_cache_resets_delta", 0.0
+                ),
+            }
+        )
+        scheduling_decisions = metrics.get("router/scheduling_decisions", 0.0)
+        if scheduling_decisions:
+            metrics["router/scheduling_wait_seconds_mean"] = (
+                metrics.get("router/scheduling_wait_seconds", 0.0)
+                / scheduling_decisions
+            )
+            metrics["router/scheduling_decision_seconds_mean"] = (
+                metrics.get("router/scheduling_decision_seconds", 0.0)
+                / scheduling_decisions
+            )
+            metrics["router/selected_worker_pressure_mean"] = (
+                metrics.get("router/selected_worker_pressure", 0.0)
+                / scheduling_decisions
+            )
+            metrics["router/affinity_selected_ratio"] = (
+                metrics.get("router/affinity_selected", 0.0)
+                / scheduling_decisions
+            )
+            metrics["router/load_override_ratio"] = (
+                metrics.get("router/load_override", 0.0)
+                / scheduling_decisions
+            )
+            metrics["router/least_loaded_selected_ratio"] = (
+                metrics.get("router/least_loaded_selected", 0.0)
+                / scheduling_decisions
+            )
+            metrics["router/working_set_prefix_selected_ratio"] = (
+                metrics.get("router/working_set_prefix_selected", 0.0)
+                / scheduling_decisions
+            )
+            metrics["router/rebuild_candidate_request_ratio"] = (
+                metrics.get("router/rebuild_candidate_request", 0.0)
+                / scheduling_decisions
+            )
+            metrics["router/priority_queued_ratio"] = (
+                metrics.get("router/priority_queued_requests", 0.0)
+                / scheduling_decisions
+            )
+            metrics["router/priority_queue_depth_mean"] = (
+                metrics.get("router/priority_queue_depth", 0.0)
+                / scheduling_decisions
+            )
+        self.request_metric_totals.clear()
+        return metrics
 
     async def abort_requests(self, request_ids, uid):
         return await self.router.abort_requests(request_ids, uid)
@@ -193,9 +469,10 @@ class RouterManager:
         self.suspend_notifier.clear()
         self.need_suspend = True
 
-    def resume(self):
+    def resume(self, version=None):
         if not self.need_suspend:
             return
+        self.router.on_version_resume(version)
         self.need_suspend = False
         self.suspend_notifier.set()
 
@@ -695,6 +972,10 @@ class Router:
     async def abort_all(self, request_ids):
         pass
 
+    def on_version_resume(self, version=None):
+        """Notify routers that model weights and prefix-cache generation changed."""
+        return None
+
     async def rebalance_on_shrink(self, shrink_dp_ranks: List[int]) -> Dict[str, int]:
         raise NotImplementedError
 
@@ -970,6 +1251,9 @@ class EnvAffinityRouter(Router):
     """
     async def initialize(self):
         self.src_rank2_dp_rank = {}
+        self.src_rank_cache_epoch = {}
+        self.src_rank_last_prompt_tokens = {}
+        self.cache_epoch = 0
         self.request_id_2_src_rank: Dict[str, int] = {}  # Reverse lookup for abort
         self.running_requests: List[set[str]] = [set() for _ in range(len(self.workers))]
         self.worker_iter = itertools.cycle(range(len(self.workers)))
@@ -982,24 +1266,238 @@ class EnvAffinityRouter(Router):
         self.priority_waiters = [[] for _ in self.workers]
         self.priority_inflight = [0 for _ in self.workers]
         self.priority_conditions = [asyncio.Condition() for _ in self.workers]
+        config = self.router_args.router_config or {}
+        self.post_update_rebuild_enabled = bool(
+            config.get("post_update_rebuild_enabled", False)
+        )
+        self.post_update_rebuild_requests = int(
+            config.get("post_update_rebuild_requests", 0)
+        )
+        self.post_update_rebuild_observe_requests = int(
+            config.get(
+                "post_update_rebuild_observe_requests",
+                self.post_update_rebuild_requests,
+            )
+        )
+        self.post_update_rebuild_prefix_tokens = int(
+            config.get("post_update_rebuild_prefix_tokens", 2048)
+        )
+        self.soft_locality_enabled = bool(
+            config.get("soft_locality_enabled", False)
+        )
+        self.soft_locality_load_slack = int(
+            config.get("soft_locality_load_slack", 1)
+        )
+        self.working_set_routing_enabled = bool(
+            config.get("working_set_routing_enabled", self.post_update_rebuild_enabled)
+        )
+        self.working_set_max_prompts_per_worker = int(
+            config.get("working_set_max_prompts_per_worker", 64)
+        )
+        self.rebuild_epoch = None
+        self.rebuild_remaining = 0
+        self.rebuild_target = 0
+        self.rebuild_observe_remaining = 0
+        self.rebuild_candidate_groups = set()
+        self.rebuild_seen_trajectories = set()
+        self.rebuild_worker_prompts = defaultdict(list)
+        self.rebuild_assigned_counts = defaultdict(int)
+        self.working_set_worker_prompts = defaultdict(list)
+        self.runtime_plan = {}
+
+    def on_version_resume(self, version=None):
+        plan = dict(version) if isinstance(version, dict) else {"version": version}
+        epoch = plan.get("version")
+        if epoch == self.rebuild_epoch:
+            return
+        self.cache_epoch += 1
+        self.rebuild_epoch = epoch
+        self.runtime_plan = plan
+        self.rebuild_candidate_groups = set(plan.get("rebuild_candidate_groups", []))
+        planned_target = int(
+            plan.get("rebuild_target_trajectories", self.post_update_rebuild_requests)
+        )
+        if not self.rebuild_candidate_groups and planned_target <= 0:
+            planned_target = self.post_update_rebuild_requests
+        self.rebuild_target = min(
+            max(0, self.post_update_rebuild_requests),
+            max(0, planned_target),
+        )
+        self.rebuild_remaining = self.rebuild_target
+        self.rebuild_observe_remaining = max(
+            self.rebuild_target,
+            max(0, self.post_update_rebuild_observe_requests),
+        )
+        self.rebuild_seen_trajectories.clear()
+        self.rebuild_worker_prompts.clear()
+        self.rebuild_assigned_counts.clear()
+        self.working_set_worker_prompts.clear()
+        if self.post_update_rebuild_enabled or self.working_set_routing_enabled:
+            # Prefix cache is flushed with the new weights, so old placement has no KV value.
+            self.src_rank2_dp_rank.clear()
+            self.src_rank_cache_epoch.clear()
+            self.src_rank_last_prompt_tokens.clear()
 
     async def generate_request(self, payload, request_id, uid, priority=None):
         src_rank = uid
+        runtime_state = TrajectoryRuntimeState.from_priority(priority, src_rank)
+        routing_key = runtime_state.trajectory_id if isinstance(priority, dict) else src_rank
+        prompt_tokens = payload.get("input_ids", [])
+        decision_started = time.perf_counter()
+        rebuild_request = False
+        rebuild_lcp_tokens = 0
+        rebuild_candidate = runtime_state.group_key in self.rebuild_candidate_groups
+        route_reason = "least_loaded"
+        affinity_candidate = False
+        affinity_cache_valid = False
+        estimated_cached_tokens = 0
+        selected_pressure = 0
         # Atomic routing assignment under lock to prevent TOCTOU race with shrink/expand
         async with self.routing_lock:
-            # Least-loaded dispatch
-            if src_rank not in self.src_rank2_dp_rank:
-                dp_rank = self._get_least_active_dp_rank()
-                self.src_rank2_dp_rank[src_rank] = dp_rank
-            dp_rank = self.src_rank2_dp_rank[src_rank]
+            affinity_rank = self.src_rank2_dp_rank.get(routing_key)
+            affinity_candidate = affinity_rank is not None
+            affinity_cache_valid = (
+                affinity_candidate
+                and self.src_rank_cache_epoch.get(routing_key) == self.cache_epoch
+            )
+            worker_pressure = self._worker_pressure()
+            if affinity_cache_valid:
+                estimated_cached_tokens = min(
+                    len(prompt_tokens),
+                    int(self.src_rank_last_prompt_tokens.get(routing_key, 0)),
+                )
 
-        has_priority_slot = await self._acquire_priority_slot(dp_rank, priority, request_id)
+            if affinity_rank is None:
+                first_epoch_request = routing_key not in self.rebuild_seen_trajectories
+                if first_epoch_request:
+                    self.rebuild_seen_trajectories.add(routing_key)
+                    self.rebuild_observe_remaining = max(
+                        0, self.rebuild_observe_remaining - 1
+                    )
+                rebuild_fallback = (
+                    not self.rebuild_candidate_groups
+                    or self.rebuild_observe_remaining <= self.rebuild_remaining
+                )
+                if (
+                    self.post_update_rebuild_enabled
+                    and self.rebuild_remaining > 0
+                    and first_epoch_request
+                    and (rebuild_candidate or rebuild_fallback)
+                    and len(prompt_tokens) > 0
+                ):
+                    dp_rank, rebuild_lcp_tokens = select_rebuild_worker(
+                        prompt_tokens,
+                        self.rebuild_worker_prompts,
+                        self.active_dp_ranks,
+                        self.rebuild_assigned_counts,
+                        self.post_update_rebuild_prefix_tokens,
+                    )
+                    self.rebuild_worker_prompts[dp_rank].append(
+                        tuple(
+                            int(token)
+                            for token in prompt_tokens[:self.post_update_rebuild_prefix_tokens]
+                        )
+                    )
+                    self.rebuild_assigned_counts[dp_rank] += 1
+                    self.rebuild_remaining -= 1
+                    rebuild_request = True
+                    route_reason = "rebuild"
+                elif self.working_set_routing_enabled and len(prompt_tokens) > 0:
+                    dp_rank, route_reason, estimated_cached_tokens = (
+                        select_prefix_locality_worker(
+                            prompt_tokens,
+                            self.working_set_worker_prompts,
+                            self.active_dp_ranks,
+                            worker_pressure,
+                            self.soft_locality_load_slack,
+                            self.post_update_rebuild_prefix_tokens,
+                        )
+                    )
+                else:
+                    dp_rank, route_reason = select_soft_locality_worker(
+                        None,
+                        self.active_dp_ranks,
+                        worker_pressure,
+                        False,
+                        self.soft_locality_load_slack,
+                    )
+                self.src_rank2_dp_rank[routing_key] = dp_rank
+            elif self.soft_locality_enabled:
+                dp_rank, route_reason = select_soft_locality_worker(
+                    affinity_rank,
+                    self.active_dp_ranks,
+                    worker_pressure,
+                    affinity_cache_valid,
+                    self.soft_locality_load_slack,
+                )
+                if dp_rank != affinity_rank:
+                    self.src_rank2_dp_rank[routing_key] = dp_rank
+                    self.src_rank_cache_epoch.pop(routing_key, None)
+                    self.src_rank_last_prompt_tokens.pop(routing_key, None)
+                    estimated_cached_tokens = 0
+            else:
+                dp_rank = affinity_rank
+                route_reason = "affinity"
+            selected_pressure = worker_pressure.get(dp_rank, 0)
+
+        routing_decision_seconds = time.perf_counter() - decision_started
+        wait_started = time.perf_counter()
+        has_priority_slot, priority_queue_depth, priority_was_queued = (
+            await self._acquire_priority_slot(dp_rank, priority, request_id)
+        )
+        scheduling_wait_seconds = time.perf_counter() - wait_started
 
         self.request_id_2_src_rank[request_id] = src_rank
         self.running_requests[dp_rank].add(request_id)
 
         try:
-            return await self.workers[dp_rank].generate_request.remote(payload)
+            response = await self.workers[dp_rank].generate_request.remote(payload)
+            finish_reasons = response.get("finish_reasons", [])
+            if not any(reason == "abort" for reason in finish_reasons):
+                self.src_rank_cache_epoch[routing_key] = self.cache_epoch
+                self.src_rank_last_prompt_tokens[routing_key] = len(prompt_tokens)
+                cached_prompts = self.working_set_worker_prompts[dp_rank]
+                cached_prompts.append(
+                    tuple(
+                        int(token)
+                        for token in prompt_tokens[:self.post_update_rebuild_prefix_tokens]
+                    )
+                )
+                max_prompts = max(1, self.working_set_max_prompts_per_worker)
+                if len(cached_prompts) > max_prompts:
+                    del cached_prompts[:-max_prompts]
+            response.setdefault("metrics", {}).update({
+                "router/scheduling_decisions": 1,
+                "router/scheduling_decision_seconds": routing_decision_seconds,
+                "router/scheduling_wait_seconds": scheduling_wait_seconds,
+                "router/scheduling_version_age": runtime_state.version_age,
+                "router/scheduling_actions_completed": runtime_state.actions_completed,
+                "router/scheduling_remaining_actions": runtime_state.remaining_actions,
+                "router/affinity_candidate": int(affinity_candidate),
+                "router/affinity_cache_valid": int(affinity_cache_valid),
+                "router/affinity_selected": int(route_reason == "affinity"),
+                "router/load_override": int(
+                    route_reason in ("load_override", "prefix_load_override")
+                ),
+                "router/least_loaded_selected": int(route_reason == "least_loaded"),
+                "router/working_set_prefix_selected": int(
+                    route_reason == "prefix_locality"
+                ),
+                "router/rebuild_selected": int(route_reason == "rebuild"),
+                "router/rebuild_candidate_request": int(rebuild_candidate),
+                "router/version_runtime_plan_request": int(bool(self.runtime_plan)),
+                "router/priority_queued_requests": int(priority_was_queued),
+                "router/priority_queue_depth": priority_queue_depth,
+                "router/selected_worker_pressure": selected_pressure,
+                "router/soft_locality_estimated_cached_tokens": estimated_cached_tokens,
+            })
+            if rebuild_request:
+                response.setdefault("metrics", {}).update({
+                    "router/post_update_rebuild_request": 1,
+                    "router/post_update_rebuild_lcp_tokens": rebuild_lcp_tokens,
+                    "router/post_update_rebuild_dp_rank": dp_rank,
+                })
+            return response
         finally:
             self.running_requests[dp_rank].remove(request_id)
             # Cleanup tracking (on both success and abort paths)
@@ -1007,12 +1505,18 @@ class EnvAffinityRouter(Router):
             if has_priority_slot:
                 await self._release_priority_slot(dp_rank)
 
-    async def _acquire_priority_slot(self, dp_rank: int, priority, request_id: str) -> bool:
+    async def _acquire_priority_slot(self, dp_rank: int, priority, request_id: str):
         if priority is None or self.max_running_requests <= 0:
-            return False
+            return False, 0, False
         condition = self.priority_conditions[dp_rank]
-        entry = (int(priority), next(self.priority_sequence), request_id)
+        runtime_state = TrajectoryRuntimeState.from_priority(priority, request_id)
+        entry = (runtime_state.priority_key, next(self.priority_sequence), request_id)
         async with condition:
+            queue_depth = len(self.priority_waiters[dp_rank])
+            was_queued = (
+                queue_depth > 0
+                or self.priority_inflight[dp_rank] >= self.max_running_requests
+            )
             heapq.heappush(self.priority_waiters[dp_rank], entry)
             try:
                 while (
@@ -1023,7 +1527,7 @@ class EnvAffinityRouter(Router):
                 heapq.heappop(self.priority_waiters[dp_rank])
                 self.priority_inflight[dp_rank] += 1
                 condition.notify_all()
-                return True
+                return True, queue_depth, was_queued
             except BaseException:
                 try:
                     self.priority_waiters[dp_rank].remove(entry)
@@ -1075,6 +1579,12 @@ class EnvAffinityRouter(Router):
 
         # Return dp_rank with minimum src_rank count
         return min(candidate_ranks, key=lambda r: src_rank_count[r])
+
+    def _worker_pressure(self) -> Dict[int, int]:
+        return {
+            dp_rank: len(self.running_requests[dp_rank]) + len(self.priority_waiters[dp_rank])
+            for dp_rank in self.active_dp_ranks
+        }
 
     def _clear_src_rank_mappings(self, src_ranks: Set[int]) -> None:
         """Clear sticky mappings to allow re-routing on retry."""

@@ -328,9 +328,10 @@ class AgenticConfig(PPOConfig):
             self.train_env_manager.max_traj_per_env = traj_per_env
         logger.info(f"train_env_manager.max_traj_per_env: {self.train_env_manager.max_traj_per_env}")
         assert self.train_env_manager.max_traj_per_env >= traj_per_env, f"max_traj_per_env must be >= {traj_per_env}"
-        if self.trajectory_admission_policy == "outstanding_watermark":
+        if self.trajectory_admission_policy in ("outstanding_watermark", "version_adaptive"):
             assert self.rollout_batch_size > 0, (
-                "outstanding_watermark admission requires a finite positive rollout_batch_size"
+                f"{self.trajectory_admission_policy} admission requires a finite positive "
+                "rollout_batch_size"
             )
             if self.max_outstanding_trajectories is not None:
                 min_group_width = (
@@ -340,6 +341,65 @@ class AgenticConfig(PPOConfig):
                 assert self.max_outstanding_trajectories >= min_group_width, (
                     "max_outstanding_trajectories must admit at least one complete rollout group "
                     f"({min_group_width})"
+                )
+        if self.trajectory_admission_policy == "version_adaptive":
+            assert self.adaptive_admission_reserve_trajectories >= 0, (
+                "adaptive_admission_reserve_trajectories must be non-negative"
+            )
+            assert 0 <= self.adaptive_admission_initial_finish_ratio <= 1, (
+                "adaptive_admission_initial_finish_ratio must be in [0, 1]"
+            )
+            assert 0 < self.adaptive_admission_ewma_alpha <= 1, (
+                "adaptive_admission_ewma_alpha must be in (0, 1]"
+            )
+            if self.dynamic_admission_reserve_enabled:
+                assert self.dynamic_admission_reserve_min >= 0, (
+                    "dynamic_admission_reserve_min must be non-negative"
+                )
+                assert self.dynamic_admission_reserve_max >= self.dynamic_admission_reserve_min, (
+                    "dynamic_admission_reserve_max must be >= dynamic_admission_reserve_min"
+                )
+                assert self.dynamic_admission_reserve_additive_step > 0, (
+                    "dynamic_admission_reserve_additive_step must be positive"
+                )
+                assert 0 < self.dynamic_admission_reserve_multiplicative_decay < 1, (
+                    "dynamic_admission_reserve_multiplicative_decay must be in (0, 1)"
+                )
+                assert self.dynamic_admission_reserve_warmup_versions >= 0, (
+                    "dynamic_admission_reserve_warmup_versions must be non-negative"
+                )
+                assert self.dynamic_admission_reserve_wait_high_seconds >= 0, (
+                    "dynamic_admission_reserve_wait_high_seconds must be non-negative"
+                )
+                assert self.dynamic_admission_reserve_stale_high >= 0, (
+                    "dynamic_admission_reserve_stale_high must be non-negative"
+                )
+                assert self.dynamic_admission_reserve_prediction_error_margin >= 0, (
+                    "dynamic_admission_reserve_prediction_error_margin must be non-negative"
+                )
+                assert 0 < self.dynamic_admission_reserve_ewma_alpha <= 1, (
+                    "dynamic_admission_reserve_ewma_alpha must be in (0, 1]"
+                )
+                assert self.dynamic_admission_reserve_signal_patience > 0, (
+                    "dynamic_admission_reserve_signal_patience must be positive"
+                )
+                assert self.dynamic_admission_reserve_cooldown_versions >= 0, (
+                    "dynamic_admission_reserve_cooldown_versions must be non-negative"
+                )
+                assert self.dynamic_admission_utility_window_versions > 0, (
+                    "dynamic_admission_utility_window_versions must be positive"
+                )
+                assert self.dynamic_admission_utility_waste_weight >= 0, (
+                    "dynamic_admission_utility_waste_weight must be non-negative"
+                )
+                assert self.dynamic_admission_utility_improvement_margin >= 0, (
+                    "dynamic_admission_utility_improvement_margin must be non-negative"
+                )
+                assert self.dynamic_admission_utility_settle_versions >= 0, (
+                    "dynamic_admission_utility_settle_versions must be non-negative"
+                )
+                assert 0 < self.dynamic_admission_utility_min_compute_efficiency <= 1, (
+                    "dynamic_admission_utility_min_compute_efficiency must be in (0, 1]"
                 )
 
         # Validate rollout_batch_size is compatible with group_size

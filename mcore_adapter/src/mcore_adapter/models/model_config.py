@@ -11,7 +11,11 @@ from typing import TYPE_CHECKING, Literal, Optional
 import torch
 import torch.nn.functional as F
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
-from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+try:
+    from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+except ModuleNotFoundError:
+    class PipelineParallelLayerLayout:
+        pass
 from transformers import AutoConfig
 from transformers.configuration_utils import CONFIG_NAME as HF_CONFIG_NAME
 
