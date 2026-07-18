@@ -37,6 +37,7 @@ class TrajectoryRuntimeState:
     max_actions: int
     group_id: int = -1
     episode_id: int = -1
+    env_id: int = -1
 
     @property
     def remaining_actions(self) -> int:
@@ -75,6 +76,7 @@ class TrajectoryRuntimeState:
                 max_actions=max(actions_completed, max_actions),
                 group_id=int(priority.get("group_id", -1)),
                 episode_id=int(priority.get("episode_id", -1)),
+                env_id=int(priority.get("env_id", -1)),
             )
         policy_version = int(priority or 0)
         return cls(
@@ -85,6 +87,132 @@ class TrajectoryRuntimeState:
             actions_completed=0,
             max_actions=0,
         )
+
+
+def build_runtime_priority_key(
+    runtime_state: TrajectoryRuntimeState,
+    planned_candidate_ranks: Dict[str, int],
+):
+    """Combine the boundary plan with request-local version/progress state."""
+    if not planned_candidate_ranks:
+        return runtime_state.priority_key
+    candidate_rank = planned_candidate_ranks.get(runtime_state.group_key)
+    return (
+        int(candidate_rank is None),
+        (
+            len(planned_candidate_ranks)
+            if candidate_rank is None
+            else int(candidate_rank)
+        ),
+        *runtime_state.priority_key,
+    )
+
+
+def build_router_progress_snapshot(
+    runtime_state: TrajectoryRuntimeState, prompt_tokens: int
+) -> Dict[str, Any]:
+    """Expose scheduling progress already carried by an inference request."""
+    return {
+        "trajectory_id": runtime_state.trajectory_id,
+        "group_id": runtime_state.group_id,
+        "episode_id": runtime_state.episode_id,
+        "env_id": runtime_state.env_id,
+        "version_start": runtime_state.policy_version,
+        "version_end": runtime_state.current_version,
+        "version_age": runtime_state.version_age,
+        "reset_completed": True,
+        "completed": False,
+        "truncated": False,
+        "actions_completed": runtime_state.actions_completed,
+        "inference_calls": runtime_state.actions_completed,
+        "tool_calls": 0,
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "inference_tokens": 0,
+        "latest_prompt_tokens": max(0, int(prompt_tokens)),
+        "latest_response_tokens": 0,
+        "current_context_tokens": max(0, int(prompt_tokens)),
+        "max_actions": runtime_state.max_actions,
+        "remaining_actions": runtime_state.remaining_actions,
+        "runtime_phase": "router_last_request",
+        "generate_seconds": 0.0,
+        "env_seconds": 0.0,
+        "trajectory_wall_seconds": 0.0,
+        "progress_source": "router",
+    }
+
+
+def build_boundary_recovery_record(
+    runtime_state: TrajectoryRuntimeState,
+    *,
+    cache_epoch: int,
+    boundary_version: Any,
+    worker_rank: int,
+    route_reason: str,
+    prompt_tokens: int,
+    response_metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Describe a survivor's first request in a new cache epoch."""
+    cached_tokens = response_metrics.get("vllm/request_cached_prompt_tokens")
+    prefill_tokens = response_metrics.get("vllm/request_prefill_tokens")
+    resolved_boundary_version = int(
+        runtime_state.current_version
+        if boundary_version is None else boundary_version
+    )
+    record = {
+        "trajectory_id": runtime_state.trajectory_id,
+        "group_id": runtime_state.group_id,
+        "episode_id": runtime_state.episode_id,
+        "policy_version": runtime_state.policy_version,
+        "boundary_version": resolved_boundary_version,
+        "version_age": max(
+            0,
+            resolved_boundary_version - runtime_state.policy_version,
+        ),
+        "actions_completed": runtime_state.actions_completed,
+        "remaining_actions": runtime_state.remaining_actions,
+        "cache_epoch": int(cache_epoch),
+        "worker_rank": int(worker_rank),
+        "route_reason": str(route_reason),
+        "logical_prompt_tokens": max(0, int(prompt_tokens)),
+        "reported_cached_prompt_tokens": (
+            None if cached_tokens is None else max(0, int(cached_tokens))
+        ),
+        "reported_prefill_tokens": (
+            None if prefill_tokens is None else max(0, int(prefill_tokens))
+        ),
+    }
+    record["logical_reprefill_exposure_tokens"] = (
+        record["reported_prefill_tokens"]
+        if record["reported_prefill_tokens"] is not None
+        else max(
+            0,
+            record["logical_prompt_tokens"]
+            - (record["reported_cached_prompt_tokens"] or 0),
+        )
+    )
+    record["reprefill_measurement"] = (
+        "engine_reported_prefill"
+        if record["reported_prefill_tokens"] is not None
+        else (
+            "request_cached_tokens"
+            if record["reported_cached_prompt_tokens"] is not None
+            else "logical_prompt_upper_bound"
+        )
+    )
+    return record
+
+
+def is_post_boundary_request(
+    runtime_state: TrajectoryRuntimeState,
+    boundary_version: Any,
+) -> bool:
+    """Return whether this trajectory started before the active cache epoch."""
+    resolved_boundary_version = int(
+        runtime_state.current_version
+        if boundary_version is None else boundary_version
+    )
+    return resolved_boundary_version > runtime_state.policy_version
 
 
 def select_soft_locality_worker(
@@ -428,6 +556,12 @@ class RouterManager:
                 metrics.get("router/rebuild_candidate_request", 0.0)
                 / scheduling_decisions
             )
+            metrics["router/planned_priority_candidate_request_ratio"] = (
+                metrics.get(
+                    "router/planned_priority_candidate_request", 0.0
+                )
+                / scheduling_decisions
+            )
             metrics["router/priority_queued_ratio"] = (
                 metrics.get("router/priority_queued_requests", 0.0)
                 / scheduling_decisions
@@ -438,6 +572,12 @@ class RouterManager:
             )
         self.request_metric_totals.clear()
         return metrics
+
+    def collect_version_boundary_profile(self):
+        return self.router.collect_version_boundary_profile()
+
+    def collect_trajectory_progress(self):
+        return self.router.collect_trajectory_progress()
 
     async def abort_requests(self, request_ids, uid):
         return await self.router.abort_requests(request_ids, uid)
@@ -976,6 +1116,12 @@ class Router:
         """Notify routers that model weights and prefix-cache generation changed."""
         return None
 
+    def collect_version_boundary_profile(self):
+        return {"metrics": {}, "records": []}
+
+    def collect_trajectory_progress(self):
+        return []
+
     async def rebalance_on_shrink(self, shrink_dp_ranks: List[int]) -> Dict[str, int]:
         raise NotImplementedError
 
@@ -1266,7 +1412,8 @@ class EnvAffinityRouter(Router):
         self.priority_waiters = [[] for _ in self.workers]
         self.priority_inflight = [0 for _ in self.workers]
         self.priority_conditions = [asyncio.Condition() for _ in self.workers]
-        config = self.router_args.router_config or {}
+        self.priority_candidate_ranks: Dict[str, int] = {}
+        config = getattr(self.router_args, "router_config", None) or {}
         self.post_update_rebuild_enabled = bool(
             config.get("post_update_rebuild_enabled", False)
         )
@@ -1304,6 +1451,8 @@ class EnvAffinityRouter(Router):
         self.rebuild_assigned_counts = defaultdict(int)
         self.working_set_worker_prompts = defaultdict(list)
         self.runtime_plan = {}
+        self.boundary_recovery_records: List[Dict[str, Any]] = []
+        self.latest_trajectory_progress: Dict[str, Dict[str, Any]] = {}
 
     def on_version_resume(self, version=None):
         plan = dict(version) if isinstance(version, dict) else {"version": version}
@@ -1313,6 +1462,15 @@ class EnvAffinityRouter(Router):
         self.cache_epoch += 1
         self.rebuild_epoch = epoch
         self.runtime_plan = plan
+        priority_candidates = (
+            plan.get("priority_candidate_groups", [])
+            if bool(plan.get("priority_enabled", False))
+            else []
+        )
+        self.priority_candidate_ranks = {
+            str(group_key): rank
+            for rank, group_key in enumerate(priority_candidates)
+        }
         self.rebuild_candidate_groups = set(plan.get("rebuild_candidate_groups", []))
         planned_target = int(
             plan.get("rebuild_target_trajectories", self.post_update_rebuild_requests)
@@ -1338,22 +1496,48 @@ class EnvAffinityRouter(Router):
             self.src_rank_cache_epoch.clear()
             self.src_rank_last_prompt_tokens.clear()
 
+    def _observe_first_epoch_request(self, trajectory_id: str) -> bool:
+        if trajectory_id in self.rebuild_seen_trajectories:
+            return False
+        self.rebuild_seen_trajectories.add(trajectory_id)
+        self.rebuild_observe_remaining = max(0, self.rebuild_observe_remaining - 1)
+        return True
+
     async def generate_request(self, payload, request_id, uid, priority=None):
         src_rank = uid
         runtime_state = TrajectoryRuntimeState.from_priority(priority, src_rank)
-        routing_key = runtime_state.trajectory_id if isinstance(priority, dict) else src_rank
+        scheduling_enabled = not isinstance(priority, dict) or bool(
+            priority.get("scheduling_enabled", True)
+        )
+        routing_key = runtime_state.trajectory_id if scheduling_enabled else src_rank
+        epoch_trajectory_id = (
+            runtime_state.trajectory_id if isinstance(priority, dict) else str(routing_key)
+        )
         prompt_tokens = payload.get("input_ids", [])
+        if runtime_state.group_id >= 0 and runtime_state.episode_id >= 0:
+            self.latest_trajectory_progress[runtime_state.trajectory_id] = (
+                build_router_progress_snapshot(runtime_state, len(prompt_tokens))
+            )
+            while len(self.latest_trajectory_progress) > 4096:
+                self.latest_trajectory_progress.pop(next(iter(self.latest_trajectory_progress)))
         decision_started = time.perf_counter()
         rebuild_request = False
         rebuild_lcp_tokens = 0
         rebuild_candidate = runtime_state.group_key in self.rebuild_candidate_groups
+        priority_candidate = (
+            runtime_state.group_key in self.priority_candidate_ranks
+        )
         route_reason = "least_loaded"
         affinity_candidate = False
         affinity_cache_valid = False
         estimated_cached_tokens = 0
         selected_pressure = 0
+        first_epoch_request = False
         # Atomic routing assignment under lock to prevent TOCTOU race with shrink/expand
         async with self.routing_lock:
+            first_epoch_request = self._observe_first_epoch_request(
+                epoch_trajectory_id
+            )
             affinity_rank = self.src_rank2_dp_rank.get(routing_key)
             affinity_candidate = affinity_rank is not None
             affinity_cache_valid = (
@@ -1368,12 +1552,6 @@ class EnvAffinityRouter(Router):
                 )
 
             if affinity_rank is None:
-                first_epoch_request = routing_key not in self.rebuild_seen_trajectories
-                if first_epoch_request:
-                    self.rebuild_seen_trajectories.add(routing_key)
-                    self.rebuild_observe_remaining = max(
-                        0, self.rebuild_observe_remaining - 1
-                    )
                 rebuild_fallback = (
                     not self.rebuild_candidate_groups
                     or self.rebuild_observe_remaining <= self.rebuild_remaining
@@ -1452,6 +1630,21 @@ class EnvAffinityRouter(Router):
 
         try:
             response = await self.workers[dp_rank].generate_request.remote(payload)
+            if first_epoch_request and is_post_boundary_request(
+                runtime_state,
+                self.rebuild_epoch,
+            ):
+                self.boundary_recovery_records.append(
+                    build_boundary_recovery_record(
+                        runtime_state,
+                        cache_epoch=self.cache_epoch,
+                        boundary_version=self.rebuild_epoch,
+                        worker_rank=dp_rank,
+                        route_reason=route_reason,
+                        prompt_tokens=len(prompt_tokens),
+                        response_metrics=response.get("metrics", {}),
+                    )
+                )
             finish_reasons = response.get("finish_reasons", [])
             if not any(reason == "abort" for reason in finish_reasons):
                 self.src_rank_cache_epoch[routing_key] = self.cache_epoch
@@ -1485,6 +1678,9 @@ class EnvAffinityRouter(Router):
                 ),
                 "router/rebuild_selected": int(route_reason == "rebuild"),
                 "router/rebuild_candidate_request": int(rebuild_candidate),
+                "router/planned_priority_candidate_request": int(
+                    priority_candidate
+                ),
                 "router/version_runtime_plan_request": int(bool(self.runtime_plan)),
                 "router/priority_queued_requests": int(priority_was_queued),
                 "router/priority_queue_depth": priority_queue_depth,
@@ -1505,12 +1701,47 @@ class EnvAffinityRouter(Router):
             if has_priority_slot:
                 await self._release_priority_slot(dp_rank)
 
+    def collect_version_boundary_profile(self):
+        records = list(self.boundary_recovery_records)
+        return {
+            "metrics": {
+                "survivor_first_requests": len(records),
+                "logical_prompt_tokens": sum(
+                    int(record["logical_prompt_tokens"]) for record in records
+                ),
+                "logical_reprefill_exposure_tokens": sum(
+                    int(record["logical_reprefill_exposure_tokens"])
+                    for record in records
+                ),
+                "engine_reported_records": sum(
+                    record["reported_prefill_tokens"] is not None for record in records
+                ),
+                "engine_reported_prefill_tokens": sum(
+                    int(record["reported_prefill_tokens"] or 0) for record in records
+                ),
+            },
+            "records": records,
+        }
+
+    def collect_trajectory_progress(self):
+        return list(self.latest_trajectory_progress.values())
+
     async def _acquire_priority_slot(self, dp_rank: int, priority, request_id: str):
-        if priority is None or self.max_running_requests <= 0:
+        if (
+            priority is None
+            or self.max_running_requests <= 0
+            or (
+                isinstance(priority, dict)
+                and not bool(priority.get("scheduling_enabled", True))
+            )
+        ):
             return False, 0, False
         condition = self.priority_conditions[dp_rank]
         runtime_state = TrajectoryRuntimeState.from_priority(priority, request_id)
-        entry = (runtime_state.priority_key, next(self.priority_sequence), request_id)
+        runtime_priority_key = build_runtime_priority_key(
+            runtime_state, self.priority_candidate_ranks
+        )
+        entry = (runtime_priority_key, next(self.priority_sequence), request_id)
         async with condition:
             queue_depth = len(self.priority_waiters[dp_rank])
             was_queued = (

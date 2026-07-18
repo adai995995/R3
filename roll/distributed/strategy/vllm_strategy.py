@@ -407,8 +407,9 @@ class VllmStrategy(InferenceStrategy):
         result["metrics"] = {
             "vllm/request_prompt_tokens": prompt_tokens,
         }
-        # V1 0.8.4 declares num_cached_tokens but never populates it. Do not
-        # publish a false zero; engine-level scheduler deltas below are exact.
+        # The ROLL vLLM 0.8.4 compatibility hook populates this field from the
+        # scheduler's exact initial computed-prefix length. Keep the fallback
+        # for native/future engines that do not expose a per-request value.
         if observed_cached_prompt_tokens is not None:
             cached_prompt_tokens = min(
                 prompt_tokens, max(0, observed_cached_prompt_tokens)

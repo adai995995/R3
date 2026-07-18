@@ -230,6 +230,7 @@ class TrajEnvManager(BaseEnvManager):
             "trajectory_id": f"{traj_group_id}_{self.rollout_cache.env_id}",
             "group_id": int(self.rollout_cache.group_id),
             "episode_id": int(self.episode_id),
+            "env_id": int(self.rollout_cache.env_id),
             "policy_version": int(self.trajectory_version),
             "current_version": current_version,
             "version_age": max(0, current_version - int(self.trajectory_version)),
@@ -254,8 +255,16 @@ class TrajEnvManager(BaseEnvManager):
         generation_config = self.worker_config.generating_args.to_dict()
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
-        if getattr(self.pipeline_config, "trajectory_scheduling_policy", "fifo") == "version_priority":
-            lm_input.meta_info["trajectory_priority"] = self._trajectory_runtime_state()
+        scheduling_enabled = (
+            getattr(self.pipeline_config, "trajectory_scheduling_policy", "fifo")
+            == "version_priority"
+        )
+        if scheduling_enabled or getattr(
+            self.pipeline_config, "version_boundary_profiler_enabled", False
+        ):
+            runtime_state = self._trajectory_runtime_state()
+            runtime_state["scheduling_enabled"] = scheduling_enabled
+            lm_input.meta_info["trajectory_priority"] = runtime_state
 
         input_messages = [item for items in self.rollout_cache.history for item in items["messages"]]
 

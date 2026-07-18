@@ -531,6 +531,24 @@ class PPOConfig(BaseConfig):
             )
         },
     )
+    version_boundary_profiler_enabled: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Record per-policy-update trajectory state and post-update survivor recovery "
+                "costs for AgenticRL runtime analysis."
+            )
+        },
+    )
+    version_boundary_profiler_max_records: int = field(
+        default=4096,
+        metadata={
+            "help": (
+                "Maximum per-trajectory records retained for one policy-version boundary. "
+                "Aggregate boundary counters are never truncated."
+            )
+        },
+    )
     trajectory_admission_policy: Literal["step", "outstanding_watermark", "version_adaptive"] = field(
         default="step",
         metadata={

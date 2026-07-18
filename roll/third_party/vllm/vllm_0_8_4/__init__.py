@@ -12,6 +12,13 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.output_processor import OutputProcessor
 
 from roll.third_party.vllm.async_llm import CustomAsyncLLM
+from roll.third_party.vllm.vllm_0_8_4.request_kv_metrics import (
+    install_request_kv_metrics_patch,
+    populate_request_cached_tokens,
+)
+
+
+install_request_kv_metrics_patch()
 
 async def generate(
     self,
@@ -39,12 +46,17 @@ async def generate(
         )
 
         finished = False
+        cached_tokens_populated = False
         while not finished:
             out = q.get_nowait() or await q.get()
 
             if isinstance(out, BaseException) or (isinstance(out, type) and issubclass(out, BaseException)):
                 # raise asyncio.CancelledError, will not cause dead recursive
                 raise out
+
+            if not cached_tokens_populated:
+                await populate_request_cached_tokens(self, request_id, out)
+                cached_tokens_populated = True
 
             finished = out.finished
             yield out
