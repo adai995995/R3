@@ -1,0 +1,47 @@
+defaults:
+  - agent_val_webshop_qwen3_4b_version_runtime_closed_loop_4step
+  - _self_
+
+exp_name: webshop_qwen3_4b_version_runtime_closed_loop_pressure_6step
+output_dir: ./output/webshop_qwen3_4b_version_runtime_closed_loop_pressure_6step
+render_save_dir: ./output/webshop_qwen3_4b_version_runtime_closed_loop_pressure_6step/render
+checkpoint_config:
+  type: file_system
+  output_dir: ./output/webshop_qwen3_4b_version_runtime_closed_loop_pressure_6step/checkpoints
+
+max_steps: 6
+eval_steps: 0
+save_steps: -1
+enable_checkpointing: false
+save_final_checkpoint: false
+resume_from_checkpoint: false
+
+seed: 49
+rollout_seed: 49
+train_env_manager:
+  group_seed_base: 494900
+
+# Trigger same-version reconciliation before a slow multi-turn batch finishes.
+version_runtime_reconcile_interval_seconds: 0.25
+version_runtime_reconcile_wait_seconds: 0.5
+version_runtime_max_revisions_per_version: 6
+dynamic_admission_reserve_enabled: false
+
+router_args:
+  router_name: EnvAffinityRouter
+  max_running_requests: 128
+  router_config:
+    priority_max_running_requests: 1
+    # Keep normal priority service strict, but admit a bounded first-wave burst so
+    # vLLM can batch unrelated full-prefill survivors after a version update.
+    priority_rebuild_max_running_requests: 4
+    priority_coalesce_seconds: 0.03
+    post_update_rebuild_enabled: true
+    post_update_rebuild_requests: 16
+    post_update_rebuild_observe_requests: 32
+    post_update_rebuild_prefix_tokens: 2048
+    post_update_rebuild_coalesce_seconds: 0.03
+    working_set_routing_enabled: true
+    working_set_max_prompts_per_worker: 64
+    soft_locality_enabled: true
+    soft_locality_load_slack: 1

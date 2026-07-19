@@ -1,0 +1,20 @@
+defaults:
+  - agent_val_webshop_qwen3_4b_version_runtime_closed_loop_batch8_4step
+  - _self_
+
+exp_name: webshop_qwen3_4b_version_runtime_engine_batch_probe_2step
+output_dir: ./output/webshop_qwen3_4b_version_runtime_engine_batch_probe_2step
+render_save_dir: ./output/webshop_qwen3_4b_version_runtime_engine_batch_probe_2step/render
+checkpoint_config:
+  type: file_system
+  output_dir: ./output/webshop_qwen3_4b_version_runtime_engine_batch_probe_2step/checkpoints
+
+max_steps: 2
+enable_checkpointing: false
+save_final_checkpoint: false
+resume_from_checkpoint: false
+
+seed: 51
+rollout_seed: 51
+train_env_manager:
+  group_seed_base: 515100

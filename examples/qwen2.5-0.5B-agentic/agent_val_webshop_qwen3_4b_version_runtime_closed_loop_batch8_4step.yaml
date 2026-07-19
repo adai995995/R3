@@ -1,0 +1,24 @@
+defaults:
+  - agent_val_webshop_qwen3_4b_version_runtime_closed_loop_pressure_6step
+  - _self_
+
+exp_name: webshop_qwen3_4b_version_runtime_closed_loop_batch8_4step
+output_dir: ./output/webshop_qwen3_4b_version_runtime_closed_loop_batch8_4step
+render_save_dir: ./output/webshop_qwen3_4b_version_runtime_closed_loop_batch8_4step/render
+checkpoint_config:
+  type: file_system
+  output_dir: ./output/webshop_qwen3_4b_version_runtime_closed_loop_batch8_4step/checkpoints
+
+max_steps: 4
+rollout_batch_size: 8
+max_outstanding_trajectories: 48
+adaptive_admission_reserve_trajectories: 8
+
+enable_checkpointing: false
+save_final_checkpoint: false
+resume_from_checkpoint: false
+
+seed: 50
+rollout_seed: 50
+train_env_manager:
+  group_seed_base: 505000
