@@ -358,6 +358,28 @@ class VllmStrategy(InferenceStrategy):
                 lora_int_id = lora_int_ids[0]
                 lora_request = LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="dummy_lora_path")
 
+        rebuild_admission_marked = bool(payload.get("_roll_prefill_rebuild", False))
+        rebuild_marker_registered = False
+        if (
+            rebuild_admission_marked
+            and Version(vllm.__version__) == Version("0.8.4")
+        ):
+            from roll.third_party.vllm.vllm_0_8_4.request_kv_metrics import (
+                MARK_REBUILD_REQUEST_UTILITY,
+            )
+
+            try:
+                await self.model.engine_core.call_utility_async(
+                    MARK_REBUILD_REQUEST_UTILITY,
+                    payload["rid"],
+                )
+                rebuild_marker_registered = True
+            except Exception:
+                logger.warning(
+                    "Failed to register rebuild request with vLLM EngineCore",
+                    exc_info=True,
+                )
+
         result_generator = self.model.generate(
             prompt=prompt,
             sampling_params=SamplingParams(**payload["sampling_params"]),
@@ -366,6 +388,8 @@ class VllmStrategy(InferenceStrategy):
         )
         output: Optional[RequestOutput] = None
         observed_cached_prompt_tokens = None
+        observed_scheduler_batch_id = None
+        observed_scheduler_batch_size = None
         # vLLM support partial rollout in v1 from 0.10.1, and will return finished output
         # with finish_reason setted no matter what RequestOutputKind is.
         # For compatibility, the following except block are only for v0 and older version of v1.
@@ -376,6 +400,14 @@ class VllmStrategy(InferenceStrategy):
                     observed_cached_prompt_tokens = max(
                         observed_cached_prompt_tokens or 0,
                         int(result.num_cached_tokens),
+                    )
+                if getattr(result, "roll_scheduler_batch_id", None) is not None:
+                    observed_scheduler_batch_id = int(
+                        result.roll_scheduler_batch_id
+                    )
+                if getattr(result, "roll_scheduler_batch_size", None) is not None:
+                    observed_scheduler_batch_size = int(
+                        result.roll_scheduler_batch_size
                     )
         except asyncio.CancelledError:
             if output is None:
@@ -406,6 +438,10 @@ class VllmStrategy(InferenceStrategy):
         )
         result["metrics"] = {
             "vllm/request_prompt_tokens": prompt_tokens,
+            "vllm/rebuild_admission_marked": int(rebuild_admission_marked),
+            "vllm/rebuild_admission_marker_registered": int(
+                rebuild_marker_registered
+            ),
         }
         # The ROLL vLLM 0.8.4 compatibility hook populates this field from the
         # scheduler's exact initial computed-prefix length. Keep the fallback
@@ -422,6 +458,15 @@ class VllmStrategy(InferenceStrategy):
                         cached_prompt_tokens / prompt_tokens if prompt_tokens else 0.0
                     ),
                 }
+            )
+        if observed_scheduler_batch_id is not None:
+            result["metrics"]["vllm/request_scheduler_batch_id"] = (
+                observed_scheduler_batch_id
+            )
+            result["metrics"]["vllm/request_scheduler_batch_reported"] = 1
+        if observed_scheduler_batch_size is not None:
+            result["metrics"]["vllm/request_scheduler_batch_size"] = (
+                observed_scheduler_batch_size
             )
         # Concurrent requests share an engine logger. Draining on completion
         # attributes deltas arbitrarily, but summing responses is exact.

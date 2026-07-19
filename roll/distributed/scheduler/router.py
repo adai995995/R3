@@ -9,7 +9,7 @@ import weakref
 from abc import abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, MutableMapping, Optional, Set
 from urllib.parse import quote
 
 import ray
@@ -25,6 +25,147 @@ from roll.utils.logging import get_logger
 
 
 logger = get_logger()
+
+
+def update_request_metric_totals(
+    totals: MutableMapping[str, float], request_metrics: Dict[str, Any]
+) -> None:
+    """Accumulate one completed request, including rebuild-only token totals."""
+    for name, value in request_metrics.items():
+        # Per-request ratios are observations, not additive counters. The
+        # aggregate ratio is derived from summed token/block counters below.
+        if name in (
+            "vllm/request_kv_hit_ratio",
+            "vllm/request_scheduler_batch_id",
+        ):
+            continue
+        if isinstance(value, (int, float)):
+            totals[name] += float(value)
+    if not request_metrics.get("router/post_update_rebuild_request", 0):
+        return
+    totals["router/rebuild_prompt_tokens"] += float(
+        request_metrics.get("vllm/request_prompt_tokens", 0)
+    )
+    if "vllm/request_cached_prompt_tokens" in request_metrics:
+        totals["router/rebuild_cached_prompt_tokens"] += float(
+            request_metrics["vllm/request_cached_prompt_tokens"]
+        )
+    if "vllm/request_prefill_tokens" in request_metrics:
+        totals["router/rebuild_prefill_tokens"] += float(
+            request_metrics["vllm/request_prefill_tokens"]
+        )
+
+
+def summarize_request_metric_totals(
+    totals: Dict[str, float], *, scope: str
+) -> Dict[str, float]:
+    """Derive comparable KV and scheduling rates from additive counters."""
+    metrics = dict(totals)
+    prompt_tokens = metrics.get("vllm/request_prompt_tokens", 0.0)
+    cached_tokens = metrics.get("vllm/request_cached_prompt_tokens")
+    if cached_tokens is not None:
+        metrics[f"vllm/{scope}_kv_hit_ratio"] = (
+            cached_tokens / prompt_tokens if prompt_tokens else 0.0
+        )
+    rebuild_prompt = metrics.get("router/rebuild_prompt_tokens", 0.0)
+    rebuild_cached = metrics.get("router/rebuild_cached_prompt_tokens")
+    if rebuild_cached is not None:
+        metrics["router/rebuild_kv_hit_ratio"] = (
+            rebuild_cached / rebuild_prompt if rebuild_prompt else 0.0
+        )
+    query_blocks = metrics.get(
+        "vllm/engine_prefix_cache_query_blocks_delta", 0.0
+    )
+    hit_blocks = metrics.get(
+        "vllm/engine_prefix_cache_hit_blocks_delta", 0.0
+    )
+    engine_cached_tokens = metrics.get(
+        "vllm/engine_prefix_cache_cached_tokens_delta", 0.0
+    )
+    metrics.update(
+        {
+            "router/kv_cache_requests": metrics.get(
+                "vllm/engine_prefix_cache_requests_delta", 0.0
+            ),
+            "router/kv_query_blocks": query_blocks,
+            "router/kv_hit_blocks": hit_blocks,
+            "router/kv_query_tokens": metrics.get(
+                "vllm/engine_prefix_cache_query_tokens_delta", 0.0
+            ),
+            "router/kv_cached_tokens": engine_cached_tokens,
+            "router/kv_saved_prefill_tokens": engine_cached_tokens,
+            "router/kv_cacheable_reprefill_tokens": max(
+                0.0,
+                metrics.get("vllm/engine_prefix_cache_query_tokens_delta", 0.0)
+                - engine_cached_tokens,
+            ),
+            "router/kv_block_hit_ratio": (
+                hit_blocks / query_blocks if query_blocks else 0.0
+            ),
+            "router/kv_cache_resets": metrics.get(
+                "vllm/engine_prefix_cache_resets_delta", 0.0
+            ),
+        }
+    )
+    scheduling_decisions = metrics.get("router/scheduling_decisions", 0.0)
+    if scheduling_decisions:
+        for total_name, derived_name in (
+            ("router/scheduling_wait_seconds", "router/scheduling_wait_seconds_mean"),
+            (
+                "router/scheduling_decision_seconds",
+                "router/scheduling_decision_seconds_mean",
+            ),
+            ("router/selected_worker_pressure", "router/selected_worker_pressure_mean"),
+            ("router/affinity_selected", "router/affinity_selected_ratio"),
+            ("router/load_override", "router/load_override_ratio"),
+            ("router/least_loaded_selected", "router/least_loaded_selected_ratio"),
+            (
+                "router/working_set_prefix_selected",
+                "router/working_set_prefix_selected_ratio",
+            ),
+            (
+                "router/rebuild_candidate_request",
+                "router/rebuild_candidate_request_ratio",
+            ),
+            (
+                "router/planned_priority_candidate_request",
+                "router/planned_priority_candidate_request_ratio",
+            ),
+            ("router/priority_queued_requests", "router/priority_queued_ratio"),
+            (
+                "router/priority_coalesced_requests",
+                "router/priority_coalesced_ratio",
+            ),
+            (
+                "router/priority_reordered_requests",
+                "router/priority_reordered_ratio",
+            ),
+            ("router/priority_queue_depth", "router/priority_queue_depth_mean"),
+            (
+                "router/engine_kv_feedback_requests",
+                "router/engine_kv_feedback_ratio",
+            ),
+        ):
+            metrics[derived_name] = (
+                metrics.get(total_name, 0.0) / scheduling_decisions
+            )
+    rebuild_requests = metrics.get("router/post_update_rebuild_request", 0.0)
+    if rebuild_requests:
+        metrics["router/post_update_rebuild_wave_size_mean"] = (
+            metrics.get("router/post_update_rebuild_wave_size", 0.0)
+            / rebuild_requests
+        )
+        metrics["router/post_update_rebuild_coalesced_ratio"] = (
+            metrics.get("router/post_update_rebuild_coalesced", 0.0)
+            / rebuild_requests
+        )
+    batch_reported = metrics.get("vllm/request_scheduler_batch_reported", 0.0)
+    if batch_reported:
+        metrics["vllm/request_scheduler_batch_size_mean"] = (
+            metrics.get("vllm/request_scheduler_batch_size", 0.0)
+            / batch_reported
+        )
+    return metrics
 
 
 @dataclass(frozen=True)
@@ -180,6 +321,12 @@ def build_boundary_recovery_record(
         ),
         "reported_prefill_tokens": (
             None if prefill_tokens is None else max(0, int(prefill_tokens))
+        ),
+        "engine_scheduler_batch_id": response_metrics.get(
+            "vllm/request_scheduler_batch_id"
+        ),
+        "engine_scheduler_batch_size": response_metrics.get(
+            "vllm/request_scheduler_batch_size"
         ),
     }
     record["logical_reprefill_exposure_tokens"] = (
@@ -400,6 +547,7 @@ class RouterManager:
 
         self.partial_gpu_manager = PartialGPUManager(actor_cluster=actor_cluster, router=self.router, num_gpus_per_node=num_gpus_per_node)
         self.request_metric_totals = defaultdict(float)
+        self.request_metric_lifetime_totals = defaultdict(float)
 
     async def initialize(self):
         await self.router.initialize()
@@ -455,123 +603,23 @@ class RouterManager:
             payload=payload, request_id=request_id, uid=uid, priority=priority
         )
         request_metrics = response.get("metrics", {})
-        for name, value in request_metrics.items():
-            if isinstance(value, (int, float)):
-                self.request_metric_totals[name] += float(value)
-        if request_metrics.get("router/post_update_rebuild_request", 0):
-            self.request_metric_totals["router/rebuild_prompt_tokens"] += float(
-                request_metrics.get("vllm/request_prompt_tokens", 0)
-            )
-            if "vllm/request_cached_prompt_tokens" in request_metrics:
-                self.request_metric_totals["router/rebuild_cached_prompt_tokens"] += float(
-                    request_metrics["vllm/request_cached_prompt_tokens"]
-                )
-            if "vllm/request_prefill_tokens" in request_metrics:
-                self.request_metric_totals["router/rebuild_prefill_tokens"] += float(
-                    request_metrics["vllm/request_prefill_tokens"]
-                )
+        update_request_metric_totals(self.request_metric_totals, request_metrics)
+        update_request_metric_totals(
+            self.request_metric_lifetime_totals, request_metrics
+        )
         return response
 
     def collect_request_metrics(self):
-        metrics = dict(self.request_metric_totals)
-        prompt_tokens = metrics.get("vllm/request_prompt_tokens", 0.0)
-        cached_tokens = metrics.get("vllm/request_cached_prompt_tokens")
-        if cached_tokens is not None:
-            metrics["vllm/interval_kv_hit_ratio"] = (
-                cached_tokens / prompt_tokens if prompt_tokens else 0.0
-            )
-        rebuild_prompt = metrics.get("router/rebuild_prompt_tokens", 0.0)
-        rebuild_cached = metrics.get("router/rebuild_cached_prompt_tokens")
-        if rebuild_cached is not None:
-            metrics["router/rebuild_kv_hit_ratio"] = (
-                rebuild_cached / rebuild_prompt if rebuild_prompt else 0.0
-            )
-        query_blocks = metrics.get(
-            "vllm/engine_prefix_cache_query_blocks_delta", 0.0
+        metrics = summarize_request_metric_totals(
+            dict(self.request_metric_totals), scope="interval"
         )
-        hit_blocks = metrics.get(
-            "vllm/engine_prefix_cache_hit_blocks_delta", 0.0
-        )
-        engine_cached_tokens = metrics.get(
-            "vllm/engine_prefix_cache_cached_tokens_delta", 0.0
-        )
-        metrics.update(
-            {
-                "router/kv_cache_requests": metrics.get(
-                    "vllm/engine_prefix_cache_requests_delta", 0.0
-                ),
-                "router/kv_query_blocks": query_blocks,
-                "router/kv_hit_blocks": hit_blocks,
-                "router/kv_query_tokens": metrics.get(
-                    "vllm/engine_prefix_cache_query_tokens_delta", 0.0
-                ),
-                "router/kv_cached_tokens": engine_cached_tokens,
-                "router/kv_saved_prefill_tokens": engine_cached_tokens,
-                "router/kv_cacheable_reprefill_tokens": max(
-                    0.0,
-                    metrics.get(
-                        "vllm/engine_prefix_cache_query_tokens_delta", 0.0
-                    )
-                    - engine_cached_tokens,
-                ),
-                "router/kv_block_hit_ratio": (
-                    hit_blocks / query_blocks if query_blocks else 0.0
-                ),
-                "router/kv_cache_resets": metrics.get(
-                    "vllm/engine_prefix_cache_resets_delta", 0.0
-                ),
-            }
-        )
-        scheduling_decisions = metrics.get("router/scheduling_decisions", 0.0)
-        if scheduling_decisions:
-            metrics["router/scheduling_wait_seconds_mean"] = (
-                metrics.get("router/scheduling_wait_seconds", 0.0)
-                / scheduling_decisions
-            )
-            metrics["router/scheduling_decision_seconds_mean"] = (
-                metrics.get("router/scheduling_decision_seconds", 0.0)
-                / scheduling_decisions
-            )
-            metrics["router/selected_worker_pressure_mean"] = (
-                metrics.get("router/selected_worker_pressure", 0.0)
-                / scheduling_decisions
-            )
-            metrics["router/affinity_selected_ratio"] = (
-                metrics.get("router/affinity_selected", 0.0)
-                / scheduling_decisions
-            )
-            metrics["router/load_override_ratio"] = (
-                metrics.get("router/load_override", 0.0)
-                / scheduling_decisions
-            )
-            metrics["router/least_loaded_selected_ratio"] = (
-                metrics.get("router/least_loaded_selected", 0.0)
-                / scheduling_decisions
-            )
-            metrics["router/working_set_prefix_selected_ratio"] = (
-                metrics.get("router/working_set_prefix_selected", 0.0)
-                / scheduling_decisions
-            )
-            metrics["router/rebuild_candidate_request_ratio"] = (
-                metrics.get("router/rebuild_candidate_request", 0.0)
-                / scheduling_decisions
-            )
-            metrics["router/planned_priority_candidate_request_ratio"] = (
-                metrics.get(
-                    "router/planned_priority_candidate_request", 0.0
-                )
-                / scheduling_decisions
-            )
-            metrics["router/priority_queued_ratio"] = (
-                metrics.get("router/priority_queued_requests", 0.0)
-                / scheduling_decisions
-            )
-            metrics["router/priority_queue_depth_mean"] = (
-                metrics.get("router/priority_queue_depth", 0.0)
-                / scheduling_decisions
-            )
         self.request_metric_totals.clear()
         return metrics
+
+    def collect_lifetime_request_metrics(self):
+        return summarize_request_metric_totals(
+            dict(self.request_metric_lifetime_totals), scope="lifetime"
+        )
 
     def collect_version_boundary_profile(self):
         return self.router.collect_version_boundary_profile()
@@ -615,6 +663,9 @@ class RouterManager:
         self.router.on_version_resume(version)
         self.need_suspend = False
         self.suspend_notifier.set()
+
+    def update_runtime_plan(self, plan=None):
+        self.router.on_runtime_plan_update(plan)
 
     async def shutdown(self):
         self.need_shutdown = True
@@ -1116,6 +1167,10 @@ class Router:
         """Notify routers that model weights and prefix-cache generation changed."""
         return None
 
+    def on_runtime_plan_update(self, plan=None):
+        """Apply an online decision revision without changing model/cache epoch."""
+        return None
+
     def collect_version_boundary_profile(self):
         return {"metrics": {}, "records": []}
 
@@ -1414,6 +1469,25 @@ class EnvAffinityRouter(Router):
         self.priority_conditions = [asyncio.Condition() for _ in self.workers]
         self.priority_candidate_ranks: Dict[str, int] = {}
         config = getattr(self.router_args, "router_config", None) or {}
+        self.priority_max_running_requests = int(
+            config.get("priority_max_running_requests", self.max_running_requests)
+        )
+        self.priority_rebuild_max_running_requests = max(
+            self.priority_max_running_requests,
+            min(
+                self.max_running_requests,
+                int(
+                    config.get(
+                        "priority_rebuild_max_running_requests",
+                        self.priority_max_running_requests,
+                    )
+                ),
+            ),
+        )
+        self.priority_coalesce_seconds = max(
+            0.0, float(config.get("priority_coalesce_seconds", 0.0))
+        )
+        self.priority_batch_deadline = [0.0 for _ in self.workers]
         self.post_update_rebuild_enabled = bool(
             config.get("post_update_rebuild_enabled", False)
         )
@@ -1428,6 +1502,10 @@ class EnvAffinityRouter(Router):
         )
         self.post_update_rebuild_prefix_tokens = int(
             config.get("post_update_rebuild_prefix_tokens", 2048)
+        )
+        self.post_update_rebuild_coalesce_seconds = max(
+            0.0,
+            float(config.get("post_update_rebuild_coalesce_seconds", 0.0)),
         )
         self.soft_locality_enabled = bool(
             config.get("soft_locality_enabled", False)
@@ -1449,10 +1527,23 @@ class EnvAffinityRouter(Router):
         self.rebuild_seen_trajectories = set()
         self.rebuild_worker_prompts = defaultdict(list)
         self.rebuild_assigned_counts = defaultdict(int)
+        self.rebuild_pending = []
+        self.rebuild_coalesce_lock = asyncio.Lock()
+        self.rebuild_flush_task = None
         self.working_set_worker_prompts = defaultdict(list)
         self.runtime_plan = {}
         self.boundary_recovery_records: List[Dict[str, Any]] = []
         self.latest_trajectory_progress: Dict[str, Dict[str, Any]] = {}
+        self.worker_engine_kv_feedback = [
+            {
+                "requests": 0,
+                "query_blocks": 0,
+                "hit_blocks": 0,
+                "cached_tokens": 0,
+                "resets": 0,
+            }
+            for _ in self.workers
+        ]
 
     def on_version_resume(self, version=None):
         plan = dict(version) if isinstance(version, dict) else {"version": version}
@@ -1489,6 +1580,8 @@ class EnvAffinityRouter(Router):
         self.rebuild_seen_trajectories.clear()
         self.rebuild_worker_prompts.clear()
         self.rebuild_assigned_counts.clear()
+        self.rebuild_pending.clear()
+        self.rebuild_flush_task = None
         self.working_set_worker_prompts.clear()
         if self.post_update_rebuild_enabled or self.working_set_routing_enabled:
             # Prefix cache is flushed with the new weights, so old placement has no KV value.
@@ -1502,6 +1595,143 @@ class EnvAffinityRouter(Router):
         self.rebuild_seen_trajectories.add(trajectory_id)
         self.rebuild_observe_remaining = max(0, self.rebuild_observe_remaining - 1)
         return True
+
+    async def _flush_rebuild_wave(self):
+        if self.post_update_rebuild_coalesce_seconds > 0:
+            await asyncio.sleep(self.post_update_rebuild_coalesce_seconds)
+        async with self.rebuild_coalesce_lock:
+            pending = self.rebuild_pending
+            self.rebuild_pending = []
+            self.rebuild_flush_task = None
+            if not pending:
+                return
+            pending.sort(
+                key=lambda item: build_runtime_priority_key(
+                    item["runtime_state"], self.priority_candidate_ranks
+                )
+            )
+            wave_size = len(pending)
+            for item in pending:
+                dp_rank, lcp_tokens = select_rebuild_worker(
+                    item["prompt_tokens"],
+                    self.rebuild_worker_prompts,
+                    self.active_dp_ranks,
+                    self.rebuild_assigned_counts,
+                    self.post_update_rebuild_prefix_tokens,
+                )
+                self.rebuild_worker_prompts[dp_rank].append(
+                    tuple(
+                        int(token)
+                        for token in item["prompt_tokens"][
+                            : self.post_update_rebuild_prefix_tokens
+                        ]
+                    )
+                )
+                self.rebuild_assigned_counts[dp_rank] += 1
+                if not item["future"].done():
+                    item["future"].set_result(
+                        (dp_rank, lcp_tokens, wave_size)
+                    )
+
+    async def _prepare_first_epoch_request(
+        self,
+        runtime_state: TrajectoryRuntimeState,
+        trajectory_id: str,
+        prompt_tokens,
+    ):
+        """Observe an epoch request and optionally join its bounded rebuild wave."""
+        future = None
+        async with self.rebuild_coalesce_lock:
+            first_epoch_request = self._observe_first_epoch_request(trajectory_id)
+            rebuild_candidate = (
+                runtime_state.group_key in self.rebuild_candidate_groups
+            )
+            rebuild_fallback = (
+                not self.rebuild_candidate_groups
+                or self.rebuild_observe_remaining <= self.rebuild_remaining
+            )
+            if (
+                self.post_update_rebuild_enabled
+                and self.rebuild_remaining > 0
+                and first_epoch_request
+                and (rebuild_candidate or rebuild_fallback)
+                and len(prompt_tokens) > 0
+            ):
+                future = asyncio.get_running_loop().create_future()
+                self.rebuild_pending.append(
+                    {
+                        "runtime_state": runtime_state,
+                        "prompt_tokens": prompt_tokens,
+                        "future": future,
+                    }
+                )
+                self.rebuild_remaining -= 1
+                if self.rebuild_flush_task is None:
+                    self.rebuild_flush_task = asyncio.create_task(
+                        self._flush_rebuild_wave()
+                    )
+        assignment = await future if future is not None else None
+        return first_epoch_request, assignment
+
+    def on_runtime_plan_update(self, plan=None):
+        revised = dict(plan) if isinstance(plan, dict) else {}
+        if revised.get("version") != self.rebuild_epoch:
+            return
+        if int(revised.get("revision", 0)) < int(
+            self.runtime_plan.get("revision", 0)
+        ):
+            return
+        self.runtime_plan = revised
+        priority_candidates = (
+            revised.get("priority_candidate_groups", [])
+            if bool(revised.get("priority_enabled", False))
+            else []
+        )
+        self.priority_candidate_ranks = {
+            str(group_key): rank
+            for rank, group_key in enumerate(priority_candidates)
+        }
+        self.rebuild_candidate_groups.update(
+            str(group_key)
+            for group_key in revised.get("rebuild_candidate_groups", [])
+        )
+
+    def _apply_engine_kv_feedback(self, dp_rank: int, response_metrics):
+        """Feed exact engine counters back into Router's worker-local cache state."""
+        metric_names = {
+            "requests": "vllm/engine_prefix_cache_requests_delta",
+            "query_blocks": "vllm/engine_prefix_cache_query_blocks_delta",
+            "hit_blocks": "vllm/engine_prefix_cache_hit_blocks_delta",
+            "cached_tokens": "vllm/engine_prefix_cache_cached_tokens_delta",
+            "resets": "vllm/engine_prefix_cache_resets_delta",
+        }
+        observed = any(name in response_metrics for name in metric_names.values())
+        if not observed:
+            return False, 0, 0
+
+        feedback = self.worker_engine_kv_feedback[dp_rank]
+        for field, name in metric_names.items():
+            feedback[field] += max(0, int(response_metrics.get(name, 0)))
+        resets = max(
+            0,
+            int(response_metrics.get("vllm/engine_prefix_cache_resets_delta", 0)),
+        )
+        invalidated = 0
+        if resets:
+            self.working_set_worker_prompts.pop(dp_rank, None)
+            self.rebuild_worker_prompts.pop(dp_rank, None)
+            self.rebuild_assigned_counts.pop(dp_rank, None)
+            affected = [
+                key
+                for key, assigned_rank in self.src_rank2_dp_rank.items()
+                if assigned_rank == dp_rank
+            ]
+            invalidated = len(affected)
+            for key in affected:
+                self.src_rank2_dp_rank.pop(key, None)
+                self.src_rank_cache_epoch.pop(key, None)
+                self.src_rank_last_prompt_tokens.pop(key, None)
+        return True, resets, invalidated
 
     async def generate_request(self, payload, request_id, uid, priority=None):
         src_rank = uid
@@ -1532,12 +1762,16 @@ class EnvAffinityRouter(Router):
         affinity_cache_valid = False
         estimated_cached_tokens = 0
         selected_pressure = 0
-        first_epoch_request = False
+        first_epoch_request, rebuild_assignment = (
+            await self._prepare_first_epoch_request(
+                runtime_state,
+                epoch_trajectory_id,
+                prompt_tokens,
+            )
+        )
+        rebuild_wave_size = 0
         # Atomic routing assignment under lock to prevent TOCTOU race with shrink/expand
         async with self.routing_lock:
-            first_epoch_request = self._observe_first_epoch_request(
-                epoch_trajectory_id
-            )
             affinity_rank = self.src_rank2_dp_rank.get(routing_key)
             affinity_candidate = affinity_rank is not None
             affinity_cache_valid = (
@@ -1552,32 +1786,10 @@ class EnvAffinityRouter(Router):
                 )
 
             if affinity_rank is None:
-                rebuild_fallback = (
-                    not self.rebuild_candidate_groups
-                    or self.rebuild_observe_remaining <= self.rebuild_remaining
-                )
-                if (
-                    self.post_update_rebuild_enabled
-                    and self.rebuild_remaining > 0
-                    and first_epoch_request
-                    and (rebuild_candidate or rebuild_fallback)
-                    and len(prompt_tokens) > 0
-                ):
-                    dp_rank, rebuild_lcp_tokens = select_rebuild_worker(
-                        prompt_tokens,
-                        self.rebuild_worker_prompts,
-                        self.active_dp_ranks,
-                        self.rebuild_assigned_counts,
-                        self.post_update_rebuild_prefix_tokens,
+                if rebuild_assignment is not None:
+                    dp_rank, rebuild_lcp_tokens, rebuild_wave_size = (
+                        rebuild_assignment
                     )
-                    self.rebuild_worker_prompts[dp_rank].append(
-                        tuple(
-                            int(token)
-                            for token in prompt_tokens[:self.post_update_rebuild_prefix_tokens]
-                        )
-                    )
-                    self.rebuild_assigned_counts[dp_rank] += 1
-                    self.rebuild_remaining -= 1
                     rebuild_request = True
                     route_reason = "rebuild"
                 elif self.working_set_routing_enabled and len(prompt_tokens) > 0:
@@ -1620,8 +1832,23 @@ class EnvAffinityRouter(Router):
 
         routing_decision_seconds = time.perf_counter() - decision_started
         wait_started = time.perf_counter()
-        has_priority_slot, priority_queue_depth, priority_was_queued = (
-            await self._acquire_priority_slot(dp_rank, priority, request_id)
+        (
+            has_priority_slot,
+            priority_queue_depth,
+            priority_was_queued,
+            priority_was_coalesced,
+            priority_was_reordered,
+        ) = (
+            await self._acquire_priority_slot(
+                dp_rank,
+                priority,
+                request_id,
+                max_running_requests=(
+                    self.priority_rebuild_max_running_requests
+                    if rebuild_request
+                    else None
+                ),
+            )
         )
         scheduling_wait_seconds = time.perf_counter() - wait_started
 
@@ -1629,7 +1856,19 @@ class EnvAffinityRouter(Router):
         self.running_requests[dp_rank].add(request_id)
 
         try:
-            response = await self.workers[dp_rank].generate_request.remote(payload)
+            worker_payload = payload
+            if rebuild_request:
+                worker_payload = dict(payload)
+                worker_payload["_roll_prefill_rebuild"] = True
+            response = await self.workers[dp_rank].generate_request.remote(
+                worker_payload
+            )
+            response_metrics = response.setdefault("metrics", {})
+            (
+                engine_feedback_observed,
+                engine_resets_observed,
+                engine_shadow_invalidations,
+            ) = self._apply_engine_kv_feedback(dp_rank, response_metrics)
             if first_epoch_request and is_post_boundary_request(
                 runtime_state,
                 self.rebuild_epoch,
@@ -1642,7 +1881,7 @@ class EnvAffinityRouter(Router):
                         worker_rank=dp_rank,
                         route_reason=route_reason,
                         prompt_tokens=len(prompt_tokens),
-                        response_metrics=response.get("metrics", {}),
+                        response_metrics=response_metrics,
                     )
                 )
             finish_reasons = response.get("finish_reasons", [])
@@ -1659,7 +1898,7 @@ class EnvAffinityRouter(Router):
                 max_prompts = max(1, self.working_set_max_prompts_per_worker)
                 if len(cached_prompts) > max_prompts:
                     del cached_prompts[:-max_prompts]
-            response.setdefault("metrics", {}).update({
+            response_metrics.update({
                 "router/scheduling_decisions": 1,
                 "router/scheduling_decision_seconds": routing_decision_seconds,
                 "router/scheduling_wait_seconds": scheduling_wait_seconds,
@@ -1683,15 +1922,42 @@ class EnvAffinityRouter(Router):
                 ),
                 "router/version_runtime_plan_request": int(bool(self.runtime_plan)),
                 "router/priority_queued_requests": int(priority_was_queued),
+                "router/priority_coalesced_requests": int(
+                    priority_was_coalesced
+                ),
+                "router/priority_reordered_requests": int(
+                    priority_was_reordered
+                ),
                 "router/priority_queue_depth": priority_queue_depth,
+                "router/priority_slot_capacity": (
+                    self.priority_rebuild_max_running_requests
+                    if rebuild_request
+                    else self.priority_max_running_requests
+                ),
+                "router/rebuild_burst_request": int(
+                    rebuild_request
+                    and self.priority_rebuild_max_running_requests
+                    > self.priority_max_running_requests
+                ),
                 "router/selected_worker_pressure": selected_pressure,
                 "router/soft_locality_estimated_cached_tokens": estimated_cached_tokens,
+                "router/engine_kv_feedback_requests": int(
+                    engine_feedback_observed
+                ),
+                "router/engine_kv_resets_observed": engine_resets_observed,
+                "router/engine_kv_shadow_invalidations": (
+                    engine_shadow_invalidations
+                ),
             })
             if rebuild_request:
-                response.setdefault("metrics", {}).update({
+                response_metrics.update({
                     "router/post_update_rebuild_request": 1,
                     "router/post_update_rebuild_lcp_tokens": rebuild_lcp_tokens,
                     "router/post_update_rebuild_dp_rank": dp_rank,
+                    "router/post_update_rebuild_wave_size": rebuild_wave_size,
+                    "router/post_update_rebuild_coalesced": int(
+                        rebuild_wave_size > 1
+                    ),
                 })
             return response
         finally:
@@ -1703,6 +1969,18 @@ class EnvAffinityRouter(Router):
 
     def collect_version_boundary_profile(self):
         records = list(self.boundary_recovery_records)
+        engine_batches = defaultdict(int)
+        for record in records:
+            batch_id = record.get("engine_scheduler_batch_id")
+            if batch_id is None:
+                continue
+            engine_batches[
+                (
+                    int(record["cache_epoch"]),
+                    int(record["worker_rank"]),
+                    int(batch_id),
+                )
+            ] += 1
         return {
             "metrics": {
                 "survivor_first_requests": len(records),
@@ -1719,6 +1997,21 @@ class EnvAffinityRouter(Router):
                 "engine_reported_prefill_tokens": sum(
                     int(record["reported_prefill_tokens"] or 0) for record in records
                 ),
+                "engine_scheduler_batch_records": sum(engine_batches.values()),
+                "engine_scheduler_batches": len(engine_batches),
+                "engine_batches_with_multiple_survivors": sum(
+                    count > 1 for count in engine_batches.values()
+                ),
+                "engine_cobatched_survivor_requests": sum(
+                    count for count in engine_batches.values() if count > 1
+                ),
+                "engine_scheduler_batch_size_max": max(
+                    (
+                        int(record.get("engine_scheduler_batch_size") or 0)
+                        for record in records
+                    ),
+                    default=0,
+                ),
             },
             "records": records,
         }
@@ -1726,17 +2019,31 @@ class EnvAffinityRouter(Router):
     def collect_trajectory_progress(self):
         return list(self.latest_trajectory_progress.values())
 
-    async def _acquire_priority_slot(self, dp_rank: int, priority, request_id: str):
+    async def _acquire_priority_slot(
+        self,
+        dp_rank: int,
+        priority,
+        request_id: str,
+        max_running_requests: Optional[int] = None,
+    ):
         if (
             priority is None
-            or self.max_running_requests <= 0
+            or self.priority_max_running_requests <= 0
             or (
                 isinstance(priority, dict)
                 and not bool(priority.get("scheduling_enabled", True))
             )
         ):
-            return False, 0, False
+            return False, 0, False, False, False
         condition = self.priority_conditions[dp_rank]
+        capacity = (
+            self.priority_max_running_requests
+            if max_running_requests is None
+            else max(
+                self.priority_max_running_requests,
+                min(self.max_running_requests, int(max_running_requests)),
+            )
+        )
         runtime_state = TrajectoryRuntimeState.from_priority(priority, request_id)
         runtime_priority_key = build_runtime_priority_key(
             runtime_state, self.priority_candidate_ranks
@@ -1744,21 +2051,50 @@ class EnvAffinityRouter(Router):
         entry = (runtime_priority_key, next(self.priority_sequence), request_id)
         async with condition:
             queue_depth = len(self.priority_waiters[dp_rank])
+            if queue_depth == 0:
+                self.priority_batch_deadline[dp_rank] = (
+                    asyncio.get_running_loop().time() + self.priority_coalesce_seconds
+                )
             was_queued = (
                 queue_depth > 0
-                or self.priority_inflight[dp_rank] >= self.max_running_requests
+                or self.priority_inflight[dp_rank] >= capacity
             )
+            was_coalesced = self.priority_coalesce_seconds > 0
             heapq.heappush(self.priority_waiters[dp_rank], entry)
             try:
-                while (
-                    self.priority_waiters[dp_rank][0] != entry
-                    or self.priority_inflight[dp_rank] >= self.max_running_requests
-                ):
-                    await condition.wait()
+                while True:
+                    is_head = self.priority_waiters[dp_rank][0] == entry
+                    has_capacity = (
+                        self.priority_inflight[dp_rank] < capacity
+                    )
+                    delay = (
+                        self.priority_batch_deadline[dp_rank]
+                        - asyncio.get_running_loop().time()
+                    )
+                    if is_head and has_capacity and delay <= 0:
+                        break
+                    if is_head and has_capacity:
+                        try:
+                            await asyncio.wait_for(condition.wait(), timeout=delay)
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        await condition.wait()
+                was_reordered = any(
+                    other[1] < entry[1]
+                    for other in self.priority_waiters[dp_rank]
+                    if other != entry
+                )
                 heapq.heappop(self.priority_waiters[dp_rank])
                 self.priority_inflight[dp_rank] += 1
                 condition.notify_all()
-                return True, queue_depth, was_queued
+                return (
+                    True,
+                    queue_depth,
+                    was_queued,
+                    was_coalesced,
+                    was_reordered,
+                )
             except BaseException:
                 try:
                     self.priority_waiters[dp_rank].remove(entry)

@@ -587,6 +587,18 @@ class PPOConfig(BaseConfig):
             )
         },
     )
+    version_runtime_reconcile_interval_seconds: float = field(
+        default=5.0,
+        metadata={"help": "How often a waiting learner may request an online runtime-plan revision."},
+    )
+    version_runtime_reconcile_wait_seconds: float = field(
+        default=30.0,
+        metadata={"help": "Minimum learner wait before admitting one progress-recovery group."},
+    )
+    version_runtime_max_revisions_per_version: int = field(
+        default=4,
+        metadata={"help": "Maximum incremental progress-recovery revisions per policy version."},
+    )
     adaptive_admission_initial_finish_ratio: float = field(
         default=0.5,
         metadata={
@@ -647,7 +659,7 @@ class PPOConfig(BaseConfig):
     )
     dynamic_admission_reserve_stale_high: float = field(
         default=0.25,
-        metadata={"help": "Stale-discard EWMA threshold that triggers reserve decay."},
+        metadata={"help": "Stale inference-token fraction EWMA threshold that triggers reserve decay."},
     )
     dynamic_admission_reserve_prediction_error_margin: float = field(
         default=1.0,

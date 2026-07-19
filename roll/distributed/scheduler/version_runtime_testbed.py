@@ -12,6 +12,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from roll.distributed.scheduler.rollout_scheduler import build_version_runtime_plan
+from roll.distributed.scheduler.router import (
+    TrajectoryRuntimeState,
+    build_runtime_priority_key,
+    select_rebuild_worker,
+)
+
 
 @dataclass(frozen=True)
 class TraceTrajectory:
@@ -96,12 +103,17 @@ def load_trace(path: Path) -> List[TraceTrajectory]:
 
 
 def _priority_key(state: _TrajectoryState) -> Tuple[int, int, int, int]:
-    return (
-        state.policy_version,
-        int(state.actions_completed == 0),
-        state.remaining_actions,
-        state.admission_order,
+    runtime_state = TrajectoryRuntimeState(
+        trajectory_id=state.spec.trajectory_id,
+        policy_version=state.policy_version,
+        current_version=state.policy_version,
+        version_age=0,
+        actions_completed=state.actions_completed,
+        max_actions=state.spec.total_actions,
+        group_id=state.admission_order,
+        episode_id=0,
     )
+    return (*build_runtime_priority_key(runtime_state, {}), state.admission_order)
 
 
 def _predict_timely_completions(
@@ -133,13 +145,22 @@ def _select_worker(
     if policy != "unified":
         return least_loaded, "least_loaded"
     if rebuild_remaining > 0 and state.policy_version < version:
-        worker = min(
+        synthetic_prompt = [state.spec.prefix_id] * min(
+            state.spec.prefix_tokens, 32
+        )
+        synthetic_worker_prompts = {
+            rank: [
+                [prefix_id] * min(state.spec.prefix_tokens, 32)
+                for prefix_id in worker_prefixes[rank]
+            ]
+            for rank in workers
+        }
+        worker, _ = select_rebuild_worker(
+            synthetic_prompt,
+            synthetic_worker_prompts,
             workers,
-            key=lambda rank: (
-                int(state.spec.prefix_id in worker_prefixes[rank]),
-                worker_assignments[rank],
-                rank,
-            ),
+            worker_assignments,
+            32,
         )
         return worker, "rebuild"
     prefix_workers = [
@@ -202,13 +223,31 @@ def run_testbed(
             predicted = _predict_timely_completions(
                 active, config.service_actions_per_version
             )
-            requested = max(
-                0,
-                config.learner_demand
-                + config.safety_reserve
-                - ready_supply
-                - predicted,
+            invested_candidates = [
+                (
+                    state.admission_order,
+                    0,
+                    version - state.policy_version,
+                    state.actions_completed,
+                    int(state.actions_completed > 0),
+                )
+                for state in active
+                if not state.complete and state.actions_completed > 0
+            ]
+            runtime_plan = build_version_runtime_plan(
+                version=version,
+                learner_demand=config.learner_demand,
+                safety_reserve=config.safety_reserve,
+                expected_existing_supply=ready_supply + predicted,
+                outstanding_trajectories=len(active),
+                max_outstanding_trajectories=config.max_outstanding,
+                admission_width=1,
+                group_size=1,
+                staleness_tolerance=config.staleness_tolerance,
+                invested_candidate_groups=invested_candidates,
+                gpu_invested_candidate_groups=invested_candidates,
             )
+            requested = runtime_plan.admission_budget
         else:
             predicted = 0
             requested = config.learner_demand + config.safety_reserve

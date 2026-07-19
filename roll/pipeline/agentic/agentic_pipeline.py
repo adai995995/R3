@@ -16,6 +16,9 @@ from roll.distributed.executor.cluster import Cluster
 from roll.distributed.scheduler.protocol import DataProto
 from roll.distributed.scheduler.router import RouterManager
 from roll.distributed.scheduler.rollout_scheduler import RolloutScheduler
+from roll.distributed.scheduler.runtime_observation import (
+    finalize_runtime_observation_report,
+)
 from roll.configs.base_config import RouterArguments
 from roll.models.model_providers import default_tokenizer_provider
 from roll.pipeline.agentic.agentic_config import AgenticConfig, EnvManagerConfig
@@ -626,31 +629,10 @@ class AgenticPipeline(BasePipeline):
         ])
         terminal_waste_report = shutdown_reports[0]
         if terminal_waste_report is not None:
-            consumed_trajectories = global_step * self.pipeline_config.rollout_batch_size
+            finalize_runtime_observation_report(
+                terminal_waste_report, self.pipeline_config, global_step
+            )
             terminal_waste_metrics = terminal_waste_report["metrics"]
-            terminal_waste_metrics["terminal_waste/consumed_trajectories"] = consumed_trajectories
-            terminal_waste_metrics["terminal_waste/waste_to_consumed_ratio"] = (
-                terminal_waste_metrics["terminal_waste/trajectories"] / consumed_trajectories
-                if consumed_trajectories > 0
-                else 0.0
-            )
-            terminal_waste_metrics["async_waste/consumed_trajectories"] = consumed_trajectories
-            terminal_waste_metrics["async_waste/waste_to_consumed_ratio"] = (
-                terminal_waste_metrics.get("async_waste/trajectories", 0) / consumed_trajectories
-                if consumed_trajectories > 0
-                else 0.0
-            )
-            terminal_waste_report["experiment"] = {
-                "exp_name": self.pipeline_config.exp_name,
-                "completed_training_steps": global_step,
-                "rollout_batch_size": self.pipeline_config.rollout_batch_size,
-                "async_generation_ratio": self.pipeline_config.async_generation_ratio,
-                "trajectory_staleness_tolerance": (
-                    self.pipeline_config.trajectory_staleness_tolerance
-                    if self.pipeline_config.trajectory_staleness_tolerance is not None
-                    else int(self.pipeline_config.async_generation_ratio)
-                ),
-            }
             os.makedirs(self.pipeline_config.output_dir, exist_ok=True)
             report_path = os.path.join(
                 self.pipeline_config.output_dir, f"terminal_waste.step_{global_step}.json"

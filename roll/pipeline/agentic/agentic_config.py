@@ -343,6 +343,15 @@ class AgenticConfig(PPOConfig):
                     f"({min_group_width})"
                 )
         if self.trajectory_admission_policy == "version_adaptive":
+            assert self.version_runtime_reconcile_interval_seconds > 0, (
+                "version_runtime_reconcile_interval_seconds must be positive"
+            )
+            assert self.version_runtime_reconcile_wait_seconds >= 0, (
+                "version_runtime_reconcile_wait_seconds must be non-negative"
+            )
+            assert self.version_runtime_max_revisions_per_version >= 0, (
+                "version_runtime_max_revisions_per_version must be non-negative"
+            )
             assert self.adaptive_admission_reserve_trajectories >= 0, (
                 "adaptive_admission_reserve_trajectories must be non-negative"
             )
@@ -371,8 +380,8 @@ class AgenticConfig(PPOConfig):
                 assert self.dynamic_admission_reserve_wait_high_seconds >= 0, (
                     "dynamic_admission_reserve_wait_high_seconds must be non-negative"
                 )
-                assert self.dynamic_admission_reserve_stale_high >= 0, (
-                    "dynamic_admission_reserve_stale_high must be non-negative"
+                assert 0 <= self.dynamic_admission_reserve_stale_high <= 1, (
+                    "dynamic_admission_reserve_stale_high must be in [0, 1]"
                 )
                 assert self.dynamic_admission_reserve_prediction_error_margin >= 0, (
                     "dynamic_admission_reserve_prediction_error_margin must be non-negative"

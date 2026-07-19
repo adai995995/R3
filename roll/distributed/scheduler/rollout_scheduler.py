@@ -3,7 +3,7 @@ import json
 import math
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import ray
@@ -107,6 +107,32 @@ def compute_effective_rollout_utility(
     return response_rate * compute_efficiency, response_rate, stale_rate, compute_efficiency
 
 
+def compute_stale_control_signal(
+    stale_tokens: int,
+    consumed_tokens: int,
+    stale_trajectories: int,
+    consumed_trajectories: int,
+) -> Tuple[Optional[float], float]:
+    """Keep compute-waste control separate from trajectory-count diagnostics."""
+    token_denominator = max(0, int(stale_tokens)) + max(
+        0, int(consumed_tokens)
+    )
+    token_fraction = (
+        max(0, int(stale_tokens)) / token_denominator
+        if token_denominator > 0
+        else None
+    )
+    trajectory_denominator = max(0, int(stale_trajectories)) + max(
+        0, int(consumed_trajectories)
+    )
+    trajectory_fraction = (
+        max(0, int(stale_trajectories)) / trajectory_denominator
+        if trajectory_denominator > 0
+        else 0.0
+    )
+    return token_fraction, trajectory_fraction
+
+
 def update_utility_hill_climb(
     reserve: int,
     direction: int,
@@ -208,6 +234,7 @@ VERSION_RUNTIME_ADMISSION_REASON_CODES = {
     "supply_deficit": 2,
     "partial_capacity": 3,
     "outstanding_cap": 4,
+    "progress_reconcile": 5,
 }
 
 
@@ -295,6 +322,10 @@ class VersionRuntimeState:
     invested_candidate_groups: Tuple[Tuple[int, int, int, int, int], ...]
     admission_enabled: bool = True
     priority_enabled: bool = True
+    revision: int = 0
+    gpu_invested_candidate_groups: Optional[
+        Tuple[Tuple[int, int, int, int, int], ...]
+    ] = None
 
 
 @dataclass(frozen=True)
@@ -317,6 +348,8 @@ class VersionRuntimePlan:
     priority_candidate_groups: Tuple[str, ...]
     rebuild_candidate_groups: Tuple[str, ...]
     rebuild_target_trajectories: int
+    revision: int = 0
+    admission_delta_trajectories: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -336,13 +369,79 @@ class VersionRuntimePlan:
             "priority_candidate_groups": list(self.priority_candidate_groups),
             "rebuild_candidate_groups": list(self.rebuild_candidate_groups),
             "rebuild_target_trajectories": self.rebuild_target_trajectories,
+            "revision": self.revision,
+            "admission_delta_trajectories": self.admission_delta_trajectories,
         }
 
 
 class VersionAwareRuntimeController:
     """Convert one boundary snapshot into a deterministic runtime decision."""
 
-    def decide(self, state: VersionRuntimeState) -> VersionRuntimePlan:
+    def decide(
+        self,
+        state: VersionRuntimeState,
+        *,
+        active_plan: Optional[VersionRuntimePlan] = None,
+        missing_trajectories: int = 0,
+        current_batch_missing: int = 0,
+        learner_wait_seconds: float = 0.0,
+        reconcile_wait_seconds: float = 0.0,
+        max_revisions_per_version: int = 0,
+        max_admission_groups: int = 1,
+    ) -> Optional[VersionRuntimePlan]:
+        """Return the complete boundary plan or an online revision of it."""
+        if active_plan is None:
+            return self._decide_boundary(state)
+        if (
+            active_plan.version != state.version
+            or learner_wait_seconds < reconcile_wait_seconds
+            or active_plan.revision >= max(0, int(max_revisions_per_version))
+        ):
+            return None
+
+        missing = min(
+            max(0, int(missing_trajectories)),
+            max(0, int(current_batch_missing)),
+        )
+        if missing <= 0:
+            return None
+        admitted_groups = compute_progress_topup_groups(
+            missing,
+            int(round(max(0.0, state.expected_existing_supply))),
+            state.outstanding_trajectories,
+            state.max_outstanding_trajectories,
+            state.group_size,
+            state.admission_width,
+        )
+        admitted_groups = min(
+            admitted_groups, max(0, int(max_admission_groups))
+        )
+        if admitted_groups <= 0:
+            return None
+
+        candidate_plan = self._decide_boundary(
+            replace(state, admission_enabled=False, safety_reserve=0)
+        )
+        admission_delta = admitted_groups * max(1, int(state.admission_width))
+        return replace(
+            active_plan,
+            revision=active_plan.revision + 1,
+            admission_enabled=True,
+            admission_budget=active_plan.admission_budget + admission_delta,
+            admission_budget_trainable=(
+                active_plan.admission_budget_trainable
+                + admitted_groups * max(1, int(state.group_size))
+            ),
+            admission_reason="progress_reconcile",
+            priority_candidate_groups=candidate_plan.priority_candidate_groups,
+            rebuild_candidate_groups=candidate_plan.rebuild_candidate_groups,
+            rebuild_target_trajectories=(
+                candidate_plan.rebuild_target_trajectories
+            ),
+            admission_delta_trajectories=admission_delta,
+        )
+
+    def _decide_boundary(self, state: VersionRuntimeState) -> VersionRuntimePlan:
         width = max(1, int(state.admission_width))
         trainable_width = max(1, int(state.group_size))
         demand = max(0, int(state.learner_demand)) + max(
@@ -389,6 +488,23 @@ class VersionAwareRuntimeController:
             f"{int(group_id)}:{int(episode_id)}"
             for group_id, episode_id, _, _, _ in ordered_candidates
         )
+        rebuild_ordered_candidates = sorted(
+            (
+                state.invested_candidate_groups
+                if state.gpu_invested_candidate_groups is None
+                else state.gpu_invested_candidate_groups
+            ),
+            key=lambda item: (
+                -int(item[2]),
+                -int(item[3]),
+                int(item[0]),
+                int(item[1]),
+            ),
+        )
+        rebuild_candidate_keys = tuple(
+            f"{int(group_id)}:{int(episode_id)}"
+            for group_id, episode_id, _, _, _ in rebuild_ordered_candidates
+        )
         priority_candidates = candidate_keys if state.priority_enabled else ()
         return VersionRuntimePlan(
             version=int(state.version),
@@ -410,11 +526,13 @@ class VersionAwareRuntimeController:
             priority_deadline_version=int(state.version)
             + max(0, int(state.staleness_tolerance)),
             priority_candidate_groups=priority_candidates,
-            rebuild_candidate_groups=candidate_keys,
+            rebuild_candidate_groups=rebuild_candidate_keys,
             rebuild_target_trajectories=sum(
                 max(0, int(invested))
-                for _, _, _, _, invested in ordered_candidates
+                for _, _, _, _, invested in rebuild_ordered_candidates
             ),
+            revision=max(0, int(state.revision)),
+            admission_delta_trajectories=admitted_groups * width,
         )
 
 
@@ -432,6 +550,10 @@ def build_version_runtime_plan(
     invested_candidate_groups: List[Tuple[int, int, int, int, int]],
     admission_enabled: bool = True,
     priority_enabled: bool = True,
+    revision: int = 0,
+    gpu_invested_candidate_groups: Optional[
+        List[Tuple[int, int, int, int, int]]
+    ] = None,
 ) -> VersionRuntimePlan:
     """Build the boundary plan consumed by both the queue manager and Router.
 
@@ -452,8 +574,16 @@ def build_version_runtime_plan(
         invested_candidate_groups=tuple(invested_candidate_groups),
         admission_enabled=admission_enabled,
         priority_enabled=priority_enabled,
+        revision=revision,
+        gpu_invested_candidate_groups=(
+            None
+            if gpu_invested_candidate_groups is None
+            else tuple(gpu_invested_candidate_groups)
+        ),
     )
-    return VersionAwareRuntimeController().decide(state)
+    plan = VersionAwareRuntimeController().decide(state)
+    assert plan is not None
+    return plan
 
 
 def summarize_version_boundary_records(
@@ -566,10 +696,15 @@ def summarize_rollout_goodput(
     def total(records, field):
         return sum(int(record.get(field, 0)) for record in records)
 
+    valid_consumed_records = [
+        record
+        for record in consumed_records
+        if bool(record.get("trainable_valid", True))
+    ]
     raw_response_tokens = total(all_records, "response_tokens")
     raw_inference_tokens = total(all_records, "inference_tokens")
-    trainable_response_tokens = total(consumed_records, "response_tokens")
-    trainable_inference_tokens = total(consumed_records, "inference_tokens")
+    trainable_response_tokens = total(valid_consumed_records, "response_tokens")
+    trainable_inference_tokens = total(valid_consumed_records, "inference_tokens")
     stale_inference_tokens = total(stale_records, "inference_tokens")
     return {
         "rollout/elapsed_seconds": elapsed,
@@ -581,10 +716,16 @@ def summarize_rollout_goodput(
         "rollout/raw_logical_inference_tokens": raw_inference_tokens,
         "rollout/raw_response_tokens_per_second": raw_response_tokens / elapsed,
         "rollout/raw_logical_inference_tokens_per_second": raw_inference_tokens / elapsed,
-        "rollout/trainable_trajectories": len(consumed_records),
+        "rollout/learner_consumed_trajectories": len(consumed_records),
+        "rollout/trainable_trajectories": len(valid_consumed_records),
+        "rollout/placeholder_trajectories": (
+            len(consumed_records) - len(valid_consumed_records)
+        ),
         "rollout/trainable_response_tokens": trainable_response_tokens,
         "rollout/trainable_logical_inference_tokens": trainable_inference_tokens,
-        "rollout/trainable_trajectories_per_second": len(consumed_records) / elapsed,
+        "rollout/trainable_trajectories_per_second": (
+            len(valid_consumed_records) / elapsed
+        ),
         "rollout/trainable_response_tokens_per_second": trainable_response_tokens / elapsed,
         "rollout/trainable_logical_inference_tokens_per_second": (
             trainable_inference_tokens / elapsed
@@ -869,8 +1010,11 @@ class GroupQueue:
         self.complete = asyncio.Event()
 
     def shutdown(self):
-        self.quit = True
+        self.stop_admission()
         self.groups.clear()
+
+    def stop_admission(self):
+        self.quit = True
         self.progress.set()
 
     @staticmethod
@@ -1102,6 +1246,11 @@ class GroupQueue:
             record["version_start"] = int(snapshot.get("version_start", record["version_start"]))
             record["version_end"] = int(snapshot.get("version_end", record["version_end"]))
 
+        record["reset_only"] = bool(
+            record.get("reset_completed", False)
+            and int(record.get("inference_calls", 0)) == 0
+        )
+
         record_key = (int(group.group_id), int(group.episode_id), int(env_id))
         existing_index = self.discard_record_indices.get(record_key)
         if existing_index is None:
@@ -1207,6 +1356,7 @@ class GroupQueue:
     def trainable_progress_summary(self, group: GroupData) -> Dict[str, int]:
         """Summarize progress across the best candidates that can make the group trainable."""
         actions_by_env: Dict[Any, int] = {}
+        gpu_invested_envs = set()
         for (episode_id, env_id), progress in self.progress_snapshots.items():
             if episode_id != group.episode_id:
                 continue
@@ -1214,6 +1364,12 @@ class GroupQueue:
                 actions_by_env.get(env_id, 0),
                 int(progress.get("actions_completed", 0)),
             )
+            if (
+                int(progress.get("inference_calls", 0)) > 0
+                or int(progress.get("current_context_tokens", 0)) > 0
+                or int(progress.get("inference_tokens", 0)) > 0
+            ):
+                gpu_invested_envs.add(env_id)
 
         anonymous_index = 0
         for rollout in group.rollouts:
@@ -1227,6 +1383,12 @@ class GroupQueue:
             tensor_progress = self._tensor_progress(rollout)
             actions = max(actions, int(tensor_progress.get("actions_completed", 0)))
             actions_by_env[env_id] = max(actions_by_env.get(env_id, 0), actions)
+            if (
+                int(self._metric_by_suffix(rollout, "/traj_inference_calls", 0)) > 0
+                or int(tensor_progress.get("inference_calls", 0)) > 0
+                or int(tensor_progress.get("current_context_tokens", 0)) > 0
+            ):
+                gpu_invested_envs.add(env_id)
 
         candidate_actions = sorted(actions_by_env.values(), reverse=True)
         candidate_actions.extend([0] * max(0, self.group_size - len(candidate_actions)))
@@ -1237,12 +1399,16 @@ class GroupQueue:
                 "frontier_actions": 0,
                 "max_actions": 0,
                 "observed_candidates": 0,
+                "gpu_invested_candidates": 0,
             }
         return {
             "mean_actions": sum(trainable_actions) // len(trainable_actions),
             "frontier_actions": trainable_actions[-1],
             "max_actions": trainable_actions[0],
             "observed_candidates": min(len(actions_by_env), self.group_size),
+            "gpu_invested_candidates": min(
+                len(gpu_invested_envs), self.group_size
+            ),
         }
 
     def trainable_frontier_actions(self, group: GroupData) -> int:
@@ -1460,6 +1626,12 @@ class GroupQueueManager:
         self.version_adaptive_progress_floor_enabled = bool(
             getattr(config, "version_adaptive_progress_floor_enabled", False)
         )
+        self.version_runtime_reconcile_wait_seconds = float(
+            getattr(config, "version_runtime_reconcile_wait_seconds", 30.0)
+        )
+        self.version_runtime_max_revisions_per_version = int(
+            getattr(config, "version_runtime_max_revisions_per_version", 4)
+        )
         self.adaptive_finish_ratio = float(
             getattr(config, "adaptive_admission_initial_finish_ratio", 0.5)
         )
@@ -1524,6 +1696,10 @@ class GroupQueueManager:
         )
         self.dynamic_learner_wait_ewma: Optional[float] = None
         self.dynamic_stale_ewma: Optional[float] = None
+        self.dynamic_stale_record_tokens_seen: Dict[
+            Tuple[int, int, int], int
+        ] = {}
+        self.dynamic_stale_record_ids_seen = set()
         self.dynamic_prediction_error_ewma: Optional[float] = None
         self.dynamic_reserve_update_reason = 5 if not self.dynamic_reserve_enabled else 4
         self.dynamic_reserve_pending_direction = 0
@@ -1547,6 +1723,8 @@ class GroupQueueManager:
         self.dynamic_utility_settle_remaining = 0
         self.version_progress_topup_events = 0
         self.version_progress_topup_trajectories = 0
+        self.version_runtime_revision = 0
+        self.current_batch_missing = 0
         self.dynamic_reserve_increase_total = 0
         self.dynamic_reserve_decrease_total = 0
         self.dynamic_reserve_hold_total = 0
@@ -1558,6 +1736,8 @@ class GroupQueueManager:
         self.version_valid_ready_at_boundary = 0
         self.version_salvageable_inflight_at_boundary = 0
         self.version_invested_inflight_at_boundary = 0
+        self.version_gpu_invested_inflight_at_boundary = 0
+        self.version_reset_only_inflight_at_boundary = 0
         self.version_reserved_unstarted_at_boundary = 0
         self.version_near_expiry_at_boundary = 0
         self.version_expected_existing_supply = 0.0
@@ -1813,12 +1993,16 @@ class GroupQueueManager:
         ready = 0
         unfinished = 0
         invested_inflight = 0
+        gpu_invested_inflight = 0
         reserved_unstarted = 0
         near_expiry = 0
         existing_groups = set()
         unfinished_groups = set()
         unfinished_group_buckets: Dict[Tuple[int, int], str] = {}
         invested_candidate_groups: List[Tuple[int, int, int, int, int]] = []
+        gpu_invested_candidate_groups: List[
+            Tuple[int, int, int, int, int]
+        ] = []
         unfinished_bucket_counts: Dict[str, int] = {}
         unfinished_progress_observed_candidates = 0
         unfinished_progress_mean_actions_sum = 0
@@ -1865,6 +2049,21 @@ class GroupQueueManager:
                                 invested,
                             )
                         )
+                    gpu_invested = min(
+                        self.group_size,
+                        int(progress["gpu_invested_candidates"]),
+                    )
+                    gpu_invested_inflight += gpu_invested
+                    if gpu_invested > 0:
+                        gpu_invested_candidate_groups.append(
+                            (
+                                group_id,
+                                episode_id,
+                                age,
+                                progress["mean_actions"],
+                                gpu_invested,
+                            )
+                        )
                     reserved_unstarted += self.group_size - invested
                 if age >= near_expiry_age:
                     near_expiry += self.group_size
@@ -1892,12 +2091,17 @@ class GroupQueueManager:
             "valid_ready": ready,
             "salvageable_inflight": unfinished,
             "invested_inflight": invested_inflight,
+            "gpu_invested_inflight": gpu_invested_inflight,
+            "reset_only_inflight": max(
+                0, invested_inflight - gpu_invested_inflight
+            ),
             "reserved_unstarted": reserved_unstarted,
             "near_expiry": near_expiry,
             "existing_groups": existing_groups,
             "unfinished_groups": unfinished_groups,
             "unfinished_group_buckets": unfinished_group_buckets,
             "invested_candidate_groups": invested_candidate_groups,
+            "gpu_invested_candidate_groups": gpu_invested_candidate_groups,
             "unfinished_bucket_counts": unfinished_bucket_counts,
             "unfinished_progress_observed_candidates": unfinished_progress_observed_candidates,
             "unfinished_progress_mean_actions_sum": unfinished_progress_mean_actions_sum,
@@ -2075,31 +2279,67 @@ class GroupQueueManager:
         for group_id in touched:
             self.group_queue[group_id].progress.set()
 
-    def _ensure_version_progress(self, current_step: int, missing_trajectories: int):
+    def reconcile_version_progress(
+        self,
+        current_step: int,
+        missing_trajectories: int,
+        learner_wait_seconds: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Revise the active plan when predicted carry-over fails to materialize."""
         if (
             not self.version_adaptive_progress_floor_enabled
             or self.admission_policy != "version_adaptive"
-            or missing_trajectories <= 0
             or not self.group_queue
+            or current_step != self.version_admission_version
+            or self.version_runtime_plan is None
         ):
-            return
+            return None
         supply = self._version_supply_snapshot(current_step)
         expected_inflight, _, _ = self._predict_unfinished_supply(supply)
         expected_inflight = int(round(expected_inflight))
         potential = supply["valid_ready"] + expected_inflight
         queues = [queue for queue in self.group_queue.values() if not queue.quit]
         if not queues:
-            return
+            return None
         width = queues[0].admission_width
         outstanding = self._outstanding_snapshot(current_step)["outstanding_trajectories"]
-        admitted_groups = compute_progress_topup_groups(
-            missing_trajectories,
-            potential,
-            outstanding,
-            self.max_outstanding_trajectories,
-            self.group_size,
-            width,
+        state = VersionRuntimeState(
+            version=current_step,
+            learner_demand=self.rollout_batch_size,
+            safety_reserve=self.adaptive_reserve,
+            expected_existing_supply=potential,
+            outstanding_trajectories=outstanding,
+            max_outstanding_trajectories=self.max_outstanding_trajectories,
+            admission_width=width,
+            group_size=self.group_size,
+            staleness_tolerance=self.staleness_tolerance,
+            invested_candidate_groups=tuple(
+                supply["invested_candidate_groups"]
+            ),
+            gpu_invested_candidate_groups=tuple(
+                supply["gpu_invested_candidate_groups"]
+            ),
+            admission_enabled=True,
+            priority_enabled=self.scheduling_policy == "version_priority",
+            revision=self.version_runtime_revision,
         )
+        revised_plan = self.version_runtime_controller.decide(
+            state,
+            active_plan=self.version_runtime_plan,
+            missing_trajectories=missing_trajectories,
+            current_batch_missing=self.current_batch_missing,
+            learner_wait_seconds=learner_wait_seconds,
+            reconcile_wait_seconds=self.version_runtime_reconcile_wait_seconds,
+            max_revisions_per_version=(
+                self.version_runtime_max_revisions_per_version
+            ),
+            max_admission_groups=1,
+        )
+        if revised_plan is None:
+            return None
+
+        admitted = revised_plan.admission_delta_trajectories
+        admitted_groups = admitted // width
         touched = set()
         for _ in range(admitted_groups):
             queue = queues[self.admission_cursor % len(queues)]
@@ -2108,11 +2348,18 @@ class GroupQueueManager:
             touched.add(queue.group_id)
         for group_id in touched:
             self.group_queue[group_id].progress.set()
-        admitted = admitted_groups * width
-        if admitted:
-            self.admitted_trajectories_total += admitted
-            self.version_progress_topup_events += 1
-            self.version_progress_topup_trajectories += admitted
+
+        self.admitted_trajectories_total += admitted
+        self.version_progress_topup_events += 1
+        self.version_progress_topup_trajectories += admitted
+        self.version_runtime_revision = revised_plan.revision
+        self.version_admission_budget = revised_plan.admission_budget
+        self.version_admission_budget_trainable = (
+            revised_plan.admission_budget_trainable
+        )
+        self.version_admission_used += admitted
+        self.version_runtime_plan = revised_plan
+        return self.version_runtime_plan.to_dict()
 
     def _build_version_runtime_plan(
         self,
@@ -2144,10 +2391,16 @@ class GroupQueueManager:
             invested_candidate_groups=tuple(
                 supply["invested_candidate_groups"]
             ),
+            gpu_invested_candidate_groups=tuple(
+                supply["gpu_invested_candidate_groups"]
+            ),
             admission_enabled=admission_enabled,
             priority_enabled=self.scheduling_policy == "version_priority",
+            revision=self.version_runtime_revision,
         )
-        return self.version_runtime_controller.decide(state)
+        plan = self.version_runtime_controller.decide(state)
+        assert plan is not None
+        return plan
 
     def _refresh_nonadaptive_runtime_plan(self, create_step: int):
         """Publish scheduling/KV decisions even when admission is an ablation."""
@@ -2200,10 +2453,17 @@ class GroupQueueManager:
         self._update_dynamic_reserve(create_step)
 
         supply = self._version_supply_snapshot(create_step)
+        self.version_runtime_revision = 0
         self.version_admission_version = create_step
         self.version_valid_ready_at_boundary = supply["valid_ready"]
         self.version_salvageable_inflight_at_boundary = supply["salvageable_inflight"]
         self.version_invested_inflight_at_boundary = supply["invested_inflight"]
+        self.version_gpu_invested_inflight_at_boundary = supply[
+            "gpu_invested_inflight"
+        ]
+        self.version_reset_only_inflight_at_boundary = supply[
+            "reset_only_inflight"
+        ]
         self.version_reserved_unstarted_at_boundary = supply["reserved_unstarted"]
         self.version_near_expiry_at_boundary = supply["near_expiry"]
         self.version_unfinished_bucket_counts = dict(supply["unfinished_bucket_counts"])
@@ -2313,6 +2573,7 @@ class GroupQueueManager:
             "scheduler/version_runtime_plan_enabled": int(
                 self.version_runtime_plan is not None
             ),
+            "scheduler/version_runtime_revision": self.version_runtime_revision,
             "scheduler/version_runtime_admission_enabled": int(
                 self.version_runtime_plan.admission_enabled
                 if self.version_runtime_plan is not None else False
@@ -2388,6 +2649,12 @@ class GroupQueueManager:
             ),
             "scheduler/invested_inflight_at_version_boundary": (
                 self.version_invested_inflight_at_boundary
+            ),
+            "scheduler/gpu_invested_inflight_at_version_boundary": (
+                self.version_gpu_invested_inflight_at_boundary
+            ),
+            "scheduler/reset_only_inflight_at_version_boundary": (
+                self.version_reset_only_inflight_at_boundary
             ),
             "scheduler/reserved_unstarted_at_version_boundary": (
                 self.version_reserved_unstarted_at_boundary
@@ -2492,9 +2759,6 @@ class GroupQueueManager:
         )
         discard_metrics, _ = self._aggregate_discard_records(new_discard_records, "scheduler/async_discard")
         filter_metrics.update(discard_metrics)
-        stale_count = discard_metrics["scheduler/async_discard/version_stale_trajectories"]
-        self.dynamic_stale_ewma = self._update_ewma(self.dynamic_stale_ewma, stale_count)
-        filter_metrics["scheduler/dynamic_stale_ewma"] = self.dynamic_stale_ewma
         consumed_metrics, _ = self._aggregate_consumed_records(
             self.new_consumed_records, "scheduler/consumed"
         )
@@ -2502,14 +2766,69 @@ class GroupQueueManager:
         now = time.monotonic()
         observation_seconds = max(1e-6, now - self.dynamic_last_observation_time)
         self.dynamic_last_observation_time = now
-        stale_tokens = sum(
-            int(record.get("inference_tokens", 0))
-            for record in new_discard_records
-            if str(record.get("discard_reason", "")).startswith("version_")
+        stale_tokens = 0
+        new_stale_count = 0
+        for record in new_discard_records:
+            if not str(record.get("discard_reason", "")).startswith("version_"):
+                continue
+            record_key = (
+                int(record.get("group_id", -1)),
+                int(record.get("episode_id", -1)),
+                int(record.get("env_id", -1)),
+            )
+            current_tokens = int(record.get("inference_tokens", 0))
+            previous_tokens = self.dynamic_stale_record_tokens_seen.get(
+                record_key, 0
+            )
+            stale_tokens += max(0, current_tokens - previous_tokens)
+            self.dynamic_stale_record_tokens_seen[record_key] = max(
+                previous_tokens, current_tokens
+            )
+            if record_key not in self.dynamic_stale_record_ids_seen:
+                self.dynamic_stale_record_ids_seen.add(record_key)
+                new_stale_count += 1
+        consumed_tokens = int(
+            consumed_metrics["scheduler/consumed/valid_inference_tokens"]
+        )
+        consumed_count = int(
+            consumed_metrics["scheduler/consumed/valid_trajectories"]
+        )
+        stale_token_sample, stale_trajectory_fraction = (
+            compute_stale_control_signal(
+                stale_tokens,
+                consumed_tokens,
+                new_stale_count,
+                consumed_count,
+            )
+        )
+        if stale_token_sample is not None:
+            stale_fraction = stale_token_sample
+            stale_signal_source = 1
+            self.dynamic_stale_ewma = self._update_ewma(
+                self.dynamic_stale_ewma, stale_fraction
+            )
+        else:
+            # A reset-only stale trajectory consumed no inference compute. Keep
+            # its count observable, but do not mix a trajectory fraction into
+            # the token-waste controller signal.
+            stale_fraction = 0.0
+            stale_signal_source = 0
+        filter_metrics["scheduler/dynamic_stale_fraction"] = stale_fraction
+        filter_metrics["scheduler/dynamic_stale_trajectory_fraction"] = (
+            stale_trajectory_fraction
+        )
+        filter_metrics["scheduler/dynamic_stale_fraction_source_tokens"] = (
+            stale_signal_source
+        )
+        filter_metrics["scheduler/dynamic_stale_new_trajectories"] = (
+            new_stale_count
+        )
+        filter_metrics["scheduler/dynamic_stale_ewma"] = (
+            self.dynamic_stale_ewma or 0.0
         )
         utility, useful_rate, stale_rate, compute_efficiency = compute_effective_rollout_utility(
-            consumed_metrics["scheduler/consumed/response_tokens"],
-            consumed_metrics["scheduler/consumed/inference_tokens"],
+            consumed_metrics["scheduler/consumed/valid_response_tokens"],
+            consumed_metrics["scheduler/consumed/valid_inference_tokens"],
             stale_tokens,
             observation_seconds,
             self.dynamic_utility_waste_weight,
@@ -2526,10 +2845,10 @@ class GroupQueueManager:
                 self.dynamic_utility_window_sum += utility
                 self.dynamic_utility_window_count += 1
                 self.dynamic_utility_window_response_tokens += int(
-                    consumed_metrics["scheduler/consumed/response_tokens"]
+                    consumed_metrics["scheduler/consumed/valid_response_tokens"]
                 )
                 self.dynamic_utility_window_consumed_tokens += int(
-                    consumed_metrics["scheduler/consumed/inference_tokens"]
+                    consumed_metrics["scheduler/consumed/valid_inference_tokens"]
                 )
                 self.dynamic_utility_window_stale_tokens += stale_tokens
                 self.dynamic_utility_window_seconds += observation_seconds
@@ -2559,6 +2878,15 @@ class GroupQueueManager:
         count = len(records)
         metrics = {
             f"{prefix}/trajectories": count,
+            f"{prefix}/valid_trajectories": sum(
+                bool(record.get("trainable_valid", True)) for record in records
+            ),
+            f"{prefix}/placeholder_trajectories": sum(
+                bool(record.get("placeholder", False)) for record in records
+            ),
+            f"{prefix}/reset_only_trajectories": sum(
+                bool(record.get("reset_only", False)) for record in records
+            ),
             f"{prefix}/version_age_sum": sum(int(record.get("version_age", 0)) for record in records),
             f"{prefix}/version_age_max": max(
                 (int(record.get("version_age", 0)) for record in records), default=0
@@ -2567,6 +2895,16 @@ class GroupQueueManager:
             f"{prefix}/prompt_tokens": sum(int(record.get("prompt_tokens", 0)) for record in records),
             f"{prefix}/response_tokens": sum(int(record.get("response_tokens", 0)) for record in records),
             f"{prefix}/inference_tokens": sum(int(record.get("inference_tokens", 0)) for record in records),
+            f"{prefix}/valid_inference_tokens": sum(
+                int(record.get("inference_tokens", 0))
+                for record in records
+                if bool(record.get("trainable_valid", True))
+            ),
+            f"{prefix}/valid_response_tokens": sum(
+                int(record.get("response_tokens", 0))
+                for record in records
+                if bool(record.get("trainable_valid", True))
+            ),
         }
         for age in range(4):
             metrics[f"{prefix}/version_age_{age}"] = sum(
@@ -2601,6 +2939,9 @@ class GroupQueueManager:
             ),
             f"{prefix}/redundancy_trajectories": sum(
                 str(record.get("discard_reason", "")).startswith("redundancy_") for record in records
+            ),
+            f"{prefix}/reset_only_trajectories": sum(
+                bool(record.get("reset_only", False)) for record in records
             ),
             f"{prefix}/actions": sum(int(record.get("actions_completed", 0)) for record in records),
             f"{prefix}/inference_calls": sum(int(record.get("inference_calls", 0)) for record in records),
@@ -2643,6 +2984,11 @@ class GroupQueueManager:
         metric = GroupQueue._metric_by_suffix
         first_value = GroupQueue._first_non_tensor_value
         env_id = first_value(rollout, "env_ids", -1)
+        placeholder = bool(
+            rollout.meta_info.get("drop_flag", False)
+            if rollout.meta_info
+            else False
+        )
         record = {
             "trajectory_id": str(first_value(rollout, "traj_id", "unknown")),
             "category": "completed_unconsumed",
@@ -2655,6 +3001,8 @@ class GroupQueueManager:
             "version_age": int(metric(rollout, "/traj_version_age", 0)),
             "reset_completed": True,
             "completed": True,
+            "placeholder": placeholder,
+            "trainable_valid": not placeholder,
             "truncated": bool(metric(rollout, "/traj_truncated", 0)),
             "actions_completed": int(metric(rollout, "/traj_actions_completed", 0)),
             "inference_calls": int(metric(rollout, "/traj_inference_calls", 0)),
@@ -2688,6 +3036,10 @@ class GroupQueueManager:
                 record[field] = max(record[field], float(value))
             except (TypeError, ValueError):
                 continue
+        record["reset_only"] = bool(
+            record.get("reset_completed", False)
+            and int(record.get("inference_calls", 0)) == 0
+        )
         return record
 
     def collect_shutdown_waste(self, inflight_records: List[Dict[str, Any]]):
@@ -2699,6 +3051,11 @@ class GroupQueueManager:
                         records.append(self._completed_rollout_record(rollout, group))
 
         records.extend(record for record in inflight_records if record is not None)
+        for record in records:
+            record["reset_only"] = bool(
+                record.get("reset_completed", False)
+                and int(record.get("inference_calls", 0)) == 0
+            )
         records.sort(
             key=lambda item: (
                 -int(item.get("actions_completed", 0)),
@@ -2730,7 +3087,9 @@ class GroupQueueManager:
             "terminal_waste/inflight": sum(
                 record.get("category") == "inflight_at_shutdown" for record in records
             ),
-            "terminal_waste/reset_only": sum(int(record.get("inference_calls", 0)) == 0 for record in records),
+            "terminal_waste/reset_only": sum(
+                bool(record.get("reset_only", False)) for record in records
+            ),
             "terminal_waste/actions": sum(int(record.get("actions_completed", 0)) for record in records),
             "terminal_waste/inference_calls": sum(int(record.get("inference_calls", 0)) for record in records),
             "terminal_waste/tool_calls": sum(int(record.get("tool_calls", 0)) for record in records),
@@ -2844,6 +3203,38 @@ class GroupQueueManager:
             ),
         }
         metrics.update(boundary_metrics)
+        runtime_state = {
+            "plan": (
+                self.version_runtime_plan.to_dict()
+                if self.version_runtime_plan is not None
+                else None
+            ),
+            "dynamic_reserve": self.adaptive_reserve,
+            "dynamic_learner_wait_ewma": self.dynamic_learner_wait_ewma or 0.0,
+            "dynamic_stale_fraction_ewma": self.dynamic_stale_ewma or 0.0,
+            "dynamic_prediction_error_ewma": (
+                self.dynamic_prediction_error_ewma or 0.0
+            ),
+            "progress_topup_events": self.version_progress_topup_events,
+            "progress_topup_trajectories": (
+                self.version_progress_topup_trajectories
+            ),
+            "reserve_increase_total": self.dynamic_reserve_increase_total,
+            "reserve_decrease_total": self.dynamic_reserve_decrease_total,
+            "reserve_hold_total": self.dynamic_reserve_hold_total,
+        }
+        metrics.update(
+            {
+                "version_runtime/final_revision": self.version_runtime_revision,
+                "version_runtime/final_dynamic_reserve": self.adaptive_reserve,
+                "version_runtime/progress_topup_events": (
+                    self.version_progress_topup_events
+                ),
+                "version_runtime/progress_topup_trajectories": (
+                    self.version_progress_topup_trajectories
+                ),
+            }
+        )
         return {
             "metrics": metrics,
             "histograms": {
@@ -2867,6 +3258,7 @@ class GroupQueueManager:
                 "metrics": boundary_metrics,
                 "events": self.version_boundary_events,
             },
+            "version_runtime": runtime_state,
         }
 
     def clear(self):
@@ -2882,10 +3274,16 @@ class GroupQueueManager:
         self.rollout_finished_at = None
         self.learner_wait_seconds_total = 0.0
         self.learner_wait_events = 0
+        self.dynamic_stale_record_tokens_seen.clear()
+        self.dynamic_stale_record_ids_seen.clear()
 
     def mark_rollout_end(self):
         if self.rollout_finished_at is None:
             self.rollout_finished_at = time.monotonic()
+
+    def stop_admission(self):
+        for group_queue in self.group_queue.values():
+            group_queue.stop_admission()
 
     def advance_step(self, step):
         if self.rollout_started_at is None:
@@ -2997,12 +3395,14 @@ class GroupQueueManager:
         ret: List[DataProto] = []
         progress_bar = tqdm(desc=f"{self.mode} rollout get_batch progress(trajectory)", mininterval=self.group_size)
         while batch_size < 0 or len(ret) < batch_size:
+            self.current_batch_missing = (
+                max(0, batch_size - len(ret)) if batch_size >= 0 else 0
+            )
 
             if len(self.rollout_complete) == len(self.group_queue):
                 break
 
             async def wait_a_episode():
-                self._ensure_version_progress(current_step, batch_size - len(ret))
                 # Only wait for new episode when there are no pending GroupQueue.get,
                 # this way we can avoid starvation of some env.
                 if not self.pending_gets:
@@ -3077,6 +3477,7 @@ class GroupQueueManager:
 
             await wait_a_episode()
         get_batch_return_start_time = time.time()
+        self.current_batch_missing = 0
         for d in ret:
             d.meta_info["get_batch_return_start_time"] = get_batch_return_start_time
         return ret
@@ -3098,6 +3499,7 @@ class RolloutScheduler(RolloutMockMixin):
         ray.get(train_rollout_scheduler.shutdown.remote())
     """
     shutdown_timeout_seconds = 30.0
+    shutdown_grace_seconds = 5.0
 
     def __init__(self, config, env_manager_config: EnvManagerConfig, resource_manager, infer_cluster, mode, collator=None):
         self.config = config
@@ -3183,23 +3585,13 @@ class RolloutScheduler(RolloutMockMixin):
             timeout_stages.append("worker_stop")
             logger.warning("timed out stopping environment workers")
 
-        try:
-            await asyncio.wait_for(self.rollout_task, timeout=timeout_seconds)
-        except asyncio.TimeoutError:
-            timeout_stages.append("rollout_loop")
-            logger.warning("timed out waiting for rollout loop shutdown")
+        # Some environment threads may be waiting for the next episode rather
+        # than inside generate(). Wake them without clearing buffered rollouts;
+        # shutdown waste is collected after the rollout loop exits.
+        await self.env_output_queue.stop_admission.remote()
 
-        inflight_records = [
-            record
-            for worker_records in worker_snapshots
-            for record in worker_records
-        ]
-        shutdown_report = await self.env_output_queue.collect_shutdown_waste.remote(inflight_records)
-        boundary_recovery = await self.router_manager.collect_version_boundary_profile.remote()
-        shutdown_report["version_boundary_recovery"] = boundary_recovery
-        for name, value in boundary_recovery.get("metrics", {}).items():
-            shutdown_report["metrics"][f"version_boundary_recovery/{name}"] = value
-        await self.env_output_queue.shutdown.remote()
+        # Environment threads may be blocked in generate(). Abort those
+        # requests before waiting for the rollout loop to observe running=False.
         try:
             await asyncio.wait_for(
                 self.router_manager.shutdown.remote(),
@@ -3209,11 +3601,57 @@ class RolloutScheduler(RolloutMockMixin):
             timeout_stages.append("router")
             logger.warning("timed out stopping rollout router")
 
+        rollout_task_cancelled = False
+        done, _ = await asyncio.wait(
+            {self.rollout_task}, timeout=self.shutdown_grace_seconds
+        )
+        if not done:
+            # External environments such as SWE sandboxes can remain blocked in
+            # reset() after admission has stopped. The terminal snapshot is
+            # already complete, so detach that orchestration wait instead of
+            # delaying pipeline shutdown for work that cannot be consumed.
+            rollout_task_cancelled = True
+            self.rollout_task.cancel()
+            done, _ = await asyncio.wait(
+                {self.rollout_task}, timeout=timeout_seconds
+            )
+
+        if done:
+            if not self.rollout_task.cancelled():
+                self.rollout_task.result()
+        else:
+            timeout_stages.append("rollout_loop")
+            logger.warning("timed out cancelling rollout loop during shutdown")
+
+        inflight_records = [
+            record
+            for worker_records in worker_snapshots
+            for record in worker_records
+        ]
+        shutdown_report = await self.env_output_queue.collect_shutdown_waste.remote(inflight_records)
+        boundary_recovery, router_lifetime_metrics = await asyncio.gather(
+            self.router_manager.collect_version_boundary_profile.remote(),
+            self.router_manager.collect_lifetime_request_metrics.remote(),
+        )
+        shutdown_report["version_boundary_recovery"] = boundary_recovery
+        for name, value in boundary_recovery.get("metrics", {}).items():
+            shutdown_report["metrics"][f"version_boundary_recovery/{name}"] = value
+        shutdown_report["router_lifetime"] = {
+            "metrics": router_lifetime_metrics,
+        }
+        for name, value in router_lifetime_metrics.items():
+            shutdown_report["metrics"][f"router_lifetime/{name}"] = value
+        await self.env_output_queue.shutdown.remote()
+
         shutdown_report["shutdown"] = {
             "timeout_seconds": timeout_seconds,
             "timeout_stages": timeout_stages,
+            "rollout_task_cancelled": rollout_task_cancelled,
         }
         shutdown_report["metrics"]["terminal_waste/shutdown_timeouts"] = len(timeout_stages)
+        shutdown_report["metrics"]["terminal_waste/rollout_task_cancelled"] = int(
+            rollout_task_cancelled
+        )
         self.rollout_task = None
         return shutdown_report
 
@@ -3283,9 +3721,36 @@ class RolloutScheduler(RolloutMockMixin):
 
         learner_wait_start = time.time()
         get_task = asyncio.create_task(self._get_batch(batch_size, global_step))
-        await asyncio.wait({get_task, self.rollout_task}, return_when=asyncio.FIRST_COMPLETED)
-        if self.rollout_task.done() and self.rollout_task.exception() is not None:
-            await self.rollout_task
+        reconcile_interval = max(
+            0.1,
+            float(
+                getattr(
+                    self.config,
+                    "version_runtime_reconcile_interval_seconds",
+                    5.0,
+                )
+            ),
+        )
+        while not get_task.done():
+            done, _ = await asyncio.wait(
+                {get_task, self.rollout_task},
+                timeout=reconcile_interval,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if self.rollout_task in done and self.rollout_task.exception() is not None:
+                await self.rollout_task
+            if get_task.done():
+                break
+            if self.mode == "train":
+                revised_plan = (
+                    await self.env_output_queue.reconcile_version_progress.remote(
+                        global_step,
+                        batch_size,
+                        time.time() - learner_wait_start,
+                    )
+                )
+                if revised_plan is not None:
+                    await self.router_manager.update_runtime_plan.remote(revised_plan)
         data_batch = await get_task
         if self.mode == "train":
             await self.env_output_queue.record_learner_wait.remote(

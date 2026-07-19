@@ -1,15 +1,97 @@
 import asyncio
+import json
 import random
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import ray
+import numpy as np
 import pytest
+import torch
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from roll.distributed.scheduler.rollout_scheduler import (
+    apply_dynamic_reserve_hysteresis,
+    compute_progress_topup_groups,
+    compute_effective_rollout_utility,
+    compute_stale_control_signal,
+    finish_rate_bucket,
+    consume_utility_settle,
+    GroupQueue,
     RolloutScheduler,
     GroupQueueManager,
+    compute_dynamic_reserve,
+    update_utility_hill_climb,
+    update_constrained_utility_hill_climb,
+    update_bucketed_finish_ratios,
+    predict_bucketed_finish_supply,
+    build_version_runtime_plan,
+    summarize_version_boundary_records,
+    summarize_rollout_goodput,
 )
+
+
+def test_rollout_goodput_separates_raw_trainable_and_stale_tokens():
+    metrics = summarize_rollout_goodput(
+        [{"completed": True, "response_tokens": 20, "inference_tokens": 100}],
+        [
+            {
+                "completed": True,
+                "discard_reason": "version_stale_at_consume",
+                "response_tokens": 10,
+                "inference_tokens": 50,
+            }
+        ],
+        [{"completed": False, "response_tokens": 5, "inference_tokens": 25}],
+        elapsed_seconds=5,
+        learner_wait_seconds=1,
+    )
+
+    assert metrics["rollout/raw_response_tokens_per_second"] == 7
+    assert metrics["rollout/trainable_response_tokens_per_second"] == 4
+    assert metrics["rollout/stale_logical_token_fraction"] == 50 / 175
+    assert metrics["learner/wait_fraction"] == 0.2
+
+
+def test_rollout_goodput_excludes_consumed_placeholders_from_trainable_work():
+    metrics = summarize_rollout_goodput(
+        [
+            {
+                "completed": True,
+                "trainable_valid": True,
+                "response_tokens": 20,
+                "inference_tokens": 100,
+            },
+            {
+                "completed": True,
+                "placeholder": True,
+                "trainable_valid": False,
+                "response_tokens": 7,
+                "inference_tokens": 30,
+            },
+        ],
+        [],
+        [],
+        elapsed_seconds=2,
+        learner_wait_seconds=0,
+    )
+
+    assert metrics["rollout/learner_consumed_trajectories"] == 2
+    assert metrics["rollout/trainable_trajectories"] == 1
+    assert metrics["rollout/placeholder_trajectories"] == 1
+    assert metrics["rollout/trainable_response_tokens"] == 20
+    assert metrics["rollout/trainable_logical_inference_tokens"] == 100
+
+
+def test_reset_only_stale_count_does_not_enter_token_waste_signal():
+    token_fraction, trajectory_fraction = compute_stale_control_signal(
+        stale_tokens=0,
+        consumed_tokens=0,
+        stale_trajectories=3,
+        consumed_trajectories=0,
+    )
+
+    assert token_fraction is None
+    assert trajectory_fraction == 1.0
 from roll.distributed.executor.worker import Worker
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.agentic_pipeline import GroupFilter
@@ -17,6 +99,562 @@ from roll.pipeline.agentic.agentic_config import EnvMonitorConfig
 
 
 FULL_DATASET_ITER=4
+
+
+def test_version_boundary_summary_separates_survivors_and_expired_work():
+    records = [
+        {
+            "trajectory_id": "survivor",
+            "version_age_at_boundary": 2,
+            "will_expire": False,
+            "completed": False,
+            "actions_completed": 6,
+            "inference_calls": 6,
+            "tool_calls": 2,
+            "inference_tokens": 1200,
+            "current_context_tokens": 400,
+        },
+        {
+            "trajectory_id": "expired",
+            "version_age_at_boundary": 3,
+            "will_expire": True,
+            "completed": False,
+            "actions_completed": 8,
+            "inference_calls": 8,
+            "tool_calls": 4,
+            "inference_tokens": 2400,
+            "current_context_tokens": 800,
+        },
+        {
+            "trajectory_id": "ready",
+            "version_age_at_boundary": 1,
+            "will_expire": False,
+            "completed": True,
+            "actions_completed": 10,
+            "inference_calls": 10,
+            "inference_tokens": 3000,
+            "current_context_tokens": 1000,
+        },
+    ]
+
+    summary = summarize_version_boundary_records(
+        records,
+        from_version=4,
+        to_version=5,
+        staleness_tolerance=2,
+        reserved_unstarted=3,
+        unobserved_started=1,
+    )
+
+    assert summary["cross_version_trajectories"] == 2
+    assert summary["cross_version_invested_trajectories"] == 2
+    assert summary["survivor_trajectories"] == 1
+    assert summary["completed_carryover_trajectories"] == 1
+    assert summary["completed_survivor_trajectories"] == 1
+    assert summary["expired_trajectories"] == 1
+    assert summary["unfinished_started_trajectories"] == 2
+    assert summary["expired_actions"] == 8
+    assert summary["expired_logical_inference_tokens"] == 2400
+    assert summary["current_context_tokens"] == 2200
+    assert summary["reserved_unstarted_trajectories"] == 3
+
+
+def test_version_runtime_plan_unifies_admission_deadline_and_rebuild_cohort():
+    plan = build_version_runtime_plan(
+        version=7,
+        learner_demand=4,
+        safety_reserve=2,
+        expected_existing_supply=2.5,
+        outstanding_trajectories=8,
+        max_outstanding_trajectories=12,
+        admission_width=2,
+        group_size=2,
+        staleness_tolerance=2,
+        invested_candidate_groups=[
+            (3, 9, 1, 7, 1),
+            (2, 4, 2, 1, 2),
+            (1, 5, 2, 6, 1),
+        ],
+    )
+
+    assert plan.admission_budget == 4
+    assert plan.admission_budget_trainable == 4
+    assert plan.admission_reason == "supply_deficit"
+    assert plan.admission_deficit == 3.5
+    assert plan.priority_deadline_version == 9
+    assert plan.priority_candidate_groups == ("1:5", "2:4", "3:9")
+    assert plan.rebuild_candidate_groups == ("1:5", "2:4", "3:9")
+    assert plan.rebuild_target_trajectories == 4
+    assert plan.revision == 0
+    assert plan.admission_delta_trajectories == 4
+
+
+def test_version_runtime_plan_rebuilds_only_gpu_invested_working_set():
+    plan = build_version_runtime_plan(
+        version=7,
+        learner_demand=4,
+        safety_reserve=0,
+        expected_existing_supply=2,
+        outstanding_trajectories=8,
+        max_outstanding_trajectories=12,
+        admission_width=2,
+        group_size=2,
+        staleness_tolerance=2,
+        invested_candidate_groups=[
+            (1, 2, 2, 0, 2),
+            (3, 4, 1, 5, 2),
+        ],
+        gpu_invested_candidate_groups=[
+            (3, 4, 1, 5, 1),
+        ],
+        revision=2,
+    )
+
+    assert plan.priority_candidate_groups == ("1:2", "3:4")
+    assert plan.rebuild_candidate_groups == ("3:4",)
+    assert plan.rebuild_target_trajectories == 1
+    assert plan.revision == 2
+
+
+def test_version_runtime_plan_keeps_priority_and_kv_when_admission_is_disabled():
+    plan = build_version_runtime_plan(
+        version=5,
+        learner_demand=4,
+        safety_reserve=0,
+        expected_existing_supply=1,
+        outstanding_trajectories=12,
+        max_outstanding_trajectories=12,
+        admission_width=2,
+        group_size=2,
+        staleness_tolerance=1,
+        invested_candidate_groups=[
+            (2, 3, 1, 4, 2),
+            (1, 7, 0, 8, 1),
+        ],
+        admission_enabled=False,
+        priority_enabled=True,
+    )
+
+    assert plan.admission_budget == 0
+    assert plan.admission_reason == "disabled"
+    assert plan.priority_candidate_groups == ("2:3", "1:7")
+    assert plan.rebuild_candidate_groups == ("2:3", "1:7")
+
+
+def test_version_runtime_plan_explains_outstanding_capacity_limit():
+    plan = build_version_runtime_plan(
+        version=5,
+        learner_demand=8,
+        safety_reserve=0,
+        expected_existing_supply=0,
+        outstanding_trajectories=12,
+        max_outstanding_trajectories=12,
+        admission_width=2,
+        group_size=2,
+        staleness_tolerance=1,
+        invested_candidate_groups=[],
+    )
+
+    assert plan.admission_budget == 0
+    assert plan.admission_capacity == 0
+    assert plan.admission_reason == "outstanding_cap"
+
+
+def test_discard_metrics_fall_back_to_trajectory_data():
+    trajectory_data = {
+        "version_info": {"version_start": 2, "version_end": 3, "version_age": 1},
+        "waste_info": {
+            "completed": True,
+            "actions_completed": 7,
+            "inference_calls": 7,
+            "tool_calls": 2,
+            "prompt_tokens_total": 1200,
+            "response_tokens_total": 300,
+            "inference_tokens_total": 1500,
+            "env_seconds_total": 4.5,
+            "generate_seconds_total": 3.0,
+        },
+    }
+    rollout = DataProto.from_single_dict({
+        "input_ids": torch.zeros((2, 1), dtype=torch.long),
+        "trajectory_data": np.array([None, json.dumps(trajectory_data)], dtype=object),
+    })
+
+    assert GroupQueue._metric_by_suffix(rollout, "/traj_actions_completed") == 7
+    assert GroupQueue._metric_by_suffix(rollout, "/traj_actions_ge_4") == 1
+    assert GroupQueue._metric_by_suffix(rollout, "/traj_inference_tokens_total") == 1500
+    assert GroupQueue._metric_by_suffix(rollout, "/traj_version_start") == 2
+
+    rollout.meta_info["metrics"] = {
+        "env/WebShopEnv/traj_actions_completed": [7.0, 7.0],
+    }
+    assert GroupQueue._metric_by_suffix(rollout, "/traj_actions_completed") == 7
+
+
+def test_discard_record_uses_boundary_snapshot_and_deduplicates():
+    queue = GroupQueue.__new__(GroupQueue)
+    queue.group_id = 3
+    queue.current_step = 4
+    queue.discard_records = []
+    queue.discard_record_indices = {}
+    queue.dirty_discard_indices = set()
+    queue.progress_snapshots = {}
+
+    group = type("Group", (), {"group_id": 3, "episode_id": 5, "create_step": 1})()
+    rollout = DataProto.from_single_dict({
+        "input_ids": torch.zeros((1, 1), dtype=torch.long),
+        "env_ids": np.array([9], dtype=object),
+        "traj_id": np.array(["trajectory-9"], dtype=object),
+    })
+    queue.update_progress_snapshots([{
+        "group_id": 3,
+        "episode_id": 5,
+        "env_id": 9,
+        "version_start": 1,
+        "version_end": 3,
+        "reset_completed": True,
+        "completed": False,
+        "truncated": False,
+        "actions_completed": 6,
+        "inference_calls": 6,
+        "tool_calls": 0,
+        "prompt_tokens": 900,
+        "response_tokens": 240,
+        "inference_tokens": 1140,
+        "generate_seconds": 2.0,
+        "env_seconds": 3.0,
+    }])
+    queue.update_progress_snapshots([{
+        "group_id": 3,
+        "episode_id": 5,
+        "env_id": 9,
+        "actions_completed": 0,
+        "inference_calls": 0,
+        "inference_tokens": 0,
+    }])
+
+    queue.record_discarded_rollout(rollout, group, "version_expired_buffered", 4)
+    queue.record_discarded_rollout(rollout, group, "version_expired_late_return", 4)
+
+    assert len(queue.discard_records) == 1
+    assert queue.discard_records[0]["actions_completed"] == 6
+    assert queue.discard_records[0]["inference_tokens"] == 1140
+    assert queue.discard_records[0]["discard_reason"] == "version_expired_late_return"
+
+
+def test_tensor_progress_recovers_completed_rollout_without_metadata():
+    rollout = DataProto.from_single_dict({
+        "response_mask": torch.tensor([[0, 1, 1, 0, 0, 1, 1]], dtype=torch.long),
+        "attention_mask": torch.ones((1, 7), dtype=torch.long),
+    })
+
+    assert GroupQueue._tensor_progress(rollout) == {
+        "actions_completed": 2,
+        "inference_calls": 2,
+        "prompt_tokens": 6,
+        "response_tokens": 4,
+        "inference_tokens": 10,
+        "current_context_tokens": 7,
+    }
+
+
+def test_consumed_metrics_preserve_version_age_and_progress_distribution():
+    records = [
+        {
+            "version_age": 0,
+            "actions_completed": 5,
+            "prompt_tokens": 100,
+            "response_tokens": 20,
+            "inference_tokens": 120,
+        },
+        {
+            "version_age": 2,
+            "actions_completed": 10,
+            "prompt_tokens": 300,
+            "response_tokens": 40,
+            "inference_tokens": 340,
+        },
+    ]
+
+    metrics, histograms = GroupQueueManager._aggregate_consumed_records(records, "consumed")
+
+    assert metrics["consumed/trajectories"] == 2
+    assert metrics["consumed/version_age_sum"] == 2
+    assert metrics["consumed/version_age_max"] == 2
+    assert metrics["consumed/actions"] == 15
+    assert metrics["consumed/inference_tokens"] == 460
+    assert histograms["version_age"] == {"0": 1, "2": 1}
+    assert histograms["actions_completed"] == {"5": 1, "10": 1}
+
+
+def test_completed_rollout_record_recovers_tensor_progress():
+    group = type("Group", (), {"group_id": 1, "episode_id": 2, "create_step": 3})()
+    rollout = DataProto.from_single_dict({
+        "response_mask": torch.tensor([[0, 1, 1, 0, 1]], dtype=torch.long),
+        "attention_mask": torch.ones((1, 5), dtype=torch.long),
+        "env_ids": np.array([4], dtype=object),
+        "traj_id": np.array(["trajectory-4"], dtype=object),
+    })
+
+    record = GroupQueueManager._completed_rollout_record(rollout, group)
+
+    assert record["actions_completed"] == 2
+    assert record["inference_calls"] == 2
+    assert record["response_tokens"] == 3
+    assert record["inference_tokens"] == 8
+
+
+def test_dynamic_reserve_increases_on_wait_and_decays_on_waste():
+    common = {
+        "reserve_min": 0,
+        "reserve_max": 8,
+        "additive_step": 2,
+        "multiplicative_decay": 0.5,
+        "warmup_versions": 2,
+        "wait_high": 2.0,
+        "stale_high": 0.25,
+        "prediction_error_margin": 1.0,
+    }
+
+    assert compute_dynamic_reserve(4, 1, 8.0, 0.0, 0.0, **common) == (4, 4)
+    assert compute_dynamic_reserve(4, 2, 8.0, 0.0, 0.0, **common) == (6, 1)
+    assert compute_dynamic_reserve(6, 3, 0.5, 1.0, 0.0, **common) == (2, 2)
+    assert compute_dynamic_reserve(4, 3, 0.5, 0.0, -2.0, **common) == (2, 3)
+    assert compute_dynamic_reserve(4, 3, 1.0, 0.0, 0.0, **common) == (4, 0)
+
+
+def test_dynamic_reserve_trace_converges_into_deadband():
+    common = {
+        "reserve_min": 0,
+        "reserve_max": 8,
+        "additive_step": 2,
+        "multiplicative_decay": 0.5,
+        "warmup_versions": 0,
+        "wait_high": 2.0,
+        "stale_high": 0.25,
+        "prediction_error_margin": 1.0,
+    }
+    trace = [
+        (8.0, 0.0, 0.0),
+        (4.0, 0.0, 0.0),
+        (0.5, 1.0, -2.0),
+        (1.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+    ]
+    reserve = 0
+    observed = []
+    for version, (wait, stale, error) in enumerate(trace):
+        reserve, _ = compute_dynamic_reserve(
+            reserve, version, wait, stale, error, **common
+        )
+        observed.append(reserve)
+
+    assert observed == [2, 4, 2, 2, 2]
+
+
+def test_dynamic_reserve_hysteresis_requires_confirmation_and_cools_down():
+    state = (4, 0, 0, 0)
+    observed = []
+    for candidate, reason in [(6, 1), (6, 1), (8, 1), (8, 1), (2, 3), (2, 3)]:
+        reserve, pending_direction, pending_count, cooldown = state
+        updated, applied_reason, pending_direction, pending_count, cooldown = (
+            apply_dynamic_reserve_hysteresis(
+                reserve,
+                candidate,
+                reason,
+                pending_direction,
+                pending_count,
+                cooldown,
+                signal_patience=2,
+                cooldown_versions=2,
+            )
+        )
+        state = (updated, pending_direction, pending_count, cooldown)
+        observed.append((updated, applied_reason, pending_count, cooldown))
+
+    assert observed == [
+        (4, 6, 1, 0),
+        (6, 1, 0, 2),
+        (6, 6, 0, 1),
+        (6, 6, 0, 0),
+        (6, 6, 1, 0),
+        (2, 3, 0, 2),
+    ]
+
+
+def test_effective_rollout_utility_allows_idle_but_penalizes_stale_work():
+    utility, useful_rate, stale_rate, compute_efficiency = compute_effective_rollout_utility(
+        consumed_response_tokens=100,
+        consumed_inference_tokens=1000,
+        stale_inference_tokens=200,
+        elapsed_seconds=2.0,
+        waste_weight=1.5,
+    )
+
+    assert useful_rate == 50.0
+    assert stale_rate == 100.0
+    assert compute_efficiency == pytest.approx(1000 / 1300)
+    assert utility == pytest.approx(50 * 1000 / 1300)
+
+
+def test_utility_hill_climb_reverses_one_step_after_regression():
+    first = update_utility_hill_climb(
+        reserve=4,
+        direction=1,
+        utility=100.0,
+        previous_utility=None,
+        reserve_min=0,
+        reserve_max=8,
+        additive_step=2,
+        improvement_margin=0.05,
+    )
+    regressed = update_utility_hill_climb(
+        reserve=first[0],
+        direction=first[1],
+        utility=80.0,
+        previous_utility=100.0,
+        reserve_min=0,
+        reserve_max=8,
+        additive_step=2,
+        improvement_margin=0.05,
+    )
+
+    assert first == (6, 1, 7)
+    assert regressed == (4, -1, 9)
+
+
+def test_constrained_utility_controller_reduces_reserve_below_efficiency_floor():
+    updated = update_constrained_utility_hill_climb(
+        reserve=6,
+        direction=1,
+        utility=120.0,
+        previous_utility=100.0,
+        compute_efficiency=0.80,
+        min_compute_efficiency=0.95,
+        reserve_min=0,
+        reserve_max=8,
+        additive_step=2,
+        improvement_margin=0.05,
+    )
+
+    assert updated == (4, -1, 11)
+
+
+def test_constrained_utility_controller_optimizes_after_efficiency_guard_passes():
+    updated = update_constrained_utility_hill_climb(
+        reserve=4,
+        direction=1,
+        utility=110.0,
+        previous_utility=100.0,
+        compute_efficiency=0.98,
+        min_compute_efficiency=0.95,
+        reserve_min=0,
+        reserve_max=8,
+        additive_step=2,
+        improvement_margin=0.05,
+    )
+
+    assert updated == (6, 1, 8)
+
+
+def test_progress_floor_only_admits_minimum_bounded_supply():
+    assert compute_progress_topup_groups(4, 0, 0, 24, 2, 2) == 2
+    assert compute_progress_topup_groups(4, 2, 22, 24, 2, 2) == 1
+    assert compute_progress_topup_groups(4, 4, 0, 24, 2, 2) == 0
+
+
+def test_finish_rate_bucket_captures_version_age_and_action_progress():
+    assert finish_rate_bucket(0, 0) == "age_0__actions_0"
+    assert finish_rate_bucket(2, 3) == "age_2__actions_2_3"
+    assert finish_rate_bucket(3, 7) == "age_3__actions_4_7"
+    assert finish_rate_bucket(9, 12) == "age_ge_4__actions_ge_8"
+
+
+def test_bucketed_finish_predictor_learns_and_falls_back_per_cohort():
+    ratios = {}
+    samples = {}
+    update_bucketed_finish_ratios(
+        ratios,
+        samples,
+        {"age_1__actions_0": 4, "age_1__actions_4_7": 4},
+        {"age_1__actions_0": 0, "age_1__actions_4_7": 4},
+        ewma_alpha=0.5,
+    )
+
+    expected, learned, fallback = predict_bucketed_finish_supply(
+        {
+            "age_1__actions_0": 2,
+            "age_1__actions_4_7": 2,
+            "age_2__actions_1": 2,
+        },
+        ratios,
+        samples,
+        fallback_ratio=0.5,
+        min_bucket_samples=4,
+    )
+
+    assert ratios == {
+        "age_1__actions_0": 0.0,
+        "age_1__actions_4_7": 1.0,
+    }
+    assert samples == {"age_1__actions_0": 4, "age_1__actions_4_7": 4}
+    assert expected == 3.0
+    assert learned == 4
+    assert fallback == 2
+
+
+def test_version_adaptive_completion_is_attributed_before_learner_consumption():
+    manager_cls = GroupQueueManager.__ray_metadata__.modified_class
+    manager = manager_cls.__new__(manager_cls)
+    manager.admission_policy = "version_adaptive"
+    manager.group_size = 2
+    manager._tracked_unfinished_groups = {(3, 7)}
+    manager._tracked_unfinished_group_buckets = {
+        (3, 7): "age_1__actions_4_7",
+    }
+    manager._tracked_unfinished_completed = 0
+    manager._tracked_unfinished_bucket_completed = {}
+
+    manager._record_version_adaptive_completion(3, 7)
+
+    assert manager._tracked_unfinished_completed == 2
+    assert manager._tracked_unfinished_bucket_completed == {
+        "age_1__actions_4_7": 2,
+    }
+
+
+def test_trainable_frontier_uses_group_size_order_statistic():
+    queue = GroupQueue.__new__(GroupQueue)
+    queue.group_id = 1
+    queue.group_size = 2
+    queue.progress_snapshots = {}
+    group = type(
+        "Group",
+        (),
+        {"group_id": 1, "episode_id": 8, "create_step": 0, "rollouts": []},
+    )()
+    queue.update_progress_snapshots([
+        {"group_id": 1, "episode_id": 8, "env_id": 0, "actions_completed": 2},
+        {"group_id": 1, "episode_id": 8, "env_id": 1, "actions_completed": 7},
+        {"group_id": 1, "episode_id": 8, "env_id": 2, "actions_completed": 10},
+    ])
+
+    # With group_size=2 and one redundant candidate, the second-highest progress
+    # is the frontier that determines whether the group can become trainable.
+    assert queue.trainable_frontier_actions(group) == 7
+    assert queue.trainable_progress_summary(group) == {
+        "mean_actions": 8,
+        "frontier_actions": 7,
+        "max_actions": 10,
+        "observed_candidates": 2,
+        "gpu_invested_candidates": 0,
+    }
+
+
+def test_utility_settle_excludes_transition_observations():
+    assert consume_utility_settle(2) == (False, 1)
+    assert consume_utility_settle(1) == (False, 0)
+    assert consume_utility_settle(0) == (True, 0)
 
 class MockGroupFilter(GroupFilter):
     def filter(self, group_id: int, episode_id: int, group: list[DataProto]):
