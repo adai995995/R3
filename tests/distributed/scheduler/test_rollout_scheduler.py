@@ -207,13 +207,41 @@ def test_version_runtime_plan_rebuilds_only_gpu_invested_working_set():
         gpu_invested_candidate_groups=[
             (3, 4, 1, 5, 1),
         ],
+        gpu_invested_candidate_trajectories=[
+            ("trajectory-9", 3, 4, 9, 1, 5),
+        ],
         revision=2,
     )
 
     assert plan.priority_candidate_groups == ("1:2", "3:4")
     assert plan.rebuild_candidate_groups == ("3:4",)
+    assert plan.rebuild_candidate_trajectories == ("trajectory-9",)
+    assert plan.rebuild_cohort_exact is True
     assert plan.rebuild_target_trajectories == 1
     assert plan.revision == 2
+
+
+def test_version_runtime_plan_carries_engine_feedback_into_decision_snapshot():
+    plan = build_version_runtime_plan(
+        version=8,
+        learner_demand=2,
+        safety_reserve=0,
+        expected_existing_supply=2,
+        outstanding_trajectories=2,
+        max_outstanding_trajectories=4,
+        admission_width=1,
+        group_size=1,
+        staleness_tolerance=2,
+        invested_candidate_groups=[],
+        gpu_invested_candidate_trajectories=[],
+        kv_feedback_requests=20,
+        kv_feedback_hit_ratio=0.625,
+        kv_feedback_resets=4,
+    )
+
+    assert plan.kv_feedback_requests == 20
+    assert plan.kv_feedback_hit_ratio == 0.625
+    assert plan.kv_feedback_resets == 4
 
 
 def test_version_runtime_plan_keeps_priority_and_kv_when_admission_is_disabled():

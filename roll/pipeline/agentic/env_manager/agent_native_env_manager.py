@@ -2,6 +2,7 @@ import copy
 import json
 import time
 from datetime import datetime
+from threading import Lock
 from typing import List, Union, Dict, Optional
 
 import numpy as np
@@ -34,6 +35,16 @@ class AgentNativeStepEnvManager(TrajEnvManager):
     tools: List[Dict]
     traj_start_time: float
     runtime_phase: str
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._progress_snapshot_lock = Lock()
+        self._latest_progress_snapshot = None
+
+    def _publish_progress_snapshot(self):
+        snapshot = self._build_progress_snapshot()
+        with self._progress_snapshot_lock:
+            self._latest_progress_snapshot = copy.deepcopy(snapshot)
 
     def run_rollout_loop(self, data: DataProto):
         assert "seed" in data.meta_info
@@ -69,6 +80,7 @@ class AgentNativeStepEnvManager(TrajEnvManager):
 
             max_reset_retries = 0
             self.runtime_phase = "inference"
+            self._publish_progress_snapshot()
             with Timer(name="generate", logger=None) as generate_timer:
                 lm_output: DataProto = self.make_decision(rollout_cache)
                 stop_reason = lm_output.meta_info.pop("stop_reason")
@@ -83,15 +95,19 @@ class AgentNativeStepEnvManager(TrajEnvManager):
                     self.stop_reason = EpisodeStopReason.ABORT
             self.log_stats["current_step"].append(self.current_step)
             self.log_stats["generate_time"].append(round(generate_timer.last))
+            self._publish_progress_snapshot()
 
             self.runtime_phase = "tool_or_environment"
+            self._publish_progress_snapshot()
             with Timer(name="step", logger=None) as step_timer:
                 if stop_reason == GenerateStopReason.FINISH:
                     rollout_cache: RolloutCache = self.step(lm_output)
             self.log_stats["step_time"].append(round(step_timer.last, 4))
+            self._publish_progress_snapshot()
 
             if self.running and rollout_cache.terminated:
                 self.runtime_phase = "completed_not_submitted"
+                self._publish_progress_snapshot()
                 rollout: DataProto = self.formulate_rollouts(rollout_cache)
                 traj_group_id = f"{self.rollout_cache.tag}_{self.rollout_cache.group_id}_{self.episode_id}_{self.group_seed}"
                 traj_id = f"{traj_group_id}_{self.rollout_cache.env_id}"
@@ -103,6 +119,7 @@ class AgentNativeStepEnvManager(TrajEnvManager):
                 start_step = self.current_step
             elif self.running:
                 self.runtime_phase = "ready_for_inference"
+                self._publish_progress_snapshot()
 
         ray.get(self.output_queue.put.remote(self.env_config['group_id'], self.episode_id, start_step, None, self.env_config['env_id']))
 
@@ -125,6 +142,7 @@ class AgentNativeStepEnvManager(TrajEnvManager):
 
         seed = self.group_seed + self.episode_id
         self.traj_start_time = time.time()
+        self._publish_progress_snapshot()
         observation, info = self.env.reset(seed=seed)
         if observation is None:
             return None
@@ -144,6 +162,7 @@ class AgentNativeStepEnvManager(TrajEnvManager):
             **info,
         })
         self.runtime_phase = "ready_for_inference"
+        self._publish_progress_snapshot()
         return self.rollout_cache
 
     def step(self, llm_output: DataProto):
@@ -239,8 +258,8 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         current_cache['messages'] = messages
         return lm_input
 
-    def get_progress_snapshot(self) -> Optional[Dict]:
-        """Return local progress for the trajectory that has not been submitted yet."""
+    def _build_progress_snapshot(self) -> Optional[Dict]:
+        """Build a progress snapshot from the rollout thread's current state."""
         rollout_cache = self.rollout_cache
         if rollout_cache is None or self.episode_id is None:
             return None
@@ -299,6 +318,11 @@ class AgentNativeStepEnvManager(TrajEnvManager):
             "env_seconds": float(env_seconds),
             "trajectory_wall_seconds": float(trajectory_wall_seconds),
         }
+
+    def get_progress_snapshot(self) -> Optional[Dict]:
+        """Return the last immutable snapshot published by the rollout thread."""
+        with self._progress_snapshot_lock:
+            return copy.deepcopy(self._latest_progress_snapshot)
 
     def formulate_rollouts(self, rollout_cache: RolloutCache):
         """

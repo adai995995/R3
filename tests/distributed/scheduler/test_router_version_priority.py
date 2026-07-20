@@ -143,6 +143,171 @@ def test_online_plan_revision_does_not_advance_cache_epoch():
     asyncio.run(run_test())
 
 
+def test_online_plan_revision_replaces_rebuild_cohort():
+    async def run_test():
+        router = EnvAffinityRouter(
+            RouterManagerStub(),
+            [object()],
+            None,
+            SimpleNamespace(
+                max_running_requests=8,
+                router_config={
+                    "post_update_rebuild_enabled": True,
+                    "post_update_rebuild_requests": 2,
+                },
+            ),
+        )
+        await router.initialize()
+        router.on_version_resume(
+            {
+                "version": 3,
+                "revision": 0,
+                "rebuild_candidate_groups": ["1:1"],
+                "rebuild_candidate_trajectories": ["old-trajectory"],
+                "rebuild_cohort_exact": True,
+                "rebuild_target_trajectories": 1,
+            }
+        )
+
+        router.on_runtime_plan_update(
+            {
+                "version": 3,
+                "revision": 1,
+                "rebuild_candidate_groups": ["2:2"],
+                "rebuild_candidate_trajectories": ["new-trajectory"],
+                "rebuild_cohort_exact": True,
+                "rebuild_target_trajectories": 2,
+            }
+        )
+
+        assert router.rebuild_candidate_groups == {"2:2"}
+        assert router.rebuild_candidate_trajectories == {"new-trajectory"}
+        assert router.rebuild_target == 2
+        assert router.rebuild_remaining == 2
+
+    asyncio.run(run_test())
+
+
+def test_exact_rebuild_cohort_rejects_uninvested_trajectory_in_same_group():
+    async def run_test():
+        router = EnvAffinityRouter(
+            RouterManagerStub(),
+            [object()],
+            None,
+            SimpleNamespace(
+                max_running_requests=8,
+                router_config={
+                    "post_update_rebuild_enabled": True,
+                    "post_update_rebuild_requests": 1,
+                },
+            ),
+        )
+        await router.initialize()
+        router.on_version_resume(
+            {
+                "version": 3,
+                "rebuild_candidate_groups": ["1:2"],
+                "rebuild_candidate_trajectories": ["invested"],
+                "rebuild_cohort_exact": True,
+                "rebuild_target_trajectories": 1,
+            }
+        )
+        uninvested = TrajectoryRuntimeState(
+            "uninvested",
+            policy_version=2,
+            current_version=3,
+            version_age=1,
+            actions_completed=0,
+            max_actions=10,
+            group_id=1,
+            episode_id=2,
+        )
+        invested = TrajectoryRuntimeState(
+            "invested",
+            policy_version=2,
+            current_version=3,
+            version_age=1,
+            actions_completed=4,
+            max_actions=10,
+            group_id=1,
+            episode_id=2,
+        )
+
+        _, uninvested_assignment = await router._prepare_first_epoch_request(
+            uninvested, "uninvested", [1, 2]
+        )
+        _, invested_assignment = await router._prepare_first_epoch_request(
+            invested, "invested", [1, 2]
+        )
+
+        assert uninvested_assignment is None
+        assert invested_assignment is not None
+        assert router.rebuild_remaining == 0
+
+    asyncio.run(run_test())
+
+
+def test_version_change_releases_pending_rebuild_waiter():
+    async def run_test():
+        router = EnvAffinityRouter(
+            RouterManagerStub(),
+            [object()],
+            None,
+            SimpleNamespace(
+                max_running_requests=8,
+                router_config={
+                    "post_update_rebuild_enabled": True,
+                    "post_update_rebuild_requests": 1,
+                    "post_update_rebuild_coalesce_seconds": 10.0,
+                },
+            ),
+        )
+        await router.initialize()
+        router.on_version_resume(
+            {
+                "version": 3,
+                "rebuild_candidate_trajectories": ["trajectory-a"],
+                "rebuild_cohort_exact": True,
+                "rebuild_target_trajectories": 1,
+            }
+        )
+        state = TrajectoryRuntimeState(
+            "trajectory-a",
+            policy_version=2,
+            current_version=3,
+            version_age=1,
+            actions_completed=3,
+            max_actions=10,
+        )
+        request = asyncio.create_task(
+            router._prepare_first_epoch_request(
+                state, "trajectory-a", [1, 2, 3]
+            )
+        )
+        await asyncio.sleep(0)
+        flush_task = router.rebuild_flush_task
+        assert len(router.rebuild_pending) == 1
+
+        router.on_version_resume(
+            {
+                "version": 4,
+                "rebuild_candidate_trajectories": [],
+                "rebuild_cohort_exact": True,
+                "rebuild_target_trajectories": 0,
+            }
+        )
+        first_epoch_request, assignment = await asyncio.wait_for(
+            request, timeout=0.1
+        )
+        await asyncio.gather(flush_task, return_exceptions=True)
+
+        assert first_epoch_request is True
+        assert assignment is None
+        assert router.rebuild_pending == []
+
+    asyncio.run(run_test())
+
+
 def test_priority_coalesce_compares_arrivals_before_dispatch():
     async def run_test():
         router = EnvAffinityRouter(

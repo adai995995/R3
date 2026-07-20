@@ -326,6 +326,13 @@ class VersionRuntimeState:
     gpu_invested_candidate_groups: Optional[
         Tuple[Tuple[int, int, int, int, int], ...]
     ] = None
+    gpu_invested_candidate_trajectories: Tuple[
+        Tuple[str, int, int, int, int, int], ...
+    ] = ()
+    exact_rebuild_cohort: bool = False
+    kv_feedback_requests: int = 0
+    kv_feedback_hit_ratio: float = 0.0
+    kv_feedback_resets: int = 0
 
 
 @dataclass(frozen=True)
@@ -347,7 +354,12 @@ class VersionRuntimePlan:
     priority_deadline_version: int
     priority_candidate_groups: Tuple[str, ...]
     rebuild_candidate_groups: Tuple[str, ...]
+    rebuild_candidate_trajectories: Tuple[str, ...]
+    rebuild_cohort_exact: bool
     rebuild_target_trajectories: int
+    kv_feedback_requests: int = 0
+    kv_feedback_hit_ratio: float = 0.0
+    kv_feedback_resets: int = 0
     revision: int = 0
     admission_delta_trajectories: int = 0
 
@@ -368,7 +380,14 @@ class VersionRuntimePlan:
             "priority_deadline_version": self.priority_deadline_version,
             "priority_candidate_groups": list(self.priority_candidate_groups),
             "rebuild_candidate_groups": list(self.rebuild_candidate_groups),
+            "rebuild_candidate_trajectories": list(
+                self.rebuild_candidate_trajectories
+            ),
+            "rebuild_cohort_exact": self.rebuild_cohort_exact,
             "rebuild_target_trajectories": self.rebuild_target_trajectories,
+            "kv_feedback_requests": self.kv_feedback_requests,
+            "kv_feedback_hit_ratio": self.kv_feedback_hit_ratio,
+            "kv_feedback_resets": self.kv_feedback_resets,
             "revision": self.revision,
             "admission_delta_trajectories": self.admission_delta_trajectories,
         }
@@ -425,6 +444,10 @@ class VersionAwareRuntimeController:
         admission_delta = admitted_groups * max(1, int(state.admission_width))
         return replace(
             active_plan,
+            learner_demand=candidate_plan.learner_demand,
+            safety_reserve=candidate_plan.safety_reserve,
+            expected_existing_supply=candidate_plan.expected_existing_supply,
+            outstanding_trajectories=candidate_plan.outstanding_trajectories,
             revision=active_plan.revision + 1,
             admission_enabled=True,
             admission_budget=active_plan.admission_budget + admission_delta,
@@ -433,11 +456,20 @@ class VersionAwareRuntimeController:
                 + admitted_groups * max(1, int(state.group_size))
             ),
             admission_reason="progress_reconcile",
+            admission_deficit=candidate_plan.admission_deficit,
+            admission_capacity=candidate_plan.admission_capacity,
             priority_candidate_groups=candidate_plan.priority_candidate_groups,
             rebuild_candidate_groups=candidate_plan.rebuild_candidate_groups,
+            rebuild_candidate_trajectories=(
+                candidate_plan.rebuild_candidate_trajectories
+            ),
+            rebuild_cohort_exact=candidate_plan.rebuild_cohort_exact,
             rebuild_target_trajectories=(
                 candidate_plan.rebuild_target_trajectories
             ),
+            kv_feedback_requests=candidate_plan.kv_feedback_requests,
+            kv_feedback_hit_ratio=candidate_plan.kv_feedback_hit_ratio,
+            kv_feedback_resets=candidate_plan.kv_feedback_resets,
             admission_delta_trajectories=admission_delta,
         )
 
@@ -505,6 +537,28 @@ class VersionAwareRuntimeController:
             f"{int(group_id)}:{int(episode_id)}"
             for group_id, episode_id, _, _, _ in rebuild_ordered_candidates
         )
+        rebuild_ordered_trajectories = sorted(
+            state.gpu_invested_candidate_trajectories,
+            key=lambda item: (
+                -int(item[4]),
+                -int(item[5]),
+                int(item[1]),
+                int(item[2]),
+                int(item[3]),
+                str(item[0]),
+            ),
+        )
+        rebuild_candidate_trajectories = tuple(
+            str(trajectory_id)
+            for trajectory_id, _, _, _, _, _ in rebuild_ordered_trajectories
+        )
+        if rebuild_candidate_trajectories:
+            rebuild_candidate_keys = tuple(
+                dict.fromkeys(
+                    f"{int(group_id)}:{int(episode_id)}"
+                    for _, group_id, episode_id, _, _, _ in rebuild_ordered_trajectories
+                )
+            )
         priority_candidates = candidate_keys if state.priority_enabled else ()
         return VersionRuntimePlan(
             version=int(state.version),
@@ -527,10 +581,21 @@ class VersionAwareRuntimeController:
             + max(0, int(state.staleness_tolerance)),
             priority_candidate_groups=priority_candidates,
             rebuild_candidate_groups=rebuild_candidate_keys,
-            rebuild_target_trajectories=sum(
-                max(0, int(invested))
-                for _, _, _, _, invested in rebuild_ordered_candidates
+            rebuild_candidate_trajectories=rebuild_candidate_trajectories,
+            rebuild_cohort_exact=bool(state.exact_rebuild_cohort),
+            rebuild_target_trajectories=(
+                len(rebuild_candidate_trajectories)
+                if state.exact_rebuild_cohort
+                else sum(
+                    max(0, int(invested))
+                    for _, _, _, _, invested in rebuild_ordered_candidates
+                )
             ),
+            kv_feedback_requests=max(0, int(state.kv_feedback_requests)),
+            kv_feedback_hit_ratio=min(
+                1.0, max(0.0, float(state.kv_feedback_hit_ratio))
+            ),
+            kv_feedback_resets=max(0, int(state.kv_feedback_resets)),
             revision=max(0, int(state.revision)),
             admission_delta_trajectories=admitted_groups * width,
         )
@@ -554,6 +619,12 @@ def build_version_runtime_plan(
     gpu_invested_candidate_groups: Optional[
         List[Tuple[int, int, int, int, int]]
     ] = None,
+    gpu_invested_candidate_trajectories: Optional[
+        List[Tuple[str, int, int, int, int, int]]
+    ] = None,
+    kv_feedback_requests: int = 0,
+    kv_feedback_hit_ratio: float = 0.0,
+    kv_feedback_resets: int = 0,
 ) -> VersionRuntimePlan:
     """Build the boundary plan consumed by both the queue manager and Router.
 
@@ -580,6 +651,13 @@ def build_version_runtime_plan(
             if gpu_invested_candidate_groups is None
             else tuple(gpu_invested_candidate_groups)
         ),
+        gpu_invested_candidate_trajectories=tuple(
+            gpu_invested_candidate_trajectories or ()
+        ),
+        exact_rebuild_cohort=gpu_invested_candidate_trajectories is not None,
+        kv_feedback_requests=kv_feedback_requests,
+        kv_feedback_hit_ratio=kv_feedback_hit_ratio,
+        kv_feedback_resets=kv_feedback_resets,
     )
     plan = VersionAwareRuntimeController().decide(state)
     assert plan is not None
@@ -980,6 +1058,7 @@ class GroupQueue:
         self.group_filter_response_tokens = 0.0
         self.group_filter_inference_tokens = 0.0
         self.group_filter_env_seconds = 0.0
+        self.version_priority_ready_bypass_total = 0
         self.env_monitor = env_monitor
 
         self.current_step = None
@@ -1414,6 +1493,39 @@ class GroupQueue:
     def trainable_frontier_actions(self, group: GroupData) -> int:
         return self.trainable_progress_summary(group)["frontier_actions"]
 
+    def gpu_invested_trajectory_candidates(
+        self, group: GroupData
+    ) -> List[Tuple[str, int, int]]:
+        """Return unfinished trajectory identities that already used inference work."""
+        completed_env_ids = {
+            int(self._first_non_tensor_value(rollout, "env_ids", -1))
+            for rollout in group.rollouts
+            if rollout is not None
+        }
+        candidates: Dict[int, Tuple[str, int, int]] = {}
+        for (episode_id, env_id), progress in self.progress_snapshots.items():
+            if episode_id != group.episode_id or int(env_id) in completed_env_ids:
+                continue
+            if bool(progress.get("completed", False)):
+                continue
+            if not (
+                int(progress.get("inference_calls", 0)) > 0
+                or int(progress.get("current_context_tokens", 0)) > 0
+                or int(progress.get("inference_tokens", 0)) > 0
+            ):
+                continue
+            trajectory_id = str(
+                progress.get(
+                    "trajectory_id",
+                    f"{self.group_id}:{group.episode_id}:{int(env_id)}",
+                )
+            )
+            actions = max(0, int(progress.get("actions_completed", 0)))
+            existing = candidates.get(int(env_id))
+            if existing is None or actions > existing[1]:
+                candidates[int(env_id)] = (trajectory_id, actions, int(env_id))
+        return list(candidates.values())
+
     def outstanding_snapshot(self, observed_step: Optional[int] = None) -> Dict[str, Any]:
         step = self.current_step if observed_step is None else observed_step
         snapshot = {
@@ -1557,10 +1669,32 @@ class GroupQueue:
                 self.complete.clear()
                 await self.complete.wait()
             if self.scheduling_policy == "version_priority":
+                ready_episode_ids = [
+                    episode_id
+                    for episode_id, group in self.groups.items()
+                    if len(group.rollouts) >= self.group_size
+                ]
+                if not ready_episode_ids:
+                    self.complete.clear()
+                    await self.complete.wait()
+                    continue
                 episode_id = min(
-                    self.groups,
-                    key=lambda key: (self.groups[key].create_step, self.groups[key].episode_id),
+                    ready_episode_ids,
+                    key=lambda key: (
+                        self.groups[key].create_step,
+                        self.groups[key].episode_id,
+                    ),
                 )
+                selected_order = (
+                    self.groups[episode_id].create_step,
+                    self.groups[episode_id].episode_id,
+                )
+                if any(
+                    (group.create_step, group.episode_id) < selected_order
+                    and len(group.rollouts) < self.group_size
+                    for group in self.groups.values()
+                ):
+                    self.version_priority_ready_bypass_total += 1
             else:
                 episode_id = next(iter(self.groups)) # preserve original FIFO behavior
             group = self.groups[episode_id]
@@ -1754,6 +1888,7 @@ class GroupQueueManager:
         self.version_progress_max_actions = 0
         self.version_runtime_controller = VersionAwareRuntimeController()
         self.version_runtime_plan: Optional[VersionRuntimePlan] = None
+        self.latest_kv_feedback: Dict[str, Any] = {}
         self._tracked_existing_groups = set()
         self._tracked_unfinished_groups = set()
         self._tracked_unfinished_group_buckets: Dict[Tuple[int, int], str] = {}
@@ -2003,6 +2138,9 @@ class GroupQueueManager:
         gpu_invested_candidate_groups: List[
             Tuple[int, int, int, int, int]
         ] = []
+        gpu_invested_candidate_trajectories: List[
+            Tuple[str, int, int, int, int, int]
+        ] = []
         unfinished_bucket_counts: Dict[str, int] = {}
         unfinished_progress_observed_candidates = 0
         unfinished_progress_mean_actions_sum = 0
@@ -2064,6 +2202,19 @@ class GroupQueueManager:
                                 gpu_invested,
                             )
                         )
+                    for trajectory_id, actions, env_id in (
+                        queue.gpu_invested_trajectory_candidates(group)
+                    ):
+                        gpu_invested_candidate_trajectories.append(
+                            (
+                                trajectory_id,
+                                group_id,
+                                episode_id,
+                                env_id,
+                                age,
+                                actions,
+                            )
+                        )
                     reserved_unstarted += self.group_size - invested
                 if age >= near_expiry_age:
                     near_expiry += self.group_size
@@ -2102,6 +2253,9 @@ class GroupQueueManager:
             "unfinished_group_buckets": unfinished_group_buckets,
             "invested_candidate_groups": invested_candidate_groups,
             "gpu_invested_candidate_groups": gpu_invested_candidate_groups,
+            "gpu_invested_candidate_trajectories": (
+                gpu_invested_candidate_trajectories
+            ),
             "unfinished_bucket_counts": unfinished_bucket_counts,
             "unfinished_progress_observed_candidates": unfinished_progress_observed_candidates,
             "unfinished_progress_mean_actions_sum": unfinished_progress_mean_actions_sum,
@@ -2319,9 +2473,22 @@ class GroupQueueManager:
             gpu_invested_candidate_groups=tuple(
                 supply["gpu_invested_candidate_groups"]
             ),
+            gpu_invested_candidate_trajectories=tuple(
+                supply["gpu_invested_candidate_trajectories"]
+            ),
+            exact_rebuild_cohort=True,
             admission_enabled=True,
             priority_enabled=self.scheduling_policy == "version_priority",
             revision=self.version_runtime_revision,
+            kv_feedback_requests=int(
+                self.latest_kv_feedback.get("requests", 0)
+            ),
+            kv_feedback_hit_ratio=float(
+                self.latest_kv_feedback.get("hit_ratio", 0.0)
+            ),
+            kv_feedback_resets=int(
+                self.latest_kv_feedback.get("resets", 0)
+            ),
         )
         revised_plan = self.version_runtime_controller.decide(
             state,
@@ -2394,9 +2561,22 @@ class GroupQueueManager:
             gpu_invested_candidate_groups=tuple(
                 supply["gpu_invested_candidate_groups"]
             ),
+            gpu_invested_candidate_trajectories=tuple(
+                supply["gpu_invested_candidate_trajectories"]
+            ),
+            exact_rebuild_cohort=True,
             admission_enabled=admission_enabled,
             priority_enabled=self.scheduling_policy == "version_priority",
             revision=self.version_runtime_revision,
+            kv_feedback_requests=int(
+                self.latest_kv_feedback.get("requests", 0)
+            ),
+            kv_feedback_hit_ratio=float(
+                self.latest_kv_feedback.get("hit_ratio", 0.0)
+            ),
+            kv_feedback_resets=int(
+                self.latest_kv_feedback.get("resets", 0)
+            ),
         )
         plan = self.version_runtime_controller.decide(state)
         assert plan is not None
@@ -2551,6 +2731,10 @@ class GroupQueueManager:
             "scheduler/async_generation_ratio": self.async_generation_ratio,
             "scheduler/trajectory_staleness_tolerance": self.staleness_tolerance,
             "scheduler/version_priority_enabled": int(self.scheduling_policy == "version_priority"),
+            "scheduler/version_priority_ready_bypass_total": sum(
+                queue.version_priority_ready_bypass_total
+                for queue in self.group_queue.values()
+            ),
             "scheduler/watermark_admission_enabled": int(self.admission_policy == "outstanding_watermark"),
             "scheduler/version_adaptive_admission_enabled": int(
                 self.admission_policy == "version_adaptive"
@@ -2602,6 +2786,18 @@ class GroupQueueManager:
             ),
             "scheduler/version_runtime_rebuild_target": (
                 self.version_runtime_plan.rebuild_target_trajectories
+                if self.version_runtime_plan is not None else 0
+            ),
+            "scheduler/version_runtime_kv_feedback_requests": (
+                self.version_runtime_plan.kv_feedback_requests
+                if self.version_runtime_plan is not None else 0
+            ),
+            "scheduler/version_runtime_kv_feedback_hit_ratio": (
+                self.version_runtime_plan.kv_feedback_hit_ratio
+                if self.version_runtime_plan is not None else 0.0
+            ),
+            "scheduler/version_runtime_kv_feedback_resets": (
+                self.version_runtime_plan.kv_feedback_resets
                 if self.version_runtime_plan is not None else 0
             ),
             "scheduler/version_runtime_priority_deadline": (
@@ -3285,9 +3481,11 @@ class GroupQueueManager:
         for group_queue in self.group_queue.values():
             group_queue.stop_admission()
 
-    def advance_step(self, step):
+    def advance_step(self, step, kv_feedback: Optional[Dict[str, Any]] = None):
         if self.rollout_started_at is None:
             self.rollout_started_at = time.monotonic()
+        if kv_feedback is not None:
+            self.latest_kv_feedback = dict(kv_feedback)
         current_versions = [
             queue.current_step
             for queue in self.group_queue.values()
@@ -3716,7 +3914,10 @@ class RolloutScheduler(RolloutMockMixin):
 
         await self._snapshot_trajectory_progress()
         await asyncio.gather(*self.es_manager.update_step(global_step, inject_trace_context({}), blocking=False))
-        runtime_plan = await self.env_output_queue.advance_step.remote(global_step)
+        kv_feedback = await self.router_manager.collect_runtime_feedback.remote()
+        runtime_plan = await self.env_output_queue.advance_step.remote(
+            global_step, kv_feedback
+        )
         await self.router_manager.resume.remote(runtime_plan)
 
         learner_wait_start = time.time()

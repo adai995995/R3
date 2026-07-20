@@ -627,6 +627,10 @@ class RouterManager:
     def collect_trajectory_progress(self):
         return self.router.collect_trajectory_progress()
 
+    def collect_runtime_feedback(self):
+        collector = getattr(self.router, "collect_runtime_feedback", None)
+        return collector() if collector is not None else {}
+
     async def abort_requests(self, request_ids, uid):
         return await self.router.abort_requests(request_ids, uid)
 
@@ -1524,6 +1528,8 @@ class EnvAffinityRouter(Router):
         self.rebuild_target = 0
         self.rebuild_observe_remaining = 0
         self.rebuild_candidate_groups = set()
+        self.rebuild_candidate_trajectories = set()
+        self.rebuild_cohort_exact = False
         self.rebuild_seen_trajectories = set()
         self.rebuild_worker_prompts = defaultdict(list)
         self.rebuild_assigned_counts = defaultdict(int)
@@ -1550,6 +1556,7 @@ class EnvAffinityRouter(Router):
         epoch = plan.get("version")
         if epoch == self.rebuild_epoch:
             return
+        self._cancel_pending_rebuild_wave()
         self.cache_epoch += 1
         self.rebuild_epoch = epoch
         self.runtime_plan = plan
@@ -1563,10 +1570,21 @@ class EnvAffinityRouter(Router):
             for rank, group_key in enumerate(priority_candidates)
         }
         self.rebuild_candidate_groups = set(plan.get("rebuild_candidate_groups", []))
+        self.rebuild_candidate_trajectories = set(
+            str(trajectory_id)
+            for trajectory_id in plan.get("rebuild_candidate_trajectories", [])
+        )
+        self.rebuild_cohort_exact = bool(
+            plan.get("rebuild_cohort_exact", False)
+        )
         planned_target = int(
             plan.get("rebuild_target_trajectories", self.post_update_rebuild_requests)
         )
-        if not self.rebuild_candidate_groups and planned_target <= 0:
+        if (
+            not self.rebuild_cohort_exact
+            and not self.rebuild_candidate_groups
+            and planned_target <= 0
+        ):
             planned_target = self.post_update_rebuild_requests
         self.rebuild_target = min(
             max(0, self.post_update_rebuild_requests),
@@ -1580,14 +1598,24 @@ class EnvAffinityRouter(Router):
         self.rebuild_seen_trajectories.clear()
         self.rebuild_worker_prompts.clear()
         self.rebuild_assigned_counts.clear()
-        self.rebuild_pending.clear()
-        self.rebuild_flush_task = None
         self.working_set_worker_prompts.clear()
         if self.post_update_rebuild_enabled or self.working_set_routing_enabled:
             # Prefix cache is flushed with the new weights, so old placement has no KV value.
             self.src_rank2_dp_rank.clear()
             self.src_rank_cache_epoch.clear()
             self.src_rank_last_prompt_tokens.clear()
+
+    def _cancel_pending_rebuild_wave(self):
+        task = self.rebuild_flush_task
+        if task is not None and not task.done():
+            task.cancel()
+        pending = self.rebuild_pending
+        self.rebuild_pending = []
+        self.rebuild_flush_task = None
+        for item in pending:
+            future = item.get("future")
+            if future is not None and not future.done():
+                future.set_result(None)
 
     def _observe_first_epoch_request(self, trajectory_id: str) -> bool:
         if trajectory_id in self.rebuild_seen_trajectories:
@@ -1644,11 +1672,16 @@ class EnvAffinityRouter(Router):
         async with self.rebuild_coalesce_lock:
             first_epoch_request = self._observe_first_epoch_request(trajectory_id)
             rebuild_candidate = (
-                runtime_state.group_key in self.rebuild_candidate_groups
+                trajectory_id in self.rebuild_candidate_trajectories
+                if self.rebuild_cohort_exact
+                else runtime_state.group_key in self.rebuild_candidate_groups
             )
             rebuild_fallback = (
-                not self.rebuild_candidate_groups
-                or self.rebuild_observe_remaining <= self.rebuild_remaining
+                not self.rebuild_cohort_exact
+                and (
+                    not self.rebuild_candidate_groups
+                    or self.rebuild_observe_remaining <= self.rebuild_remaining
+                )
             )
             if (
                 self.post_update_rebuild_enabled
@@ -1677,10 +1710,11 @@ class EnvAffinityRouter(Router):
         revised = dict(plan) if isinstance(plan, dict) else {}
         if revised.get("version") != self.rebuild_epoch:
             return
-        if int(revised.get("revision", 0)) < int(
+        if int(revised.get("revision", 0)) <= int(
             self.runtime_plan.get("revision", 0)
         ):
             return
+        self._cancel_pending_rebuild_wave()
         self.runtime_plan = revised
         priority_candidates = (
             revised.get("priority_candidate_groups", [])
@@ -1691,9 +1725,35 @@ class EnvAffinityRouter(Router):
             str(group_key): rank
             for rank, group_key in enumerate(priority_candidates)
         }
-        self.rebuild_candidate_groups.update(
+        self.rebuild_candidate_groups = set(
             str(group_key)
             for group_key in revised.get("rebuild_candidate_groups", [])
+        )
+        self.rebuild_candidate_trajectories = set(
+            str(trajectory_id)
+            for trajectory_id in revised.get(
+                "rebuild_candidate_trajectories", []
+            )
+        )
+        self.rebuild_cohort_exact = bool(
+            revised.get("rebuild_cohort_exact", False)
+        )
+        planned_target = int(
+            revised.get("rebuild_target_trajectories", self.rebuild_target)
+        )
+        self.rebuild_target = min(
+            max(0, self.post_update_rebuild_requests),
+            max(0, planned_target),
+        )
+        assigned = sum(self.rebuild_assigned_counts.values())
+        self.rebuild_remaining = max(0, self.rebuild_target - assigned)
+        self.rebuild_observe_remaining = max(
+            0,
+            max(
+                self.rebuild_target,
+                max(0, self.post_update_rebuild_observe_requests),
+            )
+            - len(self.rebuild_seen_trajectories),
         )
 
     def _apply_engine_kv_feedback(self, dp_rank: int, response_metrics):
@@ -1753,7 +1813,11 @@ class EnvAffinityRouter(Router):
         decision_started = time.perf_counter()
         rebuild_request = False
         rebuild_lcp_tokens = 0
-        rebuild_candidate = runtime_state.group_key in self.rebuild_candidate_groups
+        rebuild_candidate = (
+            runtime_state.trajectory_id in self.rebuild_candidate_trajectories
+            if self.rebuild_cohort_exact
+            else runtime_state.group_key in self.rebuild_candidate_groups
+        )
         priority_candidate = (
             runtime_state.group_key in self.priority_candidate_ranks
         )
@@ -2018,6 +2082,19 @@ class EnvAffinityRouter(Router):
 
     def collect_trajectory_progress(self):
         return list(self.latest_trajectory_progress.values())
+
+    def collect_runtime_feedback(self):
+        totals = {
+            field: sum(int(worker.get(field, 0)) for worker in self.worker_engine_kv_feedback)
+            for field in ("requests", "query_blocks", "hit_blocks", "cached_tokens", "resets")
+        }
+        totals["hit_ratio"] = (
+            totals["hit_blocks"] / totals["query_blocks"]
+            if totals["query_blocks"]
+            else 0.0
+        )
+        totals["workers"] = [dict(worker) for worker in self.worker_engine_kv_feedback]
+        return totals
 
     async def _acquire_priority_slot(
         self,

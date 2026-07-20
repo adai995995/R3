@@ -94,6 +94,96 @@ def test_version_priority_assigns_oldest_policy_version_first():
     assert episode_id == 1
 
 
+def test_version_priority_consumes_oldest_ready_group_without_head_blocking():
+    async def run_test():
+        queue = GroupQueue(
+            group_id=0,
+            progress_bar=None,
+            group_size=1,
+            group_size_redundancy=0,
+            max_traj_per_env=1,
+            async_generation_ratio=0,
+            staleness_tolerance=4,
+            group_filter=NeverFilter(),
+            scheduling_policy="version_priority",
+        )
+        queue.groups[0] = GroupData(
+            group_id=0,
+            episode_id=0,
+            create_step=0,
+            rollouts=[],
+            running_rollouts=1,
+        )
+        ready_rollout = object()
+        queue.groups[1] = GroupData(
+            group_id=0,
+            episode_id=1,
+            create_step=1,
+            rollouts=[ready_rollout],
+            running_rollouts=1,
+        )
+
+        group = await asyncio.wait_for(queue.get(), timeout=0.1)
+
+        assert group.episode_id == 1
+        assert group.rollouts == [ready_rollout]
+        assert 0 in queue.groups
+        assert queue.version_priority_ready_bypass_total == 1
+
+    asyncio.run(run_test())
+
+
+def test_gpu_rebuild_candidates_are_exact_unfinished_trajectories():
+    queue = GroupQueue(
+        group_id=2,
+        progress_bar=None,
+        group_size=2,
+        group_size_redundancy=0,
+        max_traj_per_env=1,
+        async_generation_ratio=0,
+        staleness_tolerance=4,
+        group_filter=NeverFilter(),
+        scheduling_policy="version_priority",
+    )
+    group = GroupData(group_id=2, episode_id=7, create_step=1)
+    queue.groups[7] = group
+    queue.update_progress_snapshots(
+        [
+            {
+                "trajectory_id": "invested",
+                "group_id": 2,
+                "episode_id": 7,
+                "env_id": 0,
+                "actions_completed": 4,
+                "inference_calls": 4,
+                "completed": False,
+            },
+            {
+                "trajectory_id": "reset-only",
+                "group_id": 2,
+                "episode_id": 7,
+                "env_id": 1,
+                "actions_completed": 0,
+                "inference_calls": 0,
+                "completed": False,
+            },
+            {
+                "trajectory_id": "already-complete",
+                "group_id": 2,
+                "episode_id": 7,
+                "env_id": 2,
+                "actions_completed": 5,
+                "inference_calls": 5,
+                "completed": True,
+            },
+        ]
+    )
+
+    assert queue.gpu_invested_trajectory_candidates(group) == [
+        ("invested", 4, 0)
+    ]
+
+
 def test_outstanding_snapshot_counts_ready_running_reserved_and_retired():
     queue = GroupQueue(
         group_id=0,
@@ -226,9 +316,21 @@ def test_runtime_controller_owns_reconcile_delta_without_mutating_state():
         invested_candidate_groups=(),
     )
     active_plan = controller.decide(state)
+    reconcile_state = VersionRuntimeState(
+        version=3,
+        learner_demand=4,
+        safety_reserve=0,
+        expected_existing_supply=1,
+        outstanding_trajectories=5,
+        max_outstanding_trajectories=8,
+        admission_width=1,
+        group_size=1,
+        staleness_tolerance=2,
+        invested_candidate_groups=(),
+    )
 
     revised = controller.decide(
-        state,
+        reconcile_state,
         active_plan=active_plan,
         missing_trajectories=4,
         current_batch_missing=4,
@@ -245,6 +347,10 @@ def test_runtime_controller_owns_reconcile_delta_without_mutating_state():
     assert revised.revision == 1
     assert revised.admission_delta_trajectories == 1
     assert revised.admission_budget == 5
+    assert revised.expected_existing_supply == 1
+    assert revised.outstanding_trajectories == 5
+    assert revised.admission_deficit == 3
+    assert revised.admission_capacity == 3
 
 
 def test_version_adaptive_reduces_new_work_when_carry_over_can_finish():
