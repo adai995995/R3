@@ -1,0 +1,15 @@
+defaults:
+  - agent_val_webshop_qwen3_4b_independent_pressure_common_6step
+  - _self_
+
+seed: 53
+rollout_seed: 53
+max_tokens_per_step: 64
+
+train_env_manager:
+  max_env_num_per_worker: 1
+  num_env_groups: 16
+  group_size: 1
+  tags: [SimpleSokoban]
+  num_groups_partition: [16]
+  group_seed_base: 535300

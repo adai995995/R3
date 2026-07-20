@@ -117,3 +117,49 @@ Runtime 仍有 6 条轨迹过期，因为该压力实验故意使用较大的 re
 - FIFO：`output/webshop_qwen3_4b_independent_pressure_fifo_seed52_6step/terminal_waste.step_6.json`
 - Runtime：`output/webshop_qwen3_4b_independent_pressure_runtime_seed52_6step/terminal_waste.step_6.json`
 - 配置：`examples/qwen2.5-0.5B-agentic/agent_val_webshop_qwen3_4b_independent_pressure_*_6step.yaml`
+
+## Sokoban 跨场景压力实验
+
+为了检查 WebShop 上的现象是否依赖单一环境，使用相同的独立轨迹和高并发设置，
+将环境替换为 16 个 `SimpleSokoban` 实例。模型仍为 Qwen3-4B-Instruct-2507，
+使用 4 张训练 GPU、4 张 rollout GPU，训练 batch 为 4，最大在途轨迹数为 48，
+完成 6 次真实 REINFORCE 更新。该预实验使用 seed 53，FIFO 与 Version Runtime
+只改变 runtime 策略，均不保存 checkpoint。
+
+| 指标 | FIFO | Version Runtime | 变化 |
+|---|---:|---:|---:|
+| 完成 6 次更新的 rollout 时间 | 61.34 s | 62.49 s | +1.9% |
+| 稳态平均 step 时间 | 8.76 s | 8.72 s | -0.4% |
+| 稳态 step rollout 等待 | 0.275 s | 0.328 s | +0.053 s |
+| Learner wait fraction | 10.32% | 11.48% | +1.16 pp |
+| 训练消费轨迹 | 24 | 24 | 相同 |
+| 原始轨迹 | 112 | 36 | -67.9% |
+| 过期轨迹 | 42 | 4 | -90.5% |
+| 原始 logical tokens | 646,833 | 222,055 | -65.7% |
+| 过期 logical-token fraction | 39.17% | 12.46% | -26.72 pp |
+| 计算转化率（有效 / 原始 logical tokens） | 19.97% | 62.79% | 3.14 倍 |
+| 有效 response tok/s | 25.30 | 26.37 | +4.2% |
+| Priority queued requests | 0 | 149 | 已触发 |
+| Priority reordered requests | 0 | 18 | 已触发 |
+| KV rebuild selections | 0 | 0 | 未触发 |
+
+这组实验复现了计算浪费问题：在 learner 同样消费 24 条轨迹的情况下，FIFO 多生成
+了 76 条轨迹，并产生了 42 条过期轨迹。Version Runtime 将原始推理计算减少
+65.7%，将过期轨迹减少 90.5%，有效 response throughput 仍提高 4.2%。这说明
+“rollout 更忙、原始吞吐更高”并不等于更多可训练数据，且该现象不只出现在 WebShop。
+
+但 Sokoban 没有复现 WebShop 的 step 时间收益。FIFO 的 learner wait 只有 10.32%，
+稳态每步 rollout 等待仅 0.275 秒，训练关键路径主要由 actor 更新等固定开销构成；
+因此即使 Runtime 大幅减少后台无效计算，稳态 step 时间仍基本不变。这是一个合理的
+负结果：系统的 wall-clock 收益依赖 rollout 是否处在训练 batch 形成的关键路径。
+
+此外，本次轨迹都在单个版本内快速结束，跨版本 partial trajectory 和 KV rebuild
+候选均为 0。Runtime 的真实优先级队列已经生效，但该环境主要验证 admission 对
+过量生产的抑制，不能验证跨版本 urgency 和 KV working-set rebuilding。Sokoban
+模型行为质量也较弱，因此本实验只作为系统 observation，不用于证明最终训练收敛。
+
+Sokoban 压力实验产物：
+
+- FIFO：`output/sokoban_qwen3_4b_independent_pressure_fifo_seed53_6step/terminal_waste.step_6.json`
+- Runtime：`output/sokoban_qwen3_4b_independent_pressure_runtime_seed53_6step/terminal_waste.step_6.json`
+- 配置：`examples/qwen2.5-0.5B-agentic/agent_val_sokoban_qwen3_4b_independent_pressure_*_6step.yaml`
