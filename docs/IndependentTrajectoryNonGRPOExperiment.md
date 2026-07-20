@@ -80,3 +80,40 @@ KV-only 消融，再单独调节 reserve，而不是把收益全部归因于完�
 `step_reinforce` 的预检不计入结果：当前 WebShop pipeline 每条完整轨迹只产生一条
 训练记录，而 `step_reinforce` 需要每条记录包含 `step` 字段。本实验因此采用与现有
 轨迹数据结构匹配的 trajectory-level `reinforce`。
+
+## 高并发压力实验
+
+为了验证低压力下 step 时间变化不大的原因，后续匹配实验将独立 WebShop 环境数从
+8 增加到 16，将最大在途轨迹数从 24 增加到 48。Runtime 的 reserve 从 4 增加到
+12，并将每个推理 worker 的 priority service slot 设为 2，使同时到达的请求真正
+进入 Runtime 可控制的等待队列。该预实验使用 seed 52，其他训练条件保持不变。
+
+| 指标 | FIFO | Version Runtime | 变化 |
+|---|---:|---:|---:|
+| 完成 6 次更新的 rollout 时间 | 79.90 s | 74.47 s | -6.8% |
+| 稳态平均 step 时间 | 11.90 s | 10.61 s | -10.8% |
+| 稳态 step rollout 等待 | 2.66 s | 1.36 s | -49.0% |
+| Learner wait fraction | 25.25% | 19.47% | -5.78 pp |
+| 训练消费轨迹 | 24 | 24 | 相同 |
+| 原始轨迹 | 90 | 39 | -56.7% |
+| 过期轨迹 | 40 | 6 | -85.0% |
+| 原始 logical tokens | 1,728,321 | 676,751 | -60.8% |
+| 过期 logical-token fraction | 48.70% | 23.22% | -25.48 pp |
+| 有效 response tok/s | 119.59 | 124.67 | +4.2% |
+| Priority queued requests | 0 | 167 | 已触发 |
+| Priority reordered requests | 0 | 30 | 已触发 |
+
+高并发下，FIFO 的额外工作开始与形成下一批训练数据争抢推理资源。Version Runtime
+不仅减少无效计算，还通过真实排队和重排缩短了有效 batch 的形成时间，因此节省的
+计算开始转化为 step 时间和 learner wait 的下降。
+
+Runtime 仍有 6 条轨迹过期，因为该压力实验故意使用较大的 reserve=12 来维持 16
+路并发。这说明负载不能无限增大，admission 与 priority 必须共同控制。该结果目前
+只有一个 seed，应补两个 seed 后再报告显著性；它也只证明系统时间收益，不证明调度
+后的训练数据分布和最终收敛完全一致。
+
+压力实验产物：
+
+- FIFO：`output/webshop_qwen3_4b_independent_pressure_fifo_seed52_6step/terminal_waste.step_6.json`
+- Runtime：`output/webshop_qwen3_4b_independent_pressure_runtime_seed52_6step/terminal_waste.step_6.json`
+- 配置：`examples/qwen2.5-0.5B-agentic/agent_val_webshop_qwen3_4b_independent_pressure_*_6step.yaml`

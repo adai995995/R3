@@ -1,0 +1,17 @@
+defaults:
+  - agent_val_webshop_qwen3_4b_independent_common_6step
+  - _self_
+
+seed: 52
+rollout_seed: 52
+max_outstanding_trajectories: 48
+
+# Double the independent environment concurrency from 8 to 16. Each group is
+# still one independently trainable trajectory, so no GRPO group barrier is
+# introduced by the pressure experiment.
+train_env_manager:
+  max_env_num_per_worker: 1
+  num_env_groups: 16
+  group_size: 1
+  num_groups_partition: [16]
+  group_seed_base: 525200

@@ -1,0 +1,21 @@
+defaults:
+  - agent_val_webshop_qwen3_4b_independent_pressure_common_6step
+  - _self_
+
+exp_name: webshop_qwen3_4b_independent_pressure_fifo_seed52_6step
+output_dir: ./output/webshop_qwen3_4b_independent_pressure_fifo_seed52_6step
+render_save_dir: ./output/webshop_qwen3_4b_independent_pressure_fifo_seed52_6step/render
+checkpoint_config:
+  type: file_system
+  output_dir: ./output/webshop_qwen3_4b_independent_pressure_fifo_seed52_6step/checkpoints
+
+trajectory_scheduling_policy: fifo
+trajectory_admission_policy: outstanding_watermark
+
+router_args:
+  router_name: EnvAffinityRouter
+  max_running_requests: 128
+  router_config:
+    post_update_rebuild_enabled: false
+    working_set_routing_enabled: false
+    soft_locality_enabled: false
