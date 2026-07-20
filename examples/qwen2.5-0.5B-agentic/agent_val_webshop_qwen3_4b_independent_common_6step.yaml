@@ -1,0 +1,36 @@
+defaults:
+  - agent_val_webshop_qwen3_4b_parser_fixed_ctx12k_3step
+  - _self_
+
+max_steps: 6
+eval_steps: 0
+save_steps: -1
+enable_checkpointing: false
+save_final_checkpoint: false
+resume_from_checkpoint: false
+
+seed: 49
+rollout_seed: 49
+rollout_batch_size: 4
+async_generation_ratio: 1
+trajectory_staleness_tolerance: 2
+max_outstanding_trajectories: 24
+max_actions_per_traj: 10
+max_tokens_per_step: 96
+version_boundary_profiler_enabled: true
+version_boundary_profiler_max_records: 4096
+
+# Remove GRPO group completion from the experiment: each group is one
+# independently trainable trajectory and reward normalization is not grouped.
+adv_estimator: reinforce
+batch_adjust_mode: random_sample
+reward_normalization:
+  grouping: batch
+  method: identity
+
+train_env_manager:
+  max_env_num_per_worker: 1
+  num_env_groups: 8
+  group_size: 1
+  num_groups_partition: [8]
+  group_seed_base: 494900

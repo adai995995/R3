@@ -1,0 +1,34 @@
+defaults:
+  - agent_val_webshop_qwen3_4b_independent_common_6step
+  - _self_
+
+exp_name: webshop_qwen3_4b_independent_runtime_6step
+output_dir: ./output/webshop_qwen3_4b_independent_runtime_6step
+render_save_dir: ./output/webshop_qwen3_4b_independent_runtime_6step/render
+checkpoint_config:
+  type: file_system
+  output_dir: ./output/webshop_qwen3_4b_independent_runtime_6step/checkpoints
+
+trajectory_scheduling_policy: version_priority
+trajectory_admission_policy: version_adaptive
+adaptive_admission_reserve_trajectories: 4
+adaptive_admission_initial_finish_ratio: 0.5
+adaptive_admission_ewma_alpha: 0.5
+adaptive_admission_bucketed_finish_enabled: true
+adaptive_admission_bucket_min_samples: 2
+version_adaptive_progress_floor_enabled: true
+dynamic_admission_reserve_enabled: false
+
+router_args:
+  router_name: EnvAffinityRouter
+  max_running_requests: 128
+  router_config:
+    post_update_rebuild_enabled: true
+    post_update_rebuild_requests: 16
+    post_update_rebuild_observe_requests: 32
+    post_update_rebuild_prefix_tokens: 2048
+    working_set_routing_enabled: true
+    working_set_max_prompts_per_worker: 64
+    soft_locality_enabled: true
+    soft_locality_load_slack: 1
+
