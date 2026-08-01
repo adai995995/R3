@@ -352,6 +352,9 @@ class AgenticConfig(PPOConfig):
             assert self.version_runtime_max_revisions_per_version >= 0, (
                 "version_runtime_max_revisions_per_version must be non-negative"
             )
+            assert self.version_runtime_max_outcomes > 0, (
+                "version_runtime_max_outcomes must be positive"
+            )
             assert self.adaptive_admission_reserve_trajectories >= 0, (
                 "adaptive_admission_reserve_trajectories must be non-negative"
             )
@@ -382,6 +385,15 @@ class AgenticConfig(PPOConfig):
                 )
                 assert 0 <= self.dynamic_admission_reserve_stale_high <= 1, (
                     "dynamic_admission_reserve_stale_high must be in [0, 1]"
+                )
+                assert 0 <= self.dynamic_admission_starvation_high_fraction <= 1, (
+                    "dynamic_admission_starvation_high_fraction must be in [0, 1]"
+                )
+                assert 0 <= self.dynamic_admission_queue_high_fraction <= 1, (
+                    "dynamic_admission_queue_high_fraction must be in [0, 1]"
+                )
+                assert 0 <= self.dynamic_admission_tool_wait_high_fraction <= 1, (
+                    "dynamic_admission_tool_wait_high_fraction must be in [0, 1]"
                 )
                 assert self.dynamic_admission_reserve_prediction_error_margin >= 0, (
                     "dynamic_admission_reserve_prediction_error_margin must be non-negative"

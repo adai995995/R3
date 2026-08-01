@@ -13,8 +13,12 @@ logger = logging.getLogger(__name__)
 _CACHE_STATE_ATTR = "_roll_request_cached_tokens"
 _BATCH_STATE_ATTR = "_roll_request_batch_metadata"
 _BATCH_COUNTER_ATTR = "_roll_scheduler_batch_id"
+_LAST_SCHEDULE_ATTR = "_roll_last_schedule_token_counts"
+_ENGINE_TIMING_ATTR = "_roll_request_engine_step_timing"
 _PATCH_MARKER = "_roll_request_kv_metrics_patch"
+_ENGINE_STEP_PATCH_MARKER = "_roll_engine_step_timing_patch"
 _UTILITY_METHOD = "roll_pop_request_kv_metrics"
+POP_ENGINE_TIMING_UTILITY = "roll_pop_request_engine_timing"
 _ENGINE_INPUT_PATCH_MARKER = "_roll_rebuild_input_coalesce_patch"
 MARK_REBUILD_REQUEST_UTILITY = "roll_mark_rebuild_request"
 _REBUILD_REQUEST_IDS_ATTR = "_roll_rebuild_request_ids"
@@ -55,6 +59,32 @@ def record_scheduled_request_cached_tokens(
         setattr(scheduler, _CACHE_STATE_ATTR, cached_tokens)
 
     new_requests = list(getattr(scheduler_output, "scheduled_new_reqs", ()))
+    scheduled_request_data = {}
+    requests = getattr(scheduler, "requests", {})
+    for request_id, tokens in getattr(
+        scheduler_output, "num_scheduled_tokens", {}
+    ).items():
+        request_id = str(request_id)
+        scheduled_tokens = max(0, int(tokens))
+        request = requests.get(request_id)
+        # vLLM advances num_computed_tokens immediately before returning the
+        # SchedulerOutput. Reconstruct its value at the start of this step.
+        computed_before = max(
+            0,
+            int(getattr(request, "num_computed_tokens", scheduled_tokens))
+            - scheduled_tokens,
+        )
+        prompt_tokens = int(
+            getattr(request, "num_prompt_tokens", computed_before)
+        )
+        scheduled_request_data[request_id] = {
+            "tokens": scheduled_tokens,
+            "prefill_tokens": max(
+                0,
+                min(scheduled_tokens, prompt_tokens - computed_before),
+            ),
+        }
+    setattr(scheduler, _LAST_SCHEDULE_ATTR, scheduled_request_data)
     if not new_requests:
         return
     batch_id = int(getattr(scheduler, _BATCH_COUNTER_ATTR, 0)) + 1
@@ -96,6 +126,59 @@ def pop_request_kv_metrics(engine_core: Any, request_id: str) -> dict[str, Any]:
     }
 
 
+def record_engine_step_timing(engine_core: Any, elapsed_seconds: float) -> None:
+    """Attribute one deduplicated engine step by scheduled-token share."""
+    scheduled = getattr(engine_core.scheduler, _LAST_SCHEDULE_ATTR, {})
+    setattr(engine_core.scheduler, _LAST_SCHEDULE_ATTR, {})
+    total_tokens = sum(int(item.get("tokens", 0)) for item in scheduled.values())
+    if total_tokens <= 0:
+        return
+
+    timings = getattr(engine_core, _ENGINE_TIMING_ATTR, None)
+    if timings is None:
+        timings = {}
+        setattr(engine_core, _ENGINE_TIMING_ATTR, timings)
+    elapsed = max(0.0, float(elapsed_seconds))
+    for request_id, item in scheduled.items():
+        scheduled_tokens = int(item.get("tokens", 0))
+        token_share = scheduled_tokens / total_tokens
+        attributed = elapsed * token_share
+        prefill_tokens = min(
+            scheduled_tokens,
+            max(0, int(item.get("prefill_tokens", 0))),
+        )
+        prefill_share = (
+            prefill_tokens / scheduled_tokens if scheduled_tokens else 0.0
+        )
+        request_timing = timings.setdefault(
+            request_id,
+            {
+                "engine_step_seconds_attributed": 0.0,
+                "prefill_engine_step_seconds_attributed": 0.0,
+                "decode_engine_step_seconds_attributed": 0.0,
+                "scheduled_tokens": 0,
+            },
+        )
+        request_timing["engine_step_seconds_attributed"] += attributed
+        request_timing[
+            "prefill_engine_step_seconds_attributed"
+        ] += attributed * prefill_share
+        request_timing[
+            "decode_engine_step_seconds_attributed"
+        ] += attributed * (1.0 - prefill_share)
+        request_timing["scheduled_tokens"] += scheduled_tokens
+
+
+def pop_request_engine_timing(
+    engine_core: Any, request_id: str
+) -> dict[str, Any]:
+    """Return and remove token-share-attributed V1 engine-step timing."""
+    timings = getattr(engine_core, _ENGINE_TIMING_ATTR, None)
+    if timings is None:
+        return {}
+    return dict(timings.pop(str(request_id), {}))
+
+
 def clear_request_cached_tokens(engine_core: Any, request_ids: list[str]) -> None:
     """Remove measurements for requests aborted before their first output."""
     cached_tokens = getattr(engine_core.scheduler, _CACHE_STATE_ATTR, None)
@@ -106,6 +189,10 @@ def clear_request_cached_tokens(engine_core: Any, request_ids: list[str]) -> Non
     if batch_metadata is not None:
         for request_id in request_ids:
             batch_metadata.pop(request_id, None)
+    timings = getattr(engine_core, _ENGINE_TIMING_ATTR, None)
+    if timings is not None:
+        for request_id in request_ids:
+            timings.pop(request_id, None)
 
 
 async def populate_request_cached_tokens(
@@ -155,6 +242,7 @@ def install_request_kv_metrics_patch() -> None:
     original_schedule = Scheduler.schedule
     original_abort_requests = EngineCore.abort_requests
     original_add_request = EngineCore.add_request
+    original_engine_step = EngineCore.step
     original_process_input_queue = EngineCoreProc._process_input_queue
 
     def schedule_with_request_kv_metrics(self, *args, **kwargs):
@@ -172,6 +260,12 @@ def install_request_kv_metrics_patch() -> None:
         if request_ids is not None:
             request_ids.discard(request.request_id)
         return original_add_request(self, request)
+
+    def engine_step_with_timing(self, *args, **kwargs):
+        started = time.perf_counter()
+        output = original_engine_step(self, *args, **kwargs)
+        record_engine_step_timing(self, time.perf_counter() - started)
+        return output
 
     def process_input_queue_with_rebuild_coalescing(self):
         if self.global_unfinished_reqs or self.scheduler.has_requests():
@@ -197,6 +291,8 @@ def install_request_kv_metrics_patch() -> None:
     Scheduler.schedule = schedule_with_request_kv_metrics
     EngineCore.abort_requests = abort_requests_with_kv_cleanup
     EngineCore.add_request = add_request_with_rebuild_marker_cleanup
+    setattr(engine_step_with_timing, _ENGINE_STEP_PATCH_MARKER, True)
+    EngineCore.step = engine_step_with_timing
     setattr(
         process_input_queue_with_rebuild_coalescing,
         _ENGINE_INPUT_PATCH_MARKER,
@@ -204,6 +300,7 @@ def install_request_kv_metrics_patch() -> None:
     )
     EngineCoreProc._process_input_queue = process_input_queue_with_rebuild_coalescing
     setattr(EngineCore, _UTILITY_METHOD, pop_request_kv_metrics)
+    setattr(EngineCore, POP_ENGINE_TIMING_UTILITY, pop_request_engine_timing)
     setattr(EngineCore, MARK_REBUILD_REQUEST_UTILITY, mark_rebuild_request)
 
 
@@ -214,7 +311,10 @@ __all__ = [
     "populate_request_cached_tokens",
     "pop_request_kv_metrics",
     "pop_request_cached_tokens",
+    "pop_request_engine_timing",
+    "record_engine_step_timing",
     "record_scheduled_request_cached_tokens",
     "mark_rebuild_request",
     "MARK_REBUILD_REQUEST_UTILITY",
+    "POP_ENGINE_TIMING_UTILITY",
 ]

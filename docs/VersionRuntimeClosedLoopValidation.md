@@ -1,6 +1,6 @@
 # Version-aware Runtime 闭环验证记录
 
-更新时间：2026-07-19
+更新时间：2026-07-31
 
 ## 1. 本轮闭环的定义
 
@@ -105,3 +105,63 @@
 这两次实验说明 admission、priority、KV rebuilding、真实 EngineCore 首批收集和 KV 状态反馈已经形成端到端执行闭环。但它们仍是短程单 seed 功能验证，不能据此宣称吞吐或训练效率稳定优于基线。
 
 下一阶段应固定代码，运行 FIFO、仅 admission、admission+priority、完整系统四组消融，并在至少三个 AgenticRL workload、多个 oversampling 档位和多个 seed 上比较 trainable token goodput、learner update interval、stale invested-token waste 和 boundary re-prefill cost。
+
+## 8. 统一 estimator 合入后的回归验证
+
+本轮在 `xxl_test` 容器中验证了共享 estimator、plan/outcome 归因、
+completion-ETA placement 和动态 reserve 的合入结果。
+
+### 8.1 自动化测试
+
+- 新增 Router completion-ETA 观测口径测试：实际完成时间统一为 Router
+  排队时间加请求服务时间，与预测值处于同一口径；
+- 扩展 trace-driven testbed，可注入 learner demand、tool latency、prefill
+  cost 和 worker slowdown 的阶段变化；
+- trace testbed 直接复用生产环境的 closed-loop reserve 与 hysteresis
+  函数，并记录每个版本的供给缺口、浪费和 reserve 变化原因；
+- 定向快速回归结果为 `86 passed, 1 deselected`；被排除的旧
+  `GroupQueueManager` Ray 慢测试已单独通过。
+
+### 8.2 真实 WebShop 两步 smoke test
+
+配置基于
+`examples/qwen2.5-0.5B-agentic/agent_val_webshop_qwen3_4b_version_runtime_closed_loop_4step.yaml`，
+运行时覆盖 `max_steps=2`。模型为 Qwen3-4B-Instruct-2507，使用 4 张
+learner GPU 和 4 张 rollout GPU；rollout batch size 为 4，版本容忍度为
+2，最大在途轨迹为 24，checkpoint 与 final checkpoint 均关闭。
+
+主要结果：
+
+- 完成 2 个真实 learner update，消费 8 条有效轨迹；
+- 生成 14 条 admission，其中 10 条完成，未产生 stale trajectory；
+- version 0 发生 1 次 bounded reconciliation，额外加入 2 条轨迹；
+- learner 等待 15.34 秒，占 rollout 观察窗口的 40.69%；
+- outcome 使动态 reserve 从 4 增长到 6，触发信号来自 learner
+  undersupply，overload signal 仅为 0.028；
+- Router 执行 114 次 version-aware 调度，18 次请求进入 priority queue；
+- completion-ETA 模型在 106 次请求上可用并被采用，预测 ETA 均值为
+  1.895 秒，实际 queue-plus-service 完成时间均值为 1.034 秒，绝对误差
+  均值为 0.977 秒；
+- 111 个请求携带真实引擎 KV 反馈，覆盖 97.37% 的调度决策，并观测到
+  8 次引擎 KV reset；
+- Router 估计节省 295,680 个 prefill token；真实 request prefill token
+  为 67,989；
+- shutdown timeout 和 rollout-task cancellation 均为 0，日志中没有
+  traceback 或 error，且没有生成 checkpoint 文件。
+
+结果文件：
+`output/webshop_qwen3_4b_closed_loop_postmerge_smoke_2step/terminal_waste.step_2.json`。
+
+本次 policy refresh 发生时，6 条旧版本轨迹均已完成，没有未完成
+survivor，因此 rebuild candidate 和 rebuild request 均为 0。该结果验证了
+reconstruction cohort 的条件判断不会制造虚假候选，但不替代前述真实
+EngineCore survivor-batch probe 对 reconstruction 执行分支的验证。
+
+## 9. 当前实现判断
+
+截至本轮，初版系统已经形成可追踪的运行闭环：同一份 forecast 产生
+admission、priority、placement 和 reconstruction 决策，执行请求携带
+plan/forecast 归因，实际 completion、expiration、learner wait、prefill、
+queue delay 和 KV reset 更新 estimator 与下一版本 reserve。系统仍是原型，
+后续工作重点应转向固定代码后的多 workload、多 seed 消融与训练收敛验证，
+而不是继续为 WebShop 调整单点参数。

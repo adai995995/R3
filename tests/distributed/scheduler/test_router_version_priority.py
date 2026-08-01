@@ -1,14 +1,145 @@
 import asyncio
+from collections import defaultdict
 from types import SimpleNamespace
 
 from roll.distributed.scheduler.router import (
+    build_engine_request_priority,
+    completion_eta_observation,
     EnvAffinityRouter,
+    RouterManager,
+    summarize_request_metric_totals,
     TrajectoryRuntimeState,
+    select_completion_eta_worker,
 )
 
 
 class RouterManagerStub:
     pass
+
+
+def test_engine_priority_queue_metrics_are_aggregated_separately_from_router_gate():
+    metrics = summarize_request_metric_totals(
+        {
+            "vllm/request_priority_enabled": 10,
+            "vllm/request_priority_queued": 4,
+            "vllm/request_priority_queue_seconds": 1.5,
+        },
+        scope="lifetime",
+    )
+
+    assert metrics["router/engine_priority_requests"] == 10
+    assert metrics["router/engine_priority_queued_requests"] == 4
+    assert metrics["router/engine_priority_queued_ratio"] == 0.4
+    assert metrics["router/engine_priority_queue_seconds"] == 1.5
+
+
+def _runtime_state(
+    trajectory_id,
+    *,
+    policy_version=2,
+    actions_completed=4,
+    max_actions=10,
+    group_id=1,
+    episode_id=1,
+):
+    return TrajectoryRuntimeState(
+        trajectory_id=trajectory_id,
+        policy_version=policy_version,
+        current_version=4,
+        version_age=max(0, 4 - policy_version),
+        actions_completed=actions_completed,
+        max_actions=max_actions,
+        group_id=group_id,
+        episode_id=episode_id,
+    )
+
+
+def test_engine_priority_preserves_runtime_ordering():
+    planned = {"1:1": 0}
+    candidate = build_engine_request_priority(_runtime_state("candidate"), planned)
+    outside_plan = build_engine_request_priority(
+        _runtime_state("outside", group_id=2), planned
+    )
+    assert candidate < outside_plan
+
+    older = build_engine_request_priority(
+        _runtime_state("older", policy_version=1), {}
+    )
+    newer = build_engine_request_priority(
+        _runtime_state("newer", policy_version=3), {}
+    )
+    assert older < newer
+
+    invested = build_engine_request_priority(
+        _runtime_state("invested", actions_completed=4), {}
+    )
+    unstarted = build_engine_request_priority(
+        _runtime_state("unstarted", actions_completed=0), {}
+    )
+    assert invested < unstarted
+
+
+def test_completion_eta_error_uses_queue_and_request_service_time():
+    actual, error = completion_eta_observation(
+        predicted_seconds=4.5,
+        scheduling_wait_seconds=1.5,
+        request_service_seconds=2.0,
+    )
+
+    assert actual == 3.5
+    assert error == 1.0
+
+
+def test_runtime_feedback_includes_cumulative_request_costs():
+    manager = RouterManager.__new__(RouterManager)
+    manager.router = SimpleNamespace(
+        collect_runtime_feedback=lambda: {"requests": 3, "resets": 1}
+    )
+    manager.request_metric_lifetime_totals = defaultdict(
+        float,
+        {
+            "vllm/request_prefill_tokens": 120,
+            "vllm/request_prefill_seconds": 1.5,
+            "router/scheduling_wait_seconds": 0.25,
+        },
+    )
+
+    feedback = manager.collect_runtime_feedback()
+
+    assert feedback["requests"] == 3
+    assert feedback["resets"] == 1
+    assert feedback["request_metrics"]["vllm/request_prefill_tokens"] == 120
+    assert feedback["request_metrics"]["router/scheduling_wait_seconds"] == 0.25
+
+
+def test_completion_eta_placement_balances_queue_and_prefix_cost():
+    selected, reason, estimate = select_completion_eta_worker(
+        prompt_tokens=[1, 2, 3, 4, 5, 6],
+        worker_prompts={0: [(1, 2, 3, 4)], 1: []},
+        active_dp_ranks={0, 1},
+        worker_pressure={0: 2, 1: 0},
+        worker_service_seconds={0: 2.0, 1: 2.0},
+        token_seconds=0.1,
+        prefix_limit=16,
+    )
+
+    assert selected == 1
+    assert reason == "completion_eta_load"
+    assert estimate["prefill_tokens"] == 6
+
+    selected, reason, estimate = select_completion_eta_worker(
+        prompt_tokens=[1, 2, 3, 4, 5, 6],
+        worker_prompts={0: [(1, 2, 3, 4)], 1: []},
+        active_dp_ranks={0, 1},
+        worker_pressure={0: 0, 1: 0},
+        worker_service_seconds={0: 2.0, 1: 2.0},
+        token_seconds=0.1,
+        prefix_limit=16,
+    )
+
+    assert selected == 0
+    assert reason == "completion_eta_prefix"
+    assert estimate["cached_tokens"] == 4
 
 
 def test_env_affinity_router_serves_oldest_version_when_saturated():
@@ -64,6 +195,34 @@ def test_env_affinity_router_bypasses_priority_queue_when_disabled():
             False,
             False,
         )
+
+    asyncio.run(run_test())
+
+
+def test_env_affinity_router_delegates_queueing_to_engine_priority_scheduler():
+    async def run_test():
+        router = EnvAffinityRouter(
+            RouterManagerStub(),
+            [object()],
+            None,
+            SimpleNamespace(
+                max_running_requests=1,
+                router_config={
+                    "engine_priority_scheduling_enabled": True,
+                    "priority_max_running_requests": 1,
+                },
+            ),
+        )
+        await router.initialize()
+
+        assert await router._acquire_priority_slot(0, 1, "request") == (
+            False,
+            0,
+            False,
+            False,
+            False,
+        )
+        assert router.priority_inflight == [0]
 
     asyncio.run(run_test())
 

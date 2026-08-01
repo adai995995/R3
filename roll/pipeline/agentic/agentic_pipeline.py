@@ -227,6 +227,9 @@ class AgenticPipeline(BasePipeline):
         # Calculate tokens-per-second system throughput
         tps_timer = _Timer(window_size=5)
         tracer = get_tracer("driver")
+        last_policy_activation_monotonic = None
+        pending_policy_timing: Dict[str, Any] = {}
+        policy_trace_refs: List[ray.ObjectRef] = []
 
         for global_step in range(self.pipeline_config.max_steps):
             if global_step <= self.state.step:
@@ -261,8 +264,50 @@ class AgenticPipeline(BasePipeline):
                     metrics["time/step_model_update"] =model_update_timer.last
                     metrics.update(model_update_metrics)
 
-                    # PHASE 4: init kv cache
-                    self.actor_infer.load_states()
+                    # PHASE 4: activate the new rollout policy and initialize KV state
+                    with Timer(name="policy_activation", logger=None) as activation_timer, \
+                            tracer.start_as_current_span("policy_activation"):
+                        self.actor_infer.load_states()
+                    metrics["time/step_policy_activation"] = activation_timer.last
+                    publish_activate_seconds = (
+                        model_update_timer.last + activation_timer.last
+                    )
+                    metrics["time/step_publish_activate"] = (
+                        publish_activate_seconds
+                    )
+                    policy_activation_monotonic = time.monotonic()
+                    if (
+                        last_policy_activation_monotonic is not None
+                        and pending_policy_timing
+                    ):
+                        update_interval_seconds = max(
+                            0.0,
+                            policy_activation_monotonic
+                            - last_policy_activation_monotonic,
+                        )
+                        accounted_seconds = (
+                            float(pending_policy_timing["batch_wait_seconds"])
+                            + float(
+                                pending_policy_timing["learner_compute_seconds"]
+                            )
+                            + publish_activate_seconds
+                        )
+                        finalized_timing = dict(pending_policy_timing)
+                        finalized_timing.update(
+                            publish_activate_seconds=publish_activate_seconds,
+                            update_interval_seconds=update_interval_seconds,
+                            other_seconds=(
+                                update_interval_seconds - accounted_seconds
+                            ),
+                            finalized=True,
+                        )
+                        ray.get(
+                            self.train_rollout_scheduler.record_policy_update_timing.remote(
+                                int(pending_policy_timing["version"]),
+                                finalized_timing,
+                            )
+                        )
+                    last_policy_activation_monotonic = policy_activation_monotonic
                     if self.reward:
                         self.reward.load_states()
 
@@ -300,7 +345,14 @@ class AgenticPipeline(BasePipeline):
                     with Timer(name="rollout", logger=None) as rollout_timer, \
                             tracer.start_as_current_span("rollout"):
                         inject_trace_context(batch.meta_info)
+                        batch_wait_started_monotonic = time.monotonic()
                         batch = ray.get(self.train_rollout_scheduler.get_batch.remote(batch, self.pipeline_config.rollout_batch_size))
+                        batch_ready_monotonic = time.monotonic()
+                        batch_wait_seconds = max(
+                            0.0,
+                            batch_ready_monotonic - batch_wait_started_monotonic,
+                        )
+                        metrics["time/step_batch_wait_critical"] = batch_wait_seconds
                         defer.callback(lambda b=batch: DataProto.drop(b))
                         sample_uuids = [f"{traj_id}_{i}" for i, traj_id in enumerate(batch.non_tensor_batch['traj_id'])]
                         batch.non_tensor_batch['sample_uuid'] = np.array(sample_uuids, dtype=object)
@@ -551,6 +603,26 @@ class AgenticPipeline(BasePipeline):
                             metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
                         tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
                     metrics["time/step_train"] = train_timer.last
+                    learner_compute_seconds = max(
+                        0.0, time.monotonic() - batch_ready_monotonic
+                    )
+                    metrics["time/step_learner_compute_critical"] = (
+                        learner_compute_seconds
+                    )
+                    pending_policy_timing = {
+                        "version": int(global_step),
+                        "batch_wait_seconds": batch_wait_seconds,
+                        "learner_compute_seconds": learner_compute_seconds,
+                        "publish_activate_seconds": 0.0,
+                        "update_interval_seconds": 0.0,
+                        "other_seconds": 0.0,
+                        "finalized": False,
+                    }
+                    policy_trace_refs.append(
+                        self.train_rollout_scheduler.record_policy_update_timing.remote(
+                            int(global_step), dict(pending_policy_timing)
+                        )
+                    )
 
                 with Timer(name="compute_data_metrics", logger=None) as data_metrics_timer, \
                         tracer.start_as_current_span("compute_data_metrics"):
@@ -623,6 +695,8 @@ class AgenticPipeline(BasePipeline):
             global_step += 1
             logger.info(f"epoch {global_step} finished")
 
+        if policy_trace_refs:
+            ray.get(policy_trace_refs)
         shutdown_reports = ray.get([
             self.train_rollout_scheduler.shutdown.remote(),
             self.val_rollout_scheduler.shutdown.remote(),

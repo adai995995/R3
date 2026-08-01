@@ -184,6 +184,45 @@ def test_gpu_rebuild_candidates_are_exact_unfinished_trajectories():
     ]
 
 
+def test_router_progress_does_not_overwrite_environment_runtime_phase():
+    queue = GroupQueue(
+        group_id=2,
+        progress_bar=None,
+        group_size=1,
+        group_size_redundancy=0,
+        max_traj_per_env=1,
+        async_generation_ratio=0,
+        staleness_tolerance=4,
+        group_filter=NeverFilter(),
+        scheduling_policy="version_priority",
+    )
+    queue.update_progress_snapshots(
+        [
+            {
+                "trajectory_id": "trajectory-0",
+                "group_id": 2,
+                "episode_id": 7,
+                "env_id": 0,
+                "runtime_phase": "tool_or_environment",
+                "actions_completed": 2,
+            },
+            {
+                "trajectory_id": "trajectory-0",
+                "group_id": 2,
+                "episode_id": 7,
+                "env_id": 0,
+                "runtime_phase": "router_last_request",
+                "progress_source": "router",
+                "actions_completed": 2,
+            },
+        ]
+    )
+
+    snapshot = queue.progress_snapshots[(7, 0)]
+    assert snapshot["runtime_phase"] == "tool_or_environment"
+    assert snapshot["router_runtime_phase"] == "router_last_request"
+
+
 def test_outstanding_snapshot_counts_ready_running_reserved_and_retired():
     queue = GroupQueue(
         group_id=0,
@@ -299,6 +338,37 @@ def test_progress_reconcile_publishes_an_online_plan_revision():
     report = manager.collect_shutdown_waste([])
     assert report["version_runtime"]["plan"]["revision"] == 1
     assert report["metrics"]["version_runtime/final_revision"] == 1
+
+
+def test_shutdown_records_merge_snapshot_submitted_during_collection():
+    manager_class = GroupQueueManager.__ray_metadata__.modified_class
+    records, duplicates_removed = manager_class._deduplicate_shutdown_records(
+        [
+            {
+                "trajectory_id": "traj-1",
+                "category": "completed_unconsumed",
+                "completed": True,
+                "actions_completed": 7,
+                "inference_tokens": 700,
+            },
+            {
+                "trajectory_id": "traj-1",
+                "category": "inflight_at_shutdown",
+                "runtime_phase": "policy_inference",
+                "completed": False,
+                "actions_completed": 6,
+                "inference_tokens": 650,
+                "trajectory_wall_seconds": 12.0,
+            },
+        ]
+    )
+
+    assert duplicates_removed == 1
+    assert len(records) == 1
+    assert records[0]["category"] == "completed_unconsumed"
+    assert records[0]["actions_completed"] == 7
+    assert records[0]["inference_tokens"] == 700
+    assert records[0]["trajectory_wall_seconds"] == 12.0
 
 
 def test_runtime_controller_owns_reconcile_delta_without_mutating_state():

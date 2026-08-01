@@ -15,7 +15,10 @@ from typing import List, Dict, Optional, Any
 from pydantic import TypeAdapter
 from transformers import PreTrainedTokenizer
 
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageParam
+try:
+    from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageParam
+except ModuleNotFoundError:
+    from sglang.srt.openai_api.protocol import ChatCompletionMessageParam
 
 from roll.pipeline.agentic.env_manager.token_mask_utils import convert_list_content_str
 

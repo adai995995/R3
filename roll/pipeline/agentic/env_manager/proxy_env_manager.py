@@ -31,8 +31,12 @@ from roll.utils.logging import get_logger
 from roll.pipeline.agentic.agent_runner.base import AgentRunner
 from roll.utils.import_utils import safe_import_class
 
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.entrypoints.openai.protocol import Tool
+try:
+    from sglang.srt.function_call.function_call_parser import FunctionCallParser
+    from sglang.srt.entrypoints.openai.protocol import Tool
+except ModuleNotFoundError:
+    from sglang.srt.function_call_parser import FunctionCallParser
+    from sglang.srt.openai_api.protocol import Tool
 
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -146,6 +150,9 @@ class ProxyEnvManager(BaseEnvManager):
             "step_rt": [],           # total round-trip time per step (request in → response out)
             "pure_infer_time": [],   # pure LLM generation time
             "env_exec_time": [],     # sandbox execution time (last response end → next request start)
+            "environment_model_infer_time": [],
+            "environment_model_prompt_tokens": [],
+            "environment_model_response_tokens": [],
             "proxy_overhead": [],    # proxy logic overhead (tokenizer, parser, etc.)
             "response_length": [],
             "tokens_per_second": [],
@@ -156,6 +163,28 @@ class ProxyEnvManager(BaseEnvManager):
             enable_thinking=self.env_config.config.get("enable_thinking", False),
             enable_fork=self.env_config.config.get("enable_fork", False),
         )
+
+    def _augment_lm_input_meta(
+        self,
+        lm_input: DataProto,
+        request_role: str,
+        track_trajectory: bool,
+    ) -> None:
+        """Allow specialized proxy managers to attach scheduler metadata."""
+
+    def _on_proxy_request_start(
+        self,
+        request_role: str,
+        track_trajectory: bool,
+    ) -> None:
+        """Notification hook for live trajectory progress reporting."""
+
+    def _on_proxy_request_finish(
+        self,
+        request_role: str,
+        track_trajectory: bool,
+    ) -> None:
+        """Notification hook for live trajectory progress reporting."""
 
     async def process_request(self, request: Request):
         """
@@ -195,8 +224,11 @@ class ProxyEnvManager(BaseEnvManager):
         """
         self.logger.info(f"Received request from Harbor Agent for env_id: {self.env_config['env_id']}")
         step_start_time = time.time()
+        track_trajectory = bool(body.get("_roll_track_trajectory", True))
+        request_role = str(body.get("_roll_request_role", "agent"))
+        self._on_proxy_request_start(request_role, track_trajectory)
 
-        if self.last_response_finish_time:
+        if track_trajectory and self.last_response_finish_time:
             env_work_time = step_start_time - self.last_response_finish_time
             self.log_stats["env_exec_time"].append(env_work_time)
 
@@ -210,8 +242,16 @@ class ProxyEnvManager(BaseEnvManager):
 
         tools_obj = [Tool.model_validate(t) for t in raw_tools] if raw_tools else []
 
-        prompt_ids = self.message_tracker.process_messages(
-            messages, tools=self.tools, add_generation_prompt=True,
+        message_tracker = self.message_tracker
+        if not track_trajectory:
+            message_tracker = MessageTracker(
+                self.tokenizer,
+                enable_thinking=self.env_config.config.get("enable_thinking", False),
+                enable_fork=False,
+            )
+
+        prompt_ids = message_tracker.process_messages(
+            messages, tools=raw_tools or None, add_generation_prompt=True,
         )
         input_ids = torch.tensor(prompt_ids, dtype=torch.long).unsqueeze(0)
         attention_mask = torch.tensor([1] * input_ids.shape[1], dtype=torch.long).unsqueeze(0)
@@ -243,6 +283,9 @@ class ProxyEnvManager(BaseEnvManager):
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
         generation_config["enable_thinking"] = self.env_config.config.get("enable_thinking", False)
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
+        lm_input.meta_info["request_role"] = request_role
+        lm_input.meta_info["track_trajectory"] = track_trajectory
+        self._augment_lm_input_meta(lm_input, request_role, track_trajectory)
 
         infer_start = time.time()
         lm_output = await asyncio.to_thread(
@@ -273,13 +316,18 @@ class ProxyEnvManager(BaseEnvManager):
         total_step_rt = time.time() - step_start_time
         overhead = total_step_rt - pure_infer_duration
 
-        self.log_stats["step_rt"].append(total_step_rt)
-        self.log_stats["pure_infer_time"].append(pure_infer_duration)
-        self.log_stats["proxy_overhead"].append(overhead)
-        self.log_stats["response_length"].append(resp_len)
-        self.log_stats["current_step"].append(len(self.history))
-        if total_step_rt > 0.01:
-            self.log_stats["tokens_per_second"].append(resp_len / total_step_rt)
+        if track_trajectory:
+            self.log_stats["step_rt"].append(total_step_rt)
+            self.log_stats["pure_infer_time"].append(pure_infer_duration)
+            self.log_stats["proxy_overhead"].append(overhead)
+            self.log_stats["response_length"].append(resp_len)
+            self.log_stats["current_step"].append(self.current_step)
+            if total_step_rt > 0.01:
+                self.log_stats["tokens_per_second"].append(resp_len / total_step_rt)
+        else:
+            self.log_stats["environment_model_infer_time"].append(pure_infer_duration)
+            self.log_stats["environment_model_prompt_tokens"].append(len(prompt_ids))
+            self.log_stats["environment_model_response_tokens"].append(resp_len)
 
         infer_logprobs = None
         if "infer_logprobs" in lm_output.batch.keys():
@@ -301,27 +349,34 @@ class ProxyEnvManager(BaseEnvManager):
         if tool_calls:
             message_out["tool_calls"] = tool_calls
 
-        # Record assistant response in MessageTracker (unified for both step and traj modes)
-        self.message_tracker.record_response(
-            msg_pos=len(messages),
-            resp_msg=message_out,
-            response_ids=response_ids,
-            logprobs=infer_logprobs,
-        )
+        if track_trajectory:
+            # Only policy actions become training tokens. Environment-side model
+            # calls, such as a simulated user, are measured but kept out of the
+            # MessageTracker and rollout history.
+            request_metrics = dict(lm_output.meta_info.get("metrics", {}))
+            self.message_tracker.record_response(
+                msg_pos=len(messages),
+                resp_msg=message_out,
+                response_ids=response_ids,
+                logprobs=infer_logprobs,
+            )
 
-        with self.thread_lock:
-            self.history.append({
-                "prompt_messages": messages,
-                "prompt_ids": prompt_ids,
-                "response_ids": response_ids,
-                "response_message": message_out,
-                "tools": self.tools,
-                "logprobs": infer_logprobs,
-                "finish_reason": finish_reason,
-                "timestamp": time.time(),
-            })
+            with self.thread_lock:
+                self.history.append({
+                    "prompt_messages": messages,
+                    "prompt_ids": prompt_ids,
+                    "response_ids": response_ids,
+                    "response_message": message_out,
+                    "tools": self.tools,
+                    "logprobs": infer_logprobs,
+                    "finish_reason": finish_reason,
+                    "timestamp": time.time(),
+                    "request_metrics": request_metrics,
+                })
 
-        self.last_response_finish_time = time.time()
+            self.last_response_finish_time = time.time()
+
+        self._on_proxy_request_finish(request_role, track_trajectory)
 
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -559,5 +614,3 @@ class ProxyEnvManager(BaseEnvManager):
         ]
 
         return batch
-
-

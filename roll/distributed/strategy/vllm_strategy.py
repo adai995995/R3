@@ -35,6 +35,111 @@ from roll.platforms import current_platform
 logger = get_logger()
 
 
+def request_priority_from_payload(payload: Dict) -> int:
+    """Return the engine priority attached by the version-aware router."""
+    return int(payload.get("_roll_request_priority", 0))
+
+
+def request_priority_observation(
+    payload: Dict, request_metrics: Dict[str, float]
+) -> Dict[str, float]:
+    """Summarize whether an engine-priority request experienced real queueing."""
+    enabled = "_roll_request_priority" in payload
+    queue_seconds = max(
+        0.0, float(request_metrics.get("vllm/request_queue_seconds", 0.0))
+    )
+    return {
+        "vllm/request_priority": float(request_priority_from_payload(payload)),
+        "vllm/request_priority_enabled": int(enabled),
+        "vllm/request_priority_queued": int(enabled and queue_seconds >= 1e-3),
+        "vllm/request_priority_queue_seconds": queue_seconds if enabled else 0.0,
+    }
+
+
+def request_timing_metrics(output: RequestOutput) -> Dict[str, float]:
+    """Extract stable per-request timings exposed by vLLM."""
+    request_metrics = getattr(output, "metrics", None)
+    output_tokens = sum(
+        len(completion.token_ids) for completion in getattr(output, "outputs", ())
+    )
+    metrics = {"vllm/request_output_tokens": float(output_tokens)}
+    if request_metrics is not None:
+        for field, name in (
+            ("time_in_queue", "vllm/request_queue_seconds"),
+            ("scheduler_time", "vllm/request_scheduler_seconds"),
+            ("model_forward_time", "vllm/request_model_forward_seconds"),
+            ("model_execute_time", "vllm/request_model_execute_seconds"),
+        ):
+            value = getattr(request_metrics, field, None)
+            if value is not None:
+                metrics[name] = max(0.0, float(value))
+
+        arrival_time = getattr(request_metrics, "arrival_time", None)
+        first_scheduled_time = getattr(
+            request_metrics, "first_scheduled_time", None
+        )
+        first_token_time = getattr(request_metrics, "first_token_time", None)
+        finished_time = getattr(request_metrics, "finished_time", None)
+        if arrival_time is not None and first_scheduled_time is not None:
+            # vLLM 0.10.2 exposes the timestamps but leaves time_in_queue at
+            # zero, so retain the larger of the explicit and derived values.
+            derived_queue_seconds = max(
+                0.0, float(first_scheduled_time) - float(arrival_time)
+            )
+            metrics["vllm/request_queue_seconds"] = max(
+                metrics.get("vllm/request_queue_seconds", 0.0),
+                derived_queue_seconds,
+            )
+        if arrival_time is not None and first_token_time is not None:
+            metrics["vllm/request_ttft_seconds"] = max(
+                0.0, float(first_token_time) - float(arrival_time)
+            )
+        if arrival_time is not None and finished_time is not None:
+            metrics["vllm/request_latency_seconds"] = max(
+                0.0, float(finished_time) - float(arrival_time)
+            )
+        if first_token_time is not None and finished_time is not None:
+            metrics["vllm/request_decode_seconds"] = max(
+                0.0, float(finished_time) - float(first_token_time)
+            )
+
+    v1_timing_metrics = getattr(output, "roll_request_timing_metrics", {}) or {}
+    for field, name in (
+        ("queue_seconds", "vllm/request_queue_seconds"),
+        ("ttft_seconds", "vllm/request_ttft_seconds"),
+        ("prefill_seconds", "vllm/request_prefill_seconds"),
+        ("decode_seconds", "vllm/request_decode_seconds"),
+        ("inference_seconds", "vllm/request_inference_seconds"),
+        ("latency_seconds", "vllm/request_latency_seconds"),
+    ):
+        value = v1_timing_metrics.get(field)
+        if value is not None:
+            observed_value = max(0.0, float(value))
+            if name == "vllm/request_queue_seconds":
+                observed_value = max(metrics.get(name, 0.0), observed_value)
+            metrics[name] = observed_value
+
+    v1_engine_metrics = getattr(output, "roll_request_engine_metrics", {}) or {}
+    for field in (
+        "engine_step_seconds_attributed",
+        "prefill_engine_step_seconds_attributed",
+        "decode_engine_step_seconds_attributed",
+        "scheduled_tokens",
+    ):
+        value = v1_engine_metrics.get(field)
+        if value is not None:
+            metrics[f"vllm/request_{field}"] = max(0.0, float(value))
+
+    decode_seconds = metrics.get("vllm/request_decode_seconds", 0.0)
+    decode_tokens = max(0, output_tokens - 1)
+    metrics["vllm/request_decode_tokens"] = float(decode_tokens)
+    if decode_seconds > 0:
+        metrics["vllm/request_decode_tokens_per_second"] = (
+            decode_tokens / decode_seconds
+        )
+    return metrics
+
+
 class _PrefixCacheDeltaLogger:
     """Collect exact V1 scheduler prefix-cache deltas between drains."""
 
@@ -380,11 +485,13 @@ class VllmStrategy(InferenceStrategy):
                     exc_info=True,
                 )
 
+        request_priority = request_priority_from_payload(payload)
         result_generator = self.model.generate(
             prompt=prompt,
             sampling_params=SamplingParams(**payload["sampling_params"]),
             request_id=payload["rid"],
             lora_request=lora_request,
+            priority=request_priority,
         )
         output: Optional[RequestOutput] = None
         observed_cached_prompt_tokens = None
@@ -443,6 +550,11 @@ class VllmStrategy(InferenceStrategy):
                 rebuild_marker_registered
             ),
         }
+        timing_metrics = request_timing_metrics(output)
+        result["metrics"].update(timing_metrics)
+        result["metrics"].update(
+            request_priority_observation(payload, timing_metrics)
+        )
         # The ROLL vLLM 0.8.4 compatibility hook populates this field from the
         # scheduler's exact initial computed-prefix length. Keep the fallback
         # for native/future engines that do not expose a per-request value.

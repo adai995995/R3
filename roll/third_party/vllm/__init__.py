@@ -24,6 +24,8 @@ if Version("0.8.4") == Version(vllm.__version__):
     ray_executor_class_v0 = safe_import_class("roll.third_party.vllm.vllm_0_8_4.ray_distributed_executor.CustomRayDistributedExecutor")
     ray_executor_class_v1 = safe_import_class("roll.third_party.vllm.vllm_0_8_4.v1.ray_distributed_executor.CustomRayDistributedExecutor")
 elif Version("0.10.2") == Version(vllm.__version__):
+    import roll.third_party.vllm.vllm_0_10_2  # apply patch
+
     ray_executor_class_v0 = safe_import_class("roll.third_party.vllm.vllm_0_10_2.ray_distributed_executor.CustomRayDistributedExecutor")
     ray_executor_class_v1 = safe_import_class("roll.third_party.vllm.vllm_0_10_2.v1.ray_distributed_executor.CustomRayDistributedExecutor")
 elif Version("0.11.0") == Version(vllm.__version__) or Version("0.11.1rc1") == Version(vllm.__version__) or Version("0.11.1rc2.dev0+gc3a722fcb.d20251021") == Version(vllm.__version__):

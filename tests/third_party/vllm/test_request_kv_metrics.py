@@ -8,7 +8,9 @@ from roll.third_party.vllm.vllm_0_8_4.request_kv_metrics import (
     mark_rebuild_request,
     populate_request_cached_tokens,
     pop_request_cached_tokens,
+    pop_request_engine_timing,
     pop_request_kv_metrics,
+    record_engine_step_timing,
     record_scheduled_request_cached_tokens,
 )
 
@@ -65,6 +67,80 @@ def test_abort_cleanup_and_pop_are_one_shot():
     assert pop_request_cached_tokens(engine_core, "live") == 128
     assert pop_request_cached_tokens(engine_core, "live") is None
     assert pop_request_kv_metrics(engine_core, "aborted")["scheduler_batch_id"] is None
+
+
+def test_engine_step_time_is_deduplicated_by_scheduled_token_share():
+    scheduler = SimpleNamespace(
+        requests={
+            "prefill": SimpleNamespace(
+                num_computed_tokens=25,
+                num_prompt_tokens=25,
+            ),
+            "decode": SimpleNamespace(
+                num_computed_tokens=176,
+                num_prompt_tokens=100,
+            ),
+        }
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(req_id="prefill", num_computed_tokens=0),
+        ],
+        num_scheduled_tokens={"prefill": 25, "decode": 75},
+    )
+    engine_core = SimpleNamespace(scheduler=scheduler)
+
+    record_scheduled_request_cached_tokens(scheduler, scheduler_output)
+    record_engine_step_timing(engine_core, 2.0)
+    prefill = pop_request_engine_timing(engine_core, "prefill")
+    decode = pop_request_engine_timing(engine_core, "decode")
+
+    assert prefill["engine_step_seconds_attributed"] == pytest.approx(0.5)
+    assert prefill[
+        "prefill_engine_step_seconds_attributed"
+    ] == pytest.approx(0.5)
+    assert decode["engine_step_seconds_attributed"] == pytest.approx(1.5)
+    assert decode[
+        "decode_engine_step_seconds_attributed"
+    ] == pytest.approx(1.5)
+    assert (
+        prefill["engine_step_seconds_attributed"]
+        + decode["engine_step_seconds_attributed"]
+    ) == pytest.approx(2.0)
+
+
+def test_chunked_prefill_is_classified_across_engine_steps():
+    request = SimpleNamespace(
+        num_computed_tokens=64,
+        num_prompt_tokens=128,
+    )
+    scheduler = SimpleNamespace(requests={"chunked": request})
+    engine_core = SimpleNamespace(scheduler=scheduler)
+    first_chunk = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(req_id="chunked", num_computed_tokens=0),
+        ],
+        num_scheduled_tokens={"chunked": 64},
+    )
+
+    record_scheduled_request_cached_tokens(scheduler, first_chunk)
+    record_engine_step_timing(engine_core, 1.0)
+    request.num_computed_tokens = 128
+    second_chunk = SimpleNamespace(
+        scheduled_new_reqs=[],
+        num_scheduled_tokens={"chunked": 64},
+    )
+    record_scheduled_request_cached_tokens(scheduler, second_chunk)
+    record_engine_step_timing(engine_core, 1.0)
+
+    timing = pop_request_engine_timing(engine_core, "chunked")
+    assert timing["engine_step_seconds_attributed"] == pytest.approx(2.0)
+    assert timing[
+        "prefill_engine_step_seconds_attributed"
+    ] == pytest.approx(2.0)
+    assert timing[
+        "decode_engine_step_seconds_attributed"
+    ] == pytest.approx(0.0)
 
 
 @pytest.mark.asyncio

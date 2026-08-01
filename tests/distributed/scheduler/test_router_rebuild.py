@@ -1,8 +1,12 @@
+import pytest
+
 from roll.distributed.scheduler.router import (
     TrajectoryRuntimeState,
     build_runtime_priority_key,
     build_router_progress_snapshot,
     build_boundary_recovery_record,
+    build_prefix_fingerprints,
+    build_refresh_request_record,
     common_prefix_tokens,
     is_post_boundary_request,
     select_rebuild_worker,
@@ -58,7 +62,15 @@ def test_boundary_recovery_record_distinguishes_reported_and_logical_prefill():
             "vllm/request_prefill_tokens": 3072,
             "vllm/request_scheduler_batch_id": 11,
             "vllm/request_scheduler_batch_size": 4,
+            "vllm/request_ttft_seconds": 0.4,
+            "vllm/request_model_execute_seconds": 0.25,
+            "vllm/request_engine_step_seconds_attributed": 0.2,
+            "vllm/request_prefill_engine_step_seconds_attributed": 0.15,
+            "vllm/request_decode_engine_step_seconds_attributed": 0.05,
         },
+        boundary_resumed_at=10.0,
+        request_dispatched_at=10.2,
+        request_completed_at=11.0,
     )
     upper_bound = build_boundary_recovery_record(
         state,
@@ -74,6 +86,18 @@ def test_boundary_recovery_record_distinguishes_reported_and_logical_prefill():
     assert reported["reprefill_measurement"] == "engine_reported_prefill"
     assert reported["engine_scheduler_batch_id"] == 11
     assert reported["engine_scheduler_batch_size"] == 4
+    assert reported["first_token_after_boundary_seconds"] == pytest.approx(0.6)
+    assert reported["finish_after_boundary_seconds"] == pytest.approx(1.0)
+    assert reported["request_model_execute_seconds"] == pytest.approx(0.25)
+    assert reported[
+        "request_engine_step_seconds_attributed"
+    ] == pytest.approx(0.2)
+    assert reported[
+        "request_prefill_engine_step_seconds_attributed"
+    ] == pytest.approx(0.15)
+    assert reported[
+        "request_decode_engine_step_seconds_attributed"
+    ] == pytest.approx(0.05)
     assert upper_bound["logical_reprefill_exposure_tokens"] == 4096
     assert upper_bound["reprefill_measurement"] == "logical_prompt_upper_bound"
 
@@ -100,6 +124,56 @@ def test_boundary_recovery_uses_router_epoch_when_request_version_lags():
     )
 
     assert record["version_age"] == 1
+
+
+def test_prefix_fingerprints_are_block_aligned_and_deterministic():
+    tokens = list(range(300))
+
+    first = build_prefix_fingerprints(tokens, depths=(128, 256))
+    second = build_prefix_fingerprints(tokens, depths=(128, 256))
+
+    assert first == second
+    assert [item["prefix_tokens"] for item in first] == [128, 256, 288]
+    assert len({item["fingerprint"] for item in first}) == 3
+
+
+def test_refresh_request_record_is_aligned_to_boundary():
+    state = TrajectoryRuntimeState(
+        "trajectory-5",
+        policy_version=2,
+        current_version=3,
+        version_age=1,
+        actions_completed=4,
+        max_actions=10,
+    )
+
+    record = build_refresh_request_record(
+        state,
+        cache_epoch=4,
+        boundary_version=3,
+        worker_rank=1,
+        route_reason="rebuild",
+        prompt_tokens=list(range(256)),
+        response_metrics={
+            "vllm/request_cached_prompt_tokens": 0,
+            "vllm/request_prefill_tokens": 256,
+            "vllm/request_decode_tokens": 32,
+            "vllm/request_ttft_seconds": 0.5,
+            "vllm/request_scheduler_batch_id": 7,
+        },
+        request_dispatched_at=10.25,
+        request_completed_at=11.0,
+        boundary_resumed_at=10.0,
+        first_epoch_request=True,
+    )
+
+    assert record["survivor_request"] is True
+    assert record["dispatch_after_boundary_seconds"] == pytest.approx(0.25)
+    assert record["first_token_after_boundary_seconds"] == pytest.approx(0.75)
+    assert record["finish_after_boundary_seconds"] == pytest.approx(1.0)
+    assert record["prefill_tokens"] == 256
+    assert record["decode_tokens"] == 32
+    assert record["prefix_fingerprints"]
 
 
 def test_common_prefix_tokens_is_bounded():

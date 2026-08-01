@@ -661,9 +661,38 @@ class PPOConfig(BaseConfig):
         default=0.25,
         metadata={"help": "Stale inference-token fraction EWMA threshold that triggers reserve decay."},
     )
+    dynamic_admission_starvation_high_fraction: float = field(
+        default=0.10,
+        metadata={
+            "help": "Batch-wait fraction above which the state-feedback controller detects learner starvation."
+        },
+    )
+    dynamic_admission_queue_high_fraction: float = field(
+        default=0.20,
+        metadata={
+            "help": "vLLM queue-time fraction above which admission defers to request scheduling."
+        },
+    )
+    dynamic_admission_tool_wait_high_fraction: float = field(
+        default=0.50,
+        metadata={
+            "help": "Tool-wait share above which under-supply is classified as a diversity shortage."
+        },
+    )
+    dynamic_admission_reserve_shadow_mode: bool = field(
+        default=False,
+        metadata={
+            "help": "Compute and report reserve decisions without applying them to admission."
+        },
+    )
     dynamic_admission_reserve_prediction_error_margin: float = field(
         default=1.0,
-        metadata={"help": "Negative supply-prediction EWMA margin that triggers reserve decay."},
+        metadata={
+            "help": (
+                "Legacy threshold_aimd margin for supply-prediction feedback. "
+                "closed_loop_aimd uses prediction error only to calibrate the estimator."
+            )
+        },
     )
     dynamic_admission_reserve_ewma_alpha: float = field(
         default=0.5,
@@ -678,10 +707,27 @@ class PPOConfig(BaseConfig):
         metadata={"help": "Version boundaries held after each dynamic reserve change."},
     )
     dynamic_admission_reserve_controller: Literal[
-        "threshold_aimd", "utility_hill_climb"
+        "closed_loop_aimd", "state_feedback", "threshold_aimd", "utility_hill_climb"
     ] = field(
-        default="threshold_aimd",
-        metadata={"help": "Feedback controller used to tune version-adaptive reserve."},
+        default="closed_loop_aimd",
+        metadata={
+            "help": (
+                "Feedback controller used to tune version-adaptive reserve. "
+                "closed_loop_aimd separates estimator residuals from measured "
+                "learner under-supply and expired-work overload. state_feedback "
+                "jointly considers starvation, expiration, vLLM queue pressure, "
+                "and pool readiness."
+            )
+        },
+    )
+    version_runtime_max_outcomes: int = field(
+        default=256,
+        metadata={
+            "help": (
+                "Maximum finalized per-version forecast/plan/outcome records "
+                "retained for diagnostics."
+            )
+        },
     )
     dynamic_admission_utility_window_versions: int = field(
         default=4,

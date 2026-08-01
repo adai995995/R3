@@ -147,6 +147,13 @@ def finalize_runtime_observation_report(
         "dynamic_admission_reserve_enabled": bool(
             _get(config, "dynamic_admission_reserve_enabled", False)
         ),
+        "dynamic_admission_reserve_controller": str(
+            _get(
+                config,
+                "dynamic_admission_reserve_controller",
+                "closed_loop_aimd",
+            )
+        ),
         "runtime_variant": runtime_variant(components),
         "runtime_components": components,
         "checkpointing_enabled": bool(

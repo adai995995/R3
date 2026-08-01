@@ -3,6 +3,7 @@
 from typing import Optional
 from collections.abc import AsyncGenerator, Mapping, Iterable
 import asyncio
+import time
 
 from vllm.inputs import PromptType
 from vllm.lora.request import LoRARequest
@@ -15,6 +16,7 @@ from roll.third_party.vllm.async_llm import CustomAsyncLLM
 from roll.third_party.vllm.vllm_0_8_4.request_kv_metrics import (
     install_request_kv_metrics_patch,
     populate_request_cached_tokens,
+    POP_ENGINE_TIMING_UTILITY,
 )
 
 
@@ -35,6 +37,7 @@ async def generate(
             self.output_handler = asyncio.create_task(
                 self._run_output_handler())
 
+        request_started_at = time.perf_counter()
         q = await self.add_request(
             request_id,
             prompt,
@@ -44,21 +47,71 @@ async def generate(
             prompt_adapter_request=prompt_adapter_request,
             priority=priority,
         )
+        request_state = self.output_processor.request_states.get(request_id)
 
         finished = False
         cached_tokens_populated = False
+        first_output_at = None
         while not finished:
             out = q.get_nowait() or await q.get()
+            output_received_at = time.perf_counter()
 
             if isinstance(out, BaseException) or (isinstance(out, type) and issubclass(out, BaseException)):
                 # raise asyncio.CancelledError, will not cause dead recursive
                 raise out
 
+            if first_output_at is None:
+                first_output_at = output_received_at
             if not cached_tokens_populated:
                 await populate_request_cached_tokens(self, request_id, out)
                 cached_tokens_populated = True
 
             finished = out.finished
+            if finished:
+                state_stats = getattr(request_state, "stats", None)
+                timing_metrics = {
+                    "ttft_seconds": max(
+                        0.0, float(first_output_at) - request_started_at
+                    ),
+                    "latency_seconds": max(
+                        0.0, output_received_at - request_started_at
+                    ),
+                }
+                if state_stats is not None:
+                    queued = float(getattr(state_stats, "queued_ts", 0.0))
+                    scheduled = float(
+                        getattr(state_stats, "scheduled_ts", 0.0)
+                    )
+                    first_token = float(
+                        getattr(state_stats, "first_token_ts", 0.0)
+                    )
+                    last_token = float(
+                        getattr(state_stats, "last_token_ts", 0.0)
+                    )
+                    if scheduled >= queued > 0:
+                        timing_metrics["queue_seconds"] = scheduled - queued
+                    if first_token >= scheduled > 0:
+                        timing_metrics["prefill_seconds"] = (
+                            first_token - scheduled
+                        )
+                    if last_token >= first_token > 0:
+                        timing_metrics["decode_seconds"] = (
+                            last_token - first_token
+                        )
+                    if last_token >= scheduled > 0:
+                        timing_metrics["inference_seconds"] = (
+                            last_token - scheduled
+                        )
+                out.roll_request_timing_metrics = timing_metrics
+                try:
+                    out.roll_request_engine_metrics = (
+                        await self.engine_core.call_utility_async(
+                            POP_ENGINE_TIMING_UTILITY,
+                            request_id,
+                        )
+                    )
+                except Exception:
+                    out.roll_request_engine_metrics = {}
             yield out
 
     except asyncio.CancelledError:

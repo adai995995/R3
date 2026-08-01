@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import heapq
 import itertools
 import math
@@ -9,7 +10,7 @@ import weakref
 from abc import abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, List, MutableMapping, Optional, Set
+from typing import Any, Dict, List, MutableMapping, Optional, Sequence, Set
 from urllib.parse import quote
 
 import ray
@@ -37,6 +38,7 @@ def update_request_metric_totals(
         if name in (
             "vllm/request_kv_hit_ratio",
             "vllm/request_scheduler_batch_id",
+            "vllm/request_decode_tokens_per_second",
         ):
             continue
         if isinstance(value, (int, float)):
@@ -105,7 +107,23 @@ def summarize_request_metric_totals(
             "router/kv_cache_resets": metrics.get(
                 "vllm/engine_prefix_cache_resets_delta", 0.0
             ),
+            "router/engine_priority_requests": metrics.get(
+                "vllm/request_priority_enabled", 0.0
+            ),
+            "router/engine_priority_queued_requests": metrics.get(
+                "vllm/request_priority_queued", 0.0
+            ),
+            "router/engine_priority_queue_seconds": metrics.get(
+                "vllm/request_priority_queue_seconds", 0.0
+            ),
         }
+    )
+    engine_priority_requests = metrics["router/engine_priority_requests"]
+    metrics["router/engine_priority_queued_ratio"] = (
+        metrics["router/engine_priority_queued_requests"]
+        / engine_priority_requests
+        if engine_priority_requests
+        else 0.0
     )
     scheduling_decisions = metrics.get("router/scheduling_decisions", 0.0)
     if scheduling_decisions:
@@ -144,6 +162,50 @@ def summarize_request_metric_totals(
             (
                 "router/engine_kv_feedback_requests",
                 "router/engine_kv_feedback_ratio",
+            ),
+            (
+                "router/completion_eta_selected",
+                "router/completion_eta_selected_ratio",
+            ),
+            (
+                "router/predicted_completion_eta_seconds",
+                "router/predicted_completion_eta_seconds_mean",
+            ),
+            (
+                "router/predicted_queue_eta_seconds",
+                "router/predicted_queue_eta_seconds_mean",
+            ),
+            (
+                "router/predicted_prefill_tokens",
+                "router/predicted_prefill_tokens_mean",
+            ),
+            (
+                "router/request_service_seconds",
+                "router/request_service_seconds_mean",
+            ),
+            (
+                "router/actual_completion_seconds",
+                "router/actual_completion_seconds_mean",
+            ),
+            (
+                "router/completion_eta_absolute_error_seconds",
+                "router/completion_eta_absolute_error_seconds_mean",
+            ),
+            (
+                "router/planned_completion_probability",
+                "router/planned_completion_probability_mean",
+            ),
+            (
+                "router/planned_completion_eta_seconds",
+                "router/planned_completion_eta_seconds_mean",
+            ),
+            (
+                "router/actual_prefill_tokens",
+                "router/actual_prefill_tokens_mean",
+            ),
+            (
+                "router/prefill_prediction_absolute_error_tokens",
+                "router/prefill_prediction_absolute_error_tokens_mean",
             ),
         ):
             metrics[derived_name] = (
@@ -249,6 +311,41 @@ def build_runtime_priority_key(
     )
 
 
+def build_engine_request_priority(
+    runtime_state: TrajectoryRuntimeState,
+    planned_candidate_ranks: Dict[str, int],
+) -> int:
+    """Encode the router's lexicographic order as a vLLM integer priority."""
+    rank_bits = 20
+    version_bits = 24
+    remaining_bits = 16
+    rank_limit = (1 << rank_bits) - 1
+    version_limit = (1 << version_bits) - 1
+    remaining_limit = (1 << remaining_bits) - 1
+
+    if planned_candidate_ranks:
+        candidate_rank = planned_candidate_ranks.get(runtime_state.group_key)
+        outside_plan = int(candidate_rank is None)
+        candidate_rank = rank_limit if candidate_rank is None else int(candidate_rank)
+    else:
+        outside_plan = 0
+        candidate_rank = 0
+
+    candidate_rank = min(rank_limit, max(0, candidate_rank))
+    policy_version = min(version_limit, max(0, int(runtime_state.policy_version)))
+    remaining_actions = min(
+        remaining_limit, max(0, int(runtime_state.remaining_actions))
+    )
+    unstarted = int(runtime_state.actions_completed == 0)
+
+    priority = outside_plan
+    priority = (priority << rank_bits) | candidate_rank
+    priority = (priority << version_bits) | policy_version
+    priority = (priority << 1) | unstarted
+    priority = (priority << remaining_bits) | remaining_actions
+    return priority
+
+
 def build_router_progress_snapshot(
     runtime_state: TrajectoryRuntimeState, prompt_tokens: int
 ) -> Dict[str, Any]:
@@ -292,6 +389,10 @@ def build_boundary_recovery_record(
     route_reason: str,
     prompt_tokens: int,
     response_metrics: Dict[str, Any],
+    boundary_resumed_at: Optional[float] = None,
+    request_dispatched_at: Optional[float] = None,
+    request_completed_at: Optional[float] = None,
+    prefix_fingerprints: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Describe a survivor's first request in a new cache epoch."""
     cached_tokens = response_metrics.get("vllm/request_cached_prompt_tokens")
@@ -328,7 +429,76 @@ def build_boundary_recovery_record(
         "engine_scheduler_batch_size": response_metrics.get(
             "vllm/request_scheduler_batch_size"
         ),
+        "request_queue_seconds": float(
+            response_metrics.get("vllm/request_queue_seconds", 0.0)
+        ),
+        "request_ttft_seconds": float(
+            response_metrics.get("vllm/request_ttft_seconds", 0.0)
+        ),
+        "request_prefill_seconds": float(
+            response_metrics.get("vllm/request_prefill_seconds", 0.0)
+        ),
+        "request_decode_seconds": float(
+            response_metrics.get("vllm/request_decode_seconds", 0.0)
+        ),
+        "request_inference_seconds": float(
+            response_metrics.get("vllm/request_inference_seconds", 0.0)
+        ),
+        "request_latency_seconds": float(
+            response_metrics.get("vllm/request_latency_seconds", 0.0)
+        ),
+        "request_model_forward_seconds": float(
+            response_metrics.get("vllm/request_model_forward_seconds", 0.0)
+        ),
+        "request_model_execute_seconds": float(
+            response_metrics.get("vllm/request_model_execute_seconds", 0.0)
+        ),
+        "request_engine_step_seconds_attributed": float(
+            response_metrics.get(
+                "vllm/request_engine_step_seconds_attributed", 0.0
+            )
+        ),
+        "request_prefill_engine_step_seconds_attributed": float(
+            response_metrics.get(
+                "vllm/request_prefill_engine_step_seconds_attributed", 0.0
+            )
+        ),
+        "request_decode_engine_step_seconds_attributed": float(
+            response_metrics.get(
+                "vllm/request_decode_engine_step_seconds_attributed", 0.0
+            )
+        ),
+        "request_output_tokens": int(
+            response_metrics.get("vllm/request_output_tokens", 0)
+        ),
+        "request_decode_tokens": int(
+            response_metrics.get("vllm/request_decode_tokens", 0)
+        ),
+        "prefix_fingerprints": list(prefix_fingerprints or []),
     }
+    if boundary_resumed_at is not None:
+        if request_dispatched_at is not None:
+            record["dispatch_after_boundary_seconds"] = max(
+                0.0, float(request_dispatched_at) - float(boundary_resumed_at)
+            )
+            record["first_token_after_boundary_seconds"] = (
+                record["dispatch_after_boundary_seconds"]
+                + record["request_ttft_seconds"]
+            )
+        if request_completed_at is not None:
+            record["finish_after_boundary_seconds"] = max(
+                0.0, float(request_completed_at) - float(boundary_resumed_at)
+            )
+            if record["request_latency_seconds"] > 0:
+                record["first_token_after_boundary_seconds"] = max(
+                    record.get("dispatch_after_boundary_seconds", 0.0),
+                    record["finish_after_boundary_seconds"]
+                    - max(
+                        0.0,
+                        record["request_latency_seconds"]
+                        - record["request_ttft_seconds"],
+                    ),
+                )
     record["logical_reprefill_exposure_tokens"] = (
         record["reported_prefill_tokens"]
         if record["reported_prefill_tokens"] is not None
@@ -347,6 +517,143 @@ def build_boundary_recovery_record(
             else "logical_prompt_upper_bound"
         )
     )
+    return record
+
+
+def build_prefix_fingerprints(
+    prompt_tokens: Sequence[int],
+    depths: Sequence[int] = (128, 256, 512, 1024, 2048, 4096, 8192),
+    block_size: int = 16,
+) -> List[Dict[str, Any]]:
+    """Build compact cumulative hashes at block-aligned prompt depths."""
+    if block_size <= 0 or not prompt_tokens:
+        return []
+    prompt_length = len(prompt_tokens)
+    targets = {
+        min(prompt_length, max(0, int(depth))) // block_size * block_size
+        for depth in depths
+    }
+    targets.add(prompt_length // block_size * block_size)
+    targets.discard(0)
+    ordered_targets = sorted(targets)
+    if not ordered_targets:
+        return []
+
+    digest = hashlib.blake2b(digest_size=12)
+    fingerprints = []
+    target_index = 0
+    for index, token in enumerate(prompt_tokens[: ordered_targets[-1]], start=1):
+        digest.update(int(token).to_bytes(8, "little", signed=False))
+        if index == ordered_targets[target_index]:
+            fingerprints.append(
+                {
+                    "prefix_tokens": index,
+                    "fingerprint": digest.hexdigest(),
+                }
+            )
+            target_index += 1
+            if target_index == len(ordered_targets):
+                break
+    return fingerprints
+
+
+def build_refresh_request_record(
+    runtime_state: TrajectoryRuntimeState,
+    *,
+    cache_epoch: int,
+    boundary_version: Any,
+    worker_rank: int,
+    route_reason: str,
+    prompt_tokens: Sequence[int],
+    response_metrics: Dict[str, Any],
+    request_dispatched_at: float,
+    request_completed_at: float,
+    boundary_resumed_at: Optional[float],
+    first_epoch_request: bool,
+) -> Dict[str, Any]:
+    """Capture one policy request for refresh-aligned throughput analysis."""
+    boundary = (
+        runtime_state.current_version
+        if boundary_version is None
+        else int(boundary_version)
+    )
+    record = {
+        "trajectory_id": runtime_state.trajectory_id,
+        "policy_version": runtime_state.policy_version,
+        "boundary_version": boundary,
+        "version_age": max(0, boundary - runtime_state.policy_version),
+        "cache_epoch": int(cache_epoch),
+        "worker_rank": int(worker_rank),
+        "route_reason": str(route_reason),
+        "first_epoch_request": bool(first_epoch_request),
+        "survivor_request": runtime_state.policy_version < boundary,
+        "prompt_tokens": len(prompt_tokens),
+        "cached_prompt_tokens": int(
+            response_metrics.get("vllm/request_cached_prompt_tokens", 0)
+        ),
+        "prefill_tokens": int(
+            response_metrics.get(
+                "vllm/request_prefill_tokens", len(prompt_tokens)
+            )
+        ),
+        "decode_tokens": int(
+            response_metrics.get("vllm/request_decode_tokens", 0)
+        ),
+        "output_tokens": int(
+            response_metrics.get("vllm/request_output_tokens", 0)
+        ),
+        "request_queue_seconds": float(
+            response_metrics.get("vllm/request_queue_seconds", 0.0)
+        ),
+        "request_ttft_seconds": float(
+            response_metrics.get("vllm/request_ttft_seconds", 0.0)
+        ),
+        "request_prefill_seconds": float(
+            response_metrics.get("vllm/request_prefill_seconds", 0.0)
+        ),
+        "request_decode_seconds": float(
+            response_metrics.get("vllm/request_decode_seconds", 0.0)
+        ),
+        "request_engine_step_seconds_attributed": float(
+            response_metrics.get(
+                "vllm/request_engine_step_seconds_attributed", 0.0
+            )
+        ),
+        "request_prefill_engine_step_seconds_attributed": float(
+            response_metrics.get(
+                "vllm/request_prefill_engine_step_seconds_attributed", 0.0
+            )
+        ),
+        "request_decode_engine_step_seconds_attributed": float(
+            response_metrics.get(
+                "vllm/request_decode_engine_step_seconds_attributed", 0.0
+            )
+        ),
+        "engine_scheduler_batch_id": response_metrics.get(
+            "vllm/request_scheduler_batch_id"
+        ),
+        "engine_scheduler_batch_size": response_metrics.get(
+            "vllm/request_scheduler_batch_size"
+        ),
+        "request_dispatched_at_monotonic": float(request_dispatched_at),
+        "request_completed_at_monotonic": float(request_completed_at),
+        "prefix_fingerprints": (
+            build_prefix_fingerprints(prompt_tokens)
+            if first_epoch_request
+            else []
+        ),
+    }
+    if boundary_resumed_at is not None:
+        record["dispatch_after_boundary_seconds"] = max(
+            0.0, request_dispatched_at - boundary_resumed_at
+        )
+        record["finish_after_boundary_seconds"] = max(
+            0.0, request_completed_at - boundary_resumed_at
+        )
+        record["first_token_after_boundary_seconds"] = (
+            record["dispatch_after_boundary_seconds"]
+            + record["request_ttft_seconds"]
+        )
     return record
 
 
@@ -460,6 +767,112 @@ def select_prefix_locality_worker(
     ):
         return best_rank, "prefix_locality", best_cached
     return least_loaded, "prefix_load_override", 0
+
+
+def select_completion_eta_worker(
+    prompt_tokens,
+    worker_prompts,
+    active_dp_ranks,
+    worker_pressure,
+    worker_service_seconds,
+    token_seconds: float,
+    prefix_limit: int,
+    *,
+    affinity_rank=None,
+    affinity_cached_tokens: int = 0,
+    affinity_cache_valid: bool = False,
+    locality_slack_seconds: float = 0.0,
+):
+    """Choose the worker with the lowest estimated request completion time."""
+    candidates = list(active_dp_ranks)
+    if not candidates:
+        raise RuntimeError("No active DP ranks")
+    observed_services = [
+        float(worker_service_seconds.get(rank, 0.0))
+        for rank in candidates
+        if float(worker_service_seconds.get(rank, 0.0)) > 0
+    ]
+    fallback_service = (
+        sum(observed_services) / len(observed_services)
+        if observed_services
+        else 1.0
+    )
+
+    def cached_tokens(dp_rank):
+        cached = max(
+            (
+                common_prefix_tokens(prompt_tokens, previous, prefix_limit)
+                for previous in worker_prompts.get(dp_rank, [])
+            ),
+            default=0,
+        )
+        if affinity_cache_valid and dp_rank == affinity_rank:
+            cached = max(cached, max(0, int(affinity_cached_tokens)))
+        return min(len(prompt_tokens), cached)
+
+    estimates = {}
+    for dp_rank in candidates:
+        service_seconds = max(
+            1e-6,
+            float(worker_service_seconds.get(dp_rank, 0.0))
+            or fallback_service,
+        )
+        pressure = max(0, int(worker_pressure.get(dp_rank, 0)))
+        cached = cached_tokens(dp_rank)
+        prefill_tokens = max(0, len(prompt_tokens) - cached)
+        queue_eta = pressure * service_seconds
+        request_eta = max(
+            service_seconds,
+            prefill_tokens * max(0.0, float(token_seconds)),
+        )
+        estimates[dp_rank] = {
+            "eta_seconds": queue_eta + request_eta,
+            "queue_eta_seconds": queue_eta,
+            "prefill_tokens": prefill_tokens,
+            "cached_tokens": cached,
+        }
+
+    selected = min(
+        candidates,
+        key=lambda rank: (
+            estimates[rank]["eta_seconds"],
+            -estimates[rank]["cached_tokens"],
+            rank,
+        ),
+    )
+    if affinity_cache_valid and affinity_rank in estimates:
+        if (
+            estimates[affinity_rank]["eta_seconds"]
+            <= estimates[selected]["eta_seconds"]
+            + max(0.0, float(locality_slack_seconds))
+        ):
+            selected = affinity_rank
+
+    selected_estimate = estimates[selected]
+    if affinity_cache_valid and selected == affinity_rank:
+        reason = "completion_eta_affinity"
+    elif selected_estimate["cached_tokens"] > 0:
+        reason = "completion_eta_prefix"
+    else:
+        reason = "completion_eta_load"
+    return selected, reason, selected_estimate
+
+
+def completion_eta_observation(
+    predicted_seconds: float,
+    scheduling_wait_seconds: float,
+    request_service_seconds: float,
+):
+    """Return observed end-to-end request latency and its ETA error."""
+    actual_seconds = max(0.0, float(scheduling_wait_seconds)) + max(
+        0.0, float(request_service_seconds)
+    )
+    predicted = max(0.0, float(predicted_seconds))
+    absolute_error = (
+        abs(actual_seconds - predicted) if predicted > 0 else 0.0
+    )
+    return actual_seconds, absolute_error
+
 
 def _create_sampling_params_for_sglang(gen_kwargs: dict):
     return dict(
@@ -629,7 +1042,10 @@ class RouterManager:
 
     def collect_runtime_feedback(self):
         collector = getattr(self.router, "collect_runtime_feedback", None)
-        return collector() if collector is not None else {}
+        feedback = collector() if collector is not None else {}
+        feedback = dict(feedback or {})
+        feedback["request_metrics"] = dict(self.request_metric_lifetime_totals)
+        return feedback
 
     async def abort_requests(self, request_ids, uid):
         return await self.router.abort_requests(request_ids, uid)
@@ -1107,6 +1523,10 @@ class RouterClient:
         # Merge metrics from response (e.g., speculative decoding metrics)
         if "metrics" in response:
             output_data.meta_info.setdefault("metrics", {}).update(response["metrics"])
+        if "runtime_attribution" in response:
+            output_data.meta_info["runtime_attribution"] = dict(
+                response["runtime_attribution"]
+            )
 
         return output_data
 
@@ -1472,7 +1892,11 @@ class EnvAffinityRouter(Router):
         self.priority_inflight = [0 for _ in self.workers]
         self.priority_conditions = [asyncio.Condition() for _ in self.workers]
         self.priority_candidate_ranks: Dict[str, int] = {}
+        self.priority_candidate_estimates: Dict[str, Dict[str, Any]] = {}
         config = getattr(self.router_args, "router_config", None) or {}
+        self.engine_priority_scheduling_enabled = bool(
+            config.get("engine_priority_scheduling_enabled", False)
+        )
         self.priority_max_running_requests = int(
             config.get("priority_max_running_requests", self.max_running_requests)
         )
@@ -1523,7 +1947,33 @@ class EnvAffinityRouter(Router):
         self.working_set_max_prompts_per_worker = int(
             config.get("working_set_max_prompts_per_worker", 64)
         )
+        self.completion_eta_routing_enabled = bool(
+            config.get("completion_eta_routing_enabled", False)
+        )
+        self.completion_eta_ewma_alpha = min(
+            1.0,
+            max(0.0, float(config.get("completion_eta_ewma_alpha", 0.2))),
+        )
+        self.completion_eta_locality_slack_seconds = max(
+            0.0,
+            float(
+                config.get(
+                    "completion_eta_locality_slack_seconds", 0.05
+                )
+            ),
+        )
+        self.worker_service_seconds_ewma: List[Optional[float]] = [
+            None for _ in self.workers
+        ]
+        self.model_token_seconds_ewma: Optional[float] = None
+        self.refresh_profile_enabled = bool(
+            config.get("refresh_profile_enabled", False)
+        )
+        self.refresh_profile_max_records = max(
+            1, int(config.get("refresh_profile_max_records", 20000))
+        )
         self.rebuild_epoch = None
+        self.boundary_resumed_at: Dict[int, float] = {}
         self.rebuild_remaining = 0
         self.rebuild_target = 0
         self.rebuild_observe_remaining = 0
@@ -1539,6 +1989,7 @@ class EnvAffinityRouter(Router):
         self.working_set_worker_prompts = defaultdict(list)
         self.runtime_plan = {}
         self.boundary_recovery_records: List[Dict[str, Any]] = []
+        self.refresh_request_records: List[Dict[str, Any]] = []
         self.latest_trajectory_progress: Dict[str, Dict[str, Any]] = {}
         self.worker_engine_kv_feedback = [
             {
@@ -1559,6 +2010,7 @@ class EnvAffinityRouter(Router):
         self._cancel_pending_rebuild_wave()
         self.cache_epoch += 1
         self.rebuild_epoch = epoch
+        self.boundary_resumed_at[self.cache_epoch] = time.monotonic()
         self.runtime_plan = plan
         priority_candidates = (
             plan.get("priority_candidate_groups", [])
@@ -1568,6 +2020,11 @@ class EnvAffinityRouter(Router):
         self.priority_candidate_ranks = {
             str(group_key): rank
             for rank, group_key in enumerate(priority_candidates)
+        }
+        self.priority_candidate_estimates = {
+            str(estimate.get("group_key")): dict(estimate)
+            for estimate in plan.get("priority_candidate_estimates", [])
+            if estimate.get("group_key") is not None
         }
         self.rebuild_candidate_groups = set(plan.get("rebuild_candidate_groups", []))
         self.rebuild_candidate_trajectories = set(
@@ -1725,6 +2182,11 @@ class EnvAffinityRouter(Router):
             str(group_key): rank
             for rank, group_key in enumerate(priority_candidates)
         }
+        self.priority_candidate_estimates = {
+            str(estimate.get("group_key")): dict(estimate)
+            for estimate in revised.get("priority_candidate_estimates", [])
+            if estimate.get("group_key") is not None
+        }
         self.rebuild_candidate_groups = set(
             str(group_key)
             for group_key in revised.get("rebuild_candidate_groups", [])
@@ -1793,9 +2255,55 @@ class EnvAffinityRouter(Router):
                 self.src_rank_last_prompt_tokens.pop(key, None)
         return True, resets, invalidated
 
+    def _completion_eta_model_ready(self) -> bool:
+        return any(
+            value is not None and value > 0
+            for value in self.worker_service_seconds_ewma
+        )
+
+    def _update_completion_eta_model(
+        self,
+        dp_rank: int,
+        service_seconds: float,
+        prompt_tokens: int,
+        response,
+    ) -> None:
+        if service_seconds <= 0:
+            return
+        alpha = self.completion_eta_ewma_alpha
+        previous = self.worker_service_seconds_ewma[dp_rank]
+        self.worker_service_seconds_ewma[dp_rank] = (
+            service_seconds
+            if previous is None
+            else alpha * service_seconds + (1 - alpha) * previous
+        )
+        response_metrics = response.get("metrics", {})
+        prefill_tokens = response_metrics.get("vllm/request_prefill_tokens")
+        if prefill_tokens is None:
+            cached = response_metrics.get("vllm/request_cached_prompt_tokens")
+            prefill_tokens = max(
+                0, int(prompt_tokens) - max(0, int(cached or 0))
+            )
+        output_tokens = sum(
+            len(tokens) for tokens in response.get("output_token_ids", [])
+        )
+        model_tokens = max(0, int(prefill_tokens)) + max(0, output_tokens)
+        if model_tokens <= 0:
+            return
+        sample = service_seconds / model_tokens
+        self.model_token_seconds_ewma = (
+            sample
+            if self.model_token_seconds_ewma is None
+            else alpha * sample
+            + (1 - alpha) * self.model_token_seconds_ewma
+        )
+
     async def generate_request(self, payload, request_id, uid, priority=None):
         src_rank = uid
         runtime_state = TrajectoryRuntimeState.from_priority(priority, src_rank)
+        track_trajectory = not isinstance(priority, dict) or bool(
+            priority.get("track_trajectory", True)
+        )
         scheduling_enabled = not isinstance(priority, dict) or bool(
             priority.get("scheduling_enabled", True)
         )
@@ -1821,18 +2329,28 @@ class EnvAffinityRouter(Router):
         priority_candidate = (
             runtime_state.group_key in self.priority_candidate_ranks
         )
+        priority_estimate = self.priority_candidate_estimates.get(
+            runtime_state.group_key, {}
+        )
         route_reason = "least_loaded"
         affinity_candidate = False
         affinity_cache_valid = False
         estimated_cached_tokens = 0
         selected_pressure = 0
-        first_epoch_request, rebuild_assignment = (
-            await self._prepare_first_epoch_request(
-                runtime_state,
-                epoch_trajectory_id,
-                prompt_tokens,
+        predicted_completion_eta_seconds = 0.0
+        predicted_queue_eta_seconds = 0.0
+        predicted_prefill_tokens = 0
+        completion_eta_model_ready = False
+        if track_trajectory:
+            first_epoch_request, rebuild_assignment = (
+                await self._prepare_first_epoch_request(
+                    runtime_state,
+                    epoch_trajectory_id,
+                    prompt_tokens,
+                )
             )
-        )
+        else:
+            first_epoch_request, rebuild_assignment = False, None
         rebuild_wave_size = 0
         # Atomic routing assignment under lock to prevent TOCTOU race with shrink/expand
         async with self.routing_lock:
@@ -1843,6 +2361,10 @@ class EnvAffinityRouter(Router):
                 and self.src_rank_cache_epoch.get(routing_key) == self.cache_epoch
             )
             worker_pressure = self._worker_pressure()
+            completion_eta_model_ready = (
+                self.completion_eta_routing_enabled
+                and self._completion_eta_model_ready()
+            )
             if affinity_cache_valid:
                 estimated_cached_tokens = min(
                     len(prompt_tokens),
@@ -1856,6 +2378,39 @@ class EnvAffinityRouter(Router):
                     )
                     rebuild_request = True
                     route_reason = "rebuild"
+                elif completion_eta_model_ready:
+                    dp_rank, route_reason, eta_estimate = (
+                        select_completion_eta_worker(
+                            prompt_tokens,
+                            self.working_set_worker_prompts,
+                            self.active_dp_ranks,
+                            worker_pressure,
+                            {
+                                rank: (
+                                    self.worker_service_seconds_ewma[rank]
+                                    or 0.0
+                                )
+                                for rank in self.active_dp_ranks
+                            },
+                            self.model_token_seconds_ewma or 0.0,
+                            self.post_update_rebuild_prefix_tokens,
+                            locality_slack_seconds=(
+                                self.completion_eta_locality_slack_seconds
+                            ),
+                        )
+                    )
+                    estimated_cached_tokens = int(
+                        eta_estimate["cached_tokens"]
+                    )
+                    predicted_completion_eta_seconds = float(
+                        eta_estimate["eta_seconds"]
+                    )
+                    predicted_queue_eta_seconds = float(
+                        eta_estimate["queue_eta_seconds"]
+                    )
+                    predicted_prefill_tokens = int(
+                        eta_estimate["prefill_tokens"]
+                    )
                 elif self.working_set_routing_enabled and len(prompt_tokens) > 0:
                     dp_rank, route_reason, estimated_cached_tokens = (
                         select_prefix_locality_worker(
@@ -1876,6 +2431,45 @@ class EnvAffinityRouter(Router):
                         self.soft_locality_load_slack,
                     )
                 self.src_rank2_dp_rank[routing_key] = dp_rank
+            elif completion_eta_model_ready:
+                dp_rank, route_reason, eta_estimate = (
+                    select_completion_eta_worker(
+                        prompt_tokens,
+                        self.working_set_worker_prompts,
+                        self.active_dp_ranks,
+                        worker_pressure,
+                        {
+                            rank: (
+                                self.worker_service_seconds_ewma[rank] or 0.0
+                            )
+                            for rank in self.active_dp_ranks
+                        },
+                        self.model_token_seconds_ewma or 0.0,
+                        self.post_update_rebuild_prefix_tokens,
+                        affinity_rank=affinity_rank,
+                        affinity_cached_tokens=estimated_cached_tokens,
+                        affinity_cache_valid=affinity_cache_valid,
+                        locality_slack_seconds=(
+                            self.completion_eta_locality_slack_seconds
+                        ),
+                    )
+                )
+                estimated_cached_tokens = int(
+                    eta_estimate["cached_tokens"]
+                )
+                predicted_completion_eta_seconds = float(
+                    eta_estimate["eta_seconds"]
+                )
+                predicted_queue_eta_seconds = float(
+                    eta_estimate["queue_eta_seconds"]
+                )
+                predicted_prefill_tokens = int(
+                    eta_estimate["prefill_tokens"]
+                )
+                if dp_rank != affinity_rank:
+                    self.src_rank2_dp_rank[routing_key] = dp_rank
+                    self.src_rank_cache_epoch.pop(routing_key, None)
+                    self.src_rank_last_prompt_tokens.pop(routing_key, None)
             elif self.soft_locality_enabled:
                 dp_rank, route_reason = select_soft_locality_worker(
                     affinity_rank,
@@ -1920,14 +2514,87 @@ class EnvAffinityRouter(Router):
         self.running_requests[dp_rank].add(request_id)
 
         try:
+            engine_request_priority = None
             worker_payload = payload
-            if rebuild_request:
+            if rebuild_request or (
+                self.engine_priority_scheduling_enabled and scheduling_enabled
+            ):
                 worker_payload = dict(payload)
+            if self.engine_priority_scheduling_enabled and scheduling_enabled:
+                engine_request_priority = build_engine_request_priority(
+                    runtime_state, self.priority_candidate_ranks
+                )
+                worker_payload["_roll_request_priority"] = engine_request_priority
+            if rebuild_request:
                 worker_payload["_roll_prefill_rebuild"] = True
+            request_cache_epoch = self.cache_epoch
+            request_boundary_version = self.rebuild_epoch
+            request_boundary_resumed_at = self.boundary_resumed_at.get(
+                request_cache_epoch
+            )
+            request_dispatched_at = time.monotonic()
             response = await self.workers[dp_rank].generate_request.remote(
                 worker_payload
             )
+            request_completed_at = time.monotonic()
+            request_service_seconds = max(
+                0.0, request_completed_at - request_dispatched_at
+            )
+            (
+                actual_completion_seconds,
+                completion_eta_absolute_error_seconds,
+            ) = completion_eta_observation(
+                predicted_completion_eta_seconds,
+                scheduling_wait_seconds,
+                request_service_seconds,
+            )
+            self._update_completion_eta_model(
+                dp_rank,
+                request_service_seconds,
+                len(prompt_tokens),
+                response,
+            )
             response_metrics = response.setdefault("metrics", {})
+            actual_prefill_tokens = response_metrics.get(
+                "vllm/request_prefill_tokens"
+            )
+            if actual_prefill_tokens is None:
+                actual_prefill_tokens = max(
+                    0,
+                    len(prompt_tokens)
+                    - max(
+                        0,
+                        int(
+                            response_metrics.get(
+                                "vllm/request_cached_prompt_tokens", 0
+                            )
+                        ),
+                    ),
+                )
+            refresh_request_record = None
+            if self.refresh_profile_enabled and track_trajectory:
+                refresh_request_record = build_refresh_request_record(
+                    runtime_state,
+                    cache_epoch=request_cache_epoch,
+                    boundary_version=request_boundary_version,
+                    worker_rank=dp_rank,
+                    route_reason=route_reason,
+                    prompt_tokens=prompt_tokens,
+                    response_metrics=response_metrics,
+                    request_dispatched_at=request_dispatched_at,
+                    request_completed_at=request_completed_at,
+                    boundary_resumed_at=request_boundary_resumed_at,
+                    first_epoch_request=first_epoch_request,
+                )
+                self.refresh_request_records.append(refresh_request_record)
+                if (
+                    len(self.refresh_request_records)
+                    > self.refresh_profile_max_records
+                ):
+                    del self.refresh_request_records[
+                        : len(self.refresh_request_records)
+                        - self.refresh_profile_max_records
+                    ]
             (
                 engine_feedback_observed,
                 engine_resets_observed,
@@ -1935,17 +2602,31 @@ class EnvAffinityRouter(Router):
             ) = self._apply_engine_kv_feedback(dp_rank, response_metrics)
             if first_epoch_request and is_post_boundary_request(
                 runtime_state,
-                self.rebuild_epoch,
+                request_boundary_version,
             ):
                 self.boundary_recovery_records.append(
                     build_boundary_recovery_record(
                         runtime_state,
-                        cache_epoch=self.cache_epoch,
-                        boundary_version=self.rebuild_epoch,
+                        cache_epoch=request_cache_epoch,
+                        boundary_version=request_boundary_version,
                         worker_rank=dp_rank,
                         route_reason=route_reason,
                         prompt_tokens=len(prompt_tokens),
                         response_metrics=response_metrics,
+                        boundary_resumed_at=request_boundary_resumed_at,
+                        request_dispatched_at=request_dispatched_at,
+                        request_completed_at=request_completed_at,
+                        prefix_fingerprints=(
+                            refresh_request_record.get(
+                                "prefix_fingerprints", []
+                            )
+                            if refresh_request_record is not None
+                            else (
+                                build_prefix_fingerprints(prompt_tokens)
+                                if self.refresh_profile_enabled
+                                else []
+                            )
+                        ),
                     )
                 )
             finish_reasons = response.get("finish_reasons", [])
@@ -1984,6 +2665,18 @@ class EnvAffinityRouter(Router):
                 "router/planned_priority_candidate_request": int(
                     priority_candidate
                 ),
+                "router/planned_completion_probability": float(
+                    priority_estimate.get("completion_probability", 0.0)
+                ),
+                "router/planned_completion_eta_seconds": float(
+                    priority_estimate.get("eta_seconds", 0.0)
+                ),
+                "router/planned_completion_laxity_seconds": float(
+                    priority_estimate.get("laxity_seconds", 0.0)
+                ),
+                "router/planned_completion_feasible": int(
+                    bool(priority_estimate.get("feasible", False))
+                ),
                 "router/version_runtime_plan_request": int(bool(self.runtime_plan)),
                 "router/priority_queued_requests": int(priority_was_queued),
                 "router/priority_coalesced_requests": int(
@@ -1994,17 +2687,56 @@ class EnvAffinityRouter(Router):
                 ),
                 "router/priority_queue_depth": priority_queue_depth,
                 "router/priority_slot_capacity": (
-                    self.priority_rebuild_max_running_requests
-                    if rebuild_request
-                    else self.priority_max_running_requests
+                    0
+                    if self.engine_priority_scheduling_enabled
+                    else (
+                        self.priority_rebuild_max_running_requests
+                        if rebuild_request
+                        else self.priority_max_running_requests
+                    )
                 ),
+                "router/engine_priority_scheduling_enabled": int(
+                    self.engine_priority_scheduling_enabled
+                ),
+                "router/engine_priority_request": int(
+                    engine_request_priority is not None
+                ),
+                "router/engine_request_priority": float(
+                    engine_request_priority or 0
+                ),
+                "router/router_priority_gate_used": int(has_priority_slot),
                 "router/rebuild_burst_request": int(
                     rebuild_request
+                    and not self.engine_priority_scheduling_enabled
                     and self.priority_rebuild_max_running_requests
                     > self.priority_max_running_requests
                 ),
                 "router/selected_worker_pressure": selected_pressure,
                 "router/soft_locality_estimated_cached_tokens": estimated_cached_tokens,
+                "router/completion_eta_model_ready": int(
+                    completion_eta_model_ready
+                ),
+                "router/predicted_completion_eta_seconds": (
+                    predicted_completion_eta_seconds
+                ),
+                "router/predicted_queue_eta_seconds": (
+                    predicted_queue_eta_seconds
+                ),
+                "router/predicted_prefill_tokens": predicted_prefill_tokens,
+                "router/actual_prefill_tokens": actual_prefill_tokens,
+                "router/prefill_prediction_absolute_error_tokens": (
+                    abs(actual_prefill_tokens - predicted_prefill_tokens)
+                    if completion_eta_model_ready
+                    else 0
+                ),
+                "router/request_service_seconds": request_service_seconds,
+                "router/actual_completion_seconds": actual_completion_seconds,
+                "router/completion_eta_absolute_error_seconds": (
+                    completion_eta_absolute_error_seconds
+                ),
+                "router/completion_eta_selected": int(
+                    route_reason.startswith("completion_eta_")
+                ),
                 "router/engine_kv_feedback_requests": int(
                     engine_feedback_observed
                 ),
@@ -2013,6 +2745,19 @@ class EnvAffinityRouter(Router):
                     engine_shadow_invalidations
                 ),
             })
+            response["runtime_attribution"] = {
+                "plan_id": str(self.runtime_plan.get("plan_id", "")),
+                "forecast_id": str(
+                    self.runtime_plan.get("forecast_id", "")
+                ),
+                "version": self.runtime_plan.get("version"),
+                "revision": int(self.runtime_plan.get("revision", 0)),
+                "estimator_revision": int(
+                    self.runtime_plan.get("estimator_revision", 0)
+                ),
+                "group_key": runtime_state.group_key,
+                "trajectory_id": runtime_state.trajectory_id,
+            }
             if rebuild_request:
                 response_metrics.update({
                     "router/post_update_rebuild_request": 1,
@@ -2033,6 +2778,7 @@ class EnvAffinityRouter(Router):
 
     def collect_version_boundary_profile(self):
         records = list(self.boundary_recovery_records)
+        request_records = list(self.refresh_request_records)
         engine_batches = defaultdict(int)
         for record in records:
             batch_id = record.get("engine_scheduler_batch_id")
@@ -2076,8 +2822,80 @@ class EnvAffinityRouter(Router):
                     ),
                     default=0,
                 ),
+                "request_queue_seconds": sum(
+                    float(record.get("request_queue_seconds", 0.0))
+                    for record in records
+                ),
+                "request_ttft_seconds": sum(
+                    float(record.get("request_ttft_seconds", 0.0))
+                    for record in records
+                ),
+                "request_prefill_seconds": sum(
+                    float(record.get("request_prefill_seconds", 0.0))
+                    for record in records
+                ),
+                "request_decode_seconds": sum(
+                    float(record.get("request_decode_seconds", 0.0))
+                    for record in records
+                ),
+                "request_inference_seconds": sum(
+                    float(record.get("request_inference_seconds", 0.0))
+                    for record in records
+                ),
+                "request_model_forward_seconds": sum(
+                    float(record.get("request_model_forward_seconds", 0.0))
+                    for record in records
+                ),
+                "request_model_execute_seconds": sum(
+                    float(record.get("request_model_execute_seconds", 0.0))
+                    for record in records
+                ),
+                "request_engine_step_seconds_attributed": sum(
+                    float(
+                        record.get(
+                            "request_engine_step_seconds_attributed", 0.0
+                        )
+                    )
+                    for record in records
+                ),
+                "request_prefill_engine_step_seconds_attributed": sum(
+                    float(
+                        record.get(
+                            "request_prefill_engine_step_seconds_attributed",
+                            0.0,
+                        )
+                    )
+                    for record in records
+                ),
+                "request_decode_engine_step_seconds_attributed": sum(
+                    float(
+                        record.get(
+                            "request_decode_engine_step_seconds_attributed",
+                            0.0,
+                        )
+                    )
+                    for record in records
+                ),
+                "recovery_finish_seconds_max": max(
+                    (
+                        float(record.get("finish_after_boundary_seconds", 0.0))
+                        for record in records
+                    ),
+                    default=0.0,
+                ),
+                "refresh_profile_requests": len(request_records),
+                "refresh_profile_decode_tokens": sum(
+                    int(record.get("decode_tokens", 0))
+                    for record in request_records
+                ),
+                "refresh_profile_prefill_tokens": sum(
+                    int(record.get("prefill_tokens", 0))
+                    for record in request_records
+                ),
             },
             "records": records,
+            "request_records": request_records,
+            "refresh_profile_enabled": self.refresh_profile_enabled,
         }
 
     def collect_trajectory_progress(self):
@@ -2104,7 +2922,8 @@ class EnvAffinityRouter(Router):
         max_running_requests: Optional[int] = None,
     ):
         if (
-            priority is None
+            self.engine_priority_scheduling_enabled
+            or priority is None
             or self.priority_max_running_requests <= 0
             or (
                 isinstance(priority, dict)

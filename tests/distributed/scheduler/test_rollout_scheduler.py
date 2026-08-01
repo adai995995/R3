@@ -19,12 +19,20 @@ from roll.distributed.scheduler.rollout_scheduler import (
     GroupQueue,
     RolloutScheduler,
     GroupQueueManager,
+    RuntimeEstimator,
+    RuntimeCandidateEstimate,
+    PolicyUpdateTrace,
+    VersionRuntimeOutcome,
+    compute_closed_loop_reserve,
+    compute_state_feedback_reserve,
+    runtime_finish_rate_bucket,
     compute_dynamic_reserve,
     update_utility_hill_climb,
     update_constrained_utility_hill_climb,
     update_bucketed_finish_ratios,
     predict_bucketed_finish_supply,
     build_version_runtime_plan,
+    build_learner_wait_record,
     summarize_version_boundary_records,
     summarize_rollout_goodput,
 )
@@ -39,16 +47,31 @@ def test_rollout_goodput_separates_raw_trainable_and_stale_tokens():
                 "discard_reason": "version_stale_at_consume",
                 "response_tokens": 10,
                 "inference_tokens": 50,
+                "model_execute_seconds": 2,
+                "engine_step_seconds_attributed": 1.5,
             }
         ],
-        [{"completed": False, "response_tokens": 5, "inference_tokens": 25}],
+        [
+            {
+                "completed": False,
+                "response_tokens": 5,
+                "inference_tokens": 25,
+                "model_execute_seconds": 1,
+                "engine_step_seconds_attributed": 0.5,
+            }
+        ],
         elapsed_seconds=5,
         learner_wait_seconds=1,
+        admitted_trajectories=5,
     )
 
     assert metrics["rollout/raw_response_tokens_per_second"] == 7
     assert metrics["rollout/trainable_response_tokens_per_second"] == 4
     assert metrics["rollout/stale_logical_token_fraction"] == 50 / 175
+    assert metrics["rollout/stale_trajectory_fraction"] == 1 / 5
+    assert metrics["rollout/stale_trajectory_fraction_of_recorded"] == 1 / 3
+    assert metrics["rollout/stale_model_execute_fraction"] == 2 / 3
+    assert metrics["rollout/stale_engine_step_fraction"] == 3 / 4
     assert metrics["learner/wait_fraction"] == 0.2
 
 
@@ -82,6 +105,82 @@ def test_rollout_goodput_excludes_consumed_placeholders_from_trainable_work():
     assert metrics["rollout/trainable_logical_inference_tokens"] == 100
 
 
+def test_learner_wait_record_attributes_stale_work_to_the_batch_step():
+    record = build_learner_wait_record(
+        step=7,
+        wait_seconds=2.5,
+        batch_size=4,
+        consumed_records=[
+            {
+                "consumed_at_step": 7,
+                "version_age": 1,
+                "trainable_valid": True,
+            },
+            {
+                "consumed_at_step": 6,
+                "version_age": 0,
+                "trainable_valid": True,
+            },
+        ],
+        discard_records=[
+            {
+                "discarded_at_step": 7,
+                "discard_reason": "version_stale_at_consume",
+                "actions_completed": 8,
+                "response_tokens": 320,
+                "tool_calls": 5,
+                "tool_wall_seconds": 0.4,
+                "engine_step_seconds_attributed": 1.25,
+            },
+            {
+                "discarded_at_step": 6,
+                "discard_reason": "version_stale_at_consume",
+                "actions_completed": 100,
+            },
+            {
+                "discarded_at_step": 7,
+                "discard_reason": "redundancy_trim",
+                "actions_completed": 100,
+            },
+        ],
+        recorded_at_unix=123.0,
+    )
+
+    assert record == {
+        "step": 7,
+        "batch_size": 4,
+        "wait_seconds": 2.5,
+        "consumed_trajectories": 1,
+        "valid_trajectories": 1,
+        "valid_version_age_mean": 1.0,
+        "valid_version_age_max": 1,
+        "stale_discarded_trajectories": 1,
+        "stale_discarded_actions": 8,
+        "stale_discarded_output_tokens": 320,
+        "stale_discarded_tool_calls": 5,
+        "stale_discarded_tool_wall_seconds": 0.4,
+        "stale_discarded_engine_step_seconds_attributed": 1.25,
+        "consumed_queue_seconds": 0.0,
+        "consumed_queue_mean_seconds": 0.0,
+        "consumed_queue_p95_seconds": 0.0,
+        "consumed_queue_max_seconds": 0.0,
+        "consumed_tool_seconds": 0.0,
+        "consumed_tool_mean_seconds": 0.0,
+        "consumed_tool_p95_seconds": 0.0,
+        "consumed_tool_max_seconds": 0.0,
+        "consumed_generate_seconds": 0.0,
+        "consumed_generate_mean_seconds": 0.0,
+        "consumed_generate_p95_seconds": 0.0,
+        "consumed_generate_max_seconds": 0.0,
+        "batch_closing_trajectory_id": "",
+        "batch_closing_completion_unix": 0.0,
+        "batch_closing_queue_seconds": 0.0,
+        "batch_closing_tool_seconds": 0.0,
+        "batch_closing_generate_seconds": 0.0,
+        "recorded_at_unix": 123.0,
+    }
+
+
 def test_reset_only_stale_count_does_not_enter_token_waste_signal():
     token_fraction, trajectory_fraction = compute_stale_control_signal(
         stale_tokens=0,
@@ -92,6 +191,43 @@ def test_reset_only_stale_count_does_not_enter_token_waste_signal():
 
     assert token_fraction is None
     assert trajectory_fraction == 1.0
+
+
+def test_learner_wait_record_identifies_batch_closing_trajectory():
+    record = build_learner_wait_record(
+        step=3,
+        wait_seconds=4.0,
+        batch_size=2,
+        consumed_records=[
+            {
+                "consumed_at_step": 3,
+                "trainable_valid": True,
+                "trajectory_id": "early",
+                "trajectory_completed_at_unix": 10.0,
+                "request_queue_seconds": 1.0,
+                "tool_wall_seconds": 2.0,
+                "generate_seconds": 3.0,
+            },
+            {
+                "consumed_at_step": 3,
+                "trainable_valid": True,
+                "trajectory_id": "closer",
+                "trajectory_completed_at_unix": 20.0,
+                "request_queue_seconds": 4.0,
+                "tool_wall_seconds": 5.0,
+                "generate_seconds": 6.0,
+            },
+        ],
+        discard_records=[],
+    )
+
+    assert record["consumed_queue_seconds"] == 5.0
+    assert record["consumed_queue_mean_seconds"] == 2.5
+    assert record["consumed_queue_p95_seconds"] == 4.0
+    assert record["batch_closing_trajectory_id"] == "closer"
+    assert record["batch_closing_queue_seconds"] == 4.0
+    assert record["batch_closing_tool_seconds"] == 5.0
+    assert record["batch_closing_generate_seconds"] == 6.0
 from roll.distributed.executor.worker import Worker
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.agentic_pipeline import GroupFilter
@@ -187,6 +323,219 @@ def test_version_runtime_plan_unifies_admission_deadline_and_rebuild_cohort():
     assert plan.rebuild_target_trajectories == 4
     assert plan.revision == 0
     assert plan.admission_delta_trajectories == 4
+    assert plan.plan_id == "version-7-revision-0"
+    assert plan.forecast_id == "version-7-estimator-0"
+
+
+def test_version_runtime_plan_uses_shared_completion_estimates_for_priority():
+    plan = build_version_runtime_plan(
+        version=4,
+        learner_demand=2,
+        safety_reserve=0,
+        expected_existing_supply=0,
+        outstanding_trajectories=2,
+        max_outstanding_trajectories=4,
+        admission_width=1,
+        group_size=1,
+        staleness_tolerance=2,
+        invested_candidate_groups=[
+            (1, 1, 2, 8, 1),
+            (1, 2, 1, 3, 1),
+            (1, 3, 2, 9, 1),
+        ],
+        candidate_estimates=[
+            RuntimeCandidateEstimate(
+                "1:1", 0.9, 2.0, 1.0, True, 2, 8, 1
+            ),
+            RuntimeCandidateEstimate(
+                "1:2", 0.8, 1.0, 4.0, True, 1, 3, 1
+            ),
+            RuntimeCandidateEstimate(
+                "1:3", 0.1, 20.0, -10.0, False, 2, 9, 1
+            ),
+        ],
+    )
+
+    assert plan.priority_candidate_groups == ("1:1", "1:2", "1:3")
+    assert [
+        estimate.group_key
+        for estimate in plan.priority_candidate_estimates
+    ] == ["1:1", "1:2", "1:3"]
+
+
+def test_runtime_estimator_attributes_forecast_and_updates_from_outcome():
+    estimator = RuntimeEstimator(
+        initial_finish_ratio=0.5,
+        ewma_alpha=0.5,
+        bucketed_finish_enabled=True,
+        bucket_min_samples=1,
+    )
+    forecast = estimator.build_forecast(
+        3,
+        ready_valid_slots=2,
+        salvageable_inflight=4,
+        unfinished_bucket_counts={"age_1__actions_2_3": 4},
+    )
+
+    assert forecast.expected_existing_supply == 4
+    assert forecast.forecast_id == "version-3-estimator-0"
+
+    estimator.observe_supply(
+        salvageable_inflight=4,
+        completed_inflight=3,
+        cohort_counts={"age_1__actions_2_3": 4},
+        completed_counts={"age_1__actions_2_3": 3},
+        prediction_error=-1.0,
+    )
+    next_forecast = estimator.build_forecast(
+        4,
+        ready_valid_slots=0,
+        salvageable_inflight=4,
+        unfinished_bucket_counts={"age_1__actions_2_3": 4},
+    )
+
+    assert estimator.revision == 1
+    assert next_forecast.predicted_inflight_slots == 3
+    assert estimator.supply_error_ewma == -1
+    assert estimator.supply_abs_error_ewma == 1
+
+
+def test_runtime_estimator_uses_readiness_bucket_with_coarse_fallback():
+    estimator = RuntimeEstimator(
+        initial_finish_ratio=0.25,
+        ewma_alpha=1.0,
+        bucketed_finish_enabled=True,
+        bucket_min_samples=2,
+    )
+    ready_bucket = runtime_finish_rate_bucket(
+        1, 3, {"inference_ready": 2, "tool_waiting": 0}
+    )
+    tool_bucket = runtime_finish_rate_bucket(
+        1, 3, {"inference_ready": 0, "tool_waiting": 2}
+    )
+    estimator.observe_supply(
+        salvageable_inflight=2,
+        completed_inflight=2,
+        cohort_counts={ready_bucket: 2},
+        completed_counts={ready_bucket: 2},
+    )
+
+    predicted, learned, fallback, by_bucket = (
+        estimator.predict_unfinished_supply(
+            salvageable_inflight=2,
+            unfinished_bucket_counts={tool_bucket: 2},
+        )
+    )
+
+    assert predicted == 2
+    assert learned == 2
+    assert fallback == 0
+    assert by_bucket[tool_bucket] == 2
+
+
+def test_runtime_estimator_adds_cross_version_reprefill_cost_to_eta():
+    estimator = RuntimeEstimator(
+        initial_finish_ratio=0.5,
+        ewma_alpha=1.0,
+        bucketed_finish_enabled=False,
+        bucket_min_samples=1,
+    )
+    estimator.observe_policy_interval(10.0)
+    estimator.observe_completed_records(
+        [
+            {
+                "completed": True,
+                "group_id": 1,
+                "episode_id": 2,
+                "env_id": 3,
+                "version_start": 0,
+                "inference_calls": 2,
+                "actions_completed": 2,
+                "generate_seconds": 2.0,
+                "engine_prefill_tokens": 100,
+                "request_prefill_seconds": 2.0,
+            }
+        ]
+    )
+
+    estimate = estimator.estimate_candidate(
+        group_key="1:2",
+        version_age=1,
+        staleness_tolerance=2,
+        progress_actions=2,
+        invested_trajectories=1,
+        finish_bucket="age_1__actions_2_3",
+        runtime_summary={
+            "frontier_remaining_actions": 2,
+            "mean_context_tokens": 50,
+            "inference_ready": 1,
+            "tool_waiting": 0,
+        },
+    )
+
+    assert estimate.eta_seconds == 3.0
+    assert estimate.feasible is True
+
+
+def test_version_runtime_outcome_exposes_signed_forecast_residual():
+    outcome = VersionRuntimeOutcome(
+        plan_id="version-2-revision-1",
+        forecast_id="version-2-estimator-1",
+        version=2,
+        final_revision=1,
+        predicted_existing_supply=6.5,
+        actual_existing_valid_slots=4,
+        admitted_trajectories=2,
+        completed_valid_slots=4,
+        consumed_valid_slots=4,
+        learner_wait_seconds=3.0,
+        next_batch_latency_seconds=3.0,
+        reprefill_tokens=800,
+        prefill_tokens=1200,
+        prefill_seconds=0.75,
+        scheduling_wait_seconds=0.25,
+        scheduling_requests=4,
+        scheduling_wait_mean_seconds=0.0625,
+    )
+
+    assert outcome.supply_prediction_error == -2.5
+    assert outcome.to_dict()["supply_prediction_error"] == -2.5
+    assert outcome.to_dict()["reprefill_tokens"] == 800
+    assert outcome.to_dict()["scheduling_wait_mean_seconds"] == 0.0625
+
+
+def test_policy_update_trace_checks_activation_to_activation_decomposition():
+    trace = PolicyUpdateTrace(
+        version=4,
+        batch_wait_seconds=2.0,
+        learner_compute_seconds=5.0,
+        publish_activate_seconds=1.0,
+        other_seconds=0.5,
+        update_interval_seconds=8.5,
+        finalized=True,
+    )
+
+    assert trace.decomposition_error_seconds == 0.0
+    assert trace.to_dict()["decomposition_error_seconds"] == 0.0
+
+
+def test_record_policy_update_timing_accepts_serialized_trace_version():
+    manager_cls = GroupQueueManager.__ray_metadata__.modified_class
+    manager = manager_cls.__new__(manager_cls)
+    manager.policy_update_traces = {}
+
+    result = manager.record_policy_update_timing(
+        4,
+        {
+            "version": 4,
+            "batch_wait_seconds": 2.0,
+            "learner_compute_seconds": 5.0,
+        },
+    )
+
+    assert result["version"] == 4
+    assert result["batch_wait_seconds"] == 2.0
+    assert result["learner_compute_seconds"] == 5.0
 
 
 def test_version_runtime_plan_rebuilds_only_gpu_invested_working_set():
@@ -351,6 +700,8 @@ def test_discard_record_uses_boundary_snapshot_and_deduplicates():
         "inference_tokens": 1140,
         "generate_seconds": 2.0,
         "env_seconds": 3.0,
+        "trajectory_started_at_unix": 100.0,
+        "trajectory_completed_at_unix": None,
     }])
     queue.update_progress_snapshots([{
         "group_id": 3,
@@ -367,6 +718,8 @@ def test_discard_record_uses_boundary_snapshot_and_deduplicates():
     assert len(queue.discard_records) == 1
     assert queue.discard_records[0]["actions_completed"] == 6
     assert queue.discard_records[0]["inference_tokens"] == 1140
+    assert queue.discard_records[0]["trajectory_started_at_unix"] == 100.0
+    assert queue.discard_records[0]["trajectory_completed_at_unix"] == 0.0
     assert queue.discard_records[0]["discard_reason"] == "version_expired_late_return"
 
 
@@ -449,6 +802,64 @@ def test_dynamic_reserve_increases_on_wait_and_decays_on_waste():
     assert compute_dynamic_reserve(6, 3, 0.5, 1.0, 0.0, **common) == (2, 2)
     assert compute_dynamic_reserve(4, 3, 0.5, 0.0, -2.0, **common) == (2, 3)
     assert compute_dynamic_reserve(4, 3, 1.0, 0.0, 0.0, **common) == (4, 0)
+
+
+def test_closed_loop_reserve_separates_under_supply_from_forecast_error():
+    common = {
+        "reserve_min": 0,
+        "reserve_max": 8,
+        "additive_step": 2,
+        "multiplicative_decay": 0.5,
+        "warmup_versions": 0,
+        "wait_high": 2.0,
+        "overload_high": 0.25,
+    }
+
+    assert compute_closed_loop_reserve(2, 3, 4.0, 0.0, **common) == (
+        4,
+        1,
+    )
+    assert compute_closed_loop_reserve(6, 3, 4.0, 0.5, **common) == (
+        2,
+        2,
+    )
+    assert compute_closed_loop_reserve(4, 3, 1.0, 0.0, **common) == (
+        4,
+        0,
+    )
+
+
+def test_state_feedback_reserve_distinguishes_supply_and_queue_pressure():
+    common = {
+        "reserve_min": 0,
+        "reserve_max": 8,
+        "additive_step": 1,
+        "warmup_versions": 0,
+        "starvation_high": 0.10,
+        "waste_high": 0.25,
+        "queue_high": 0.20,
+        "tool_wait_high": 0.50,
+        "learner_demand": 4,
+    }
+
+    assert compute_state_feedback_reserve(
+        3, 4, 0.30, 0.05, 0.05, 1, 0.20, **common
+    ) == (4, 1)
+    assert compute_state_feedback_reserve(
+        3, 4, 0.30, 0.05, 0.30, 1, 0.20, **common
+    ) == (3, 7)
+    assert compute_state_feedback_reserve(
+        3, 4, 0.30, 0.40, 0.05, 1, 0.20, **common
+    ) == (3, 8)
+    assert compute_state_feedback_reserve(
+        3, 4, 0.30, 0.05, 0.05, 1, 0.80, **common
+    ) == (4, 9)
+    assert compute_state_feedback_reserve(
+        3, 4, 0.01, 0.40, 0.05, 4, 0.20, **common
+    ) == (2, 2)
+    assert compute_state_feedback_reserve(
+        3, 4, 0.01, 0.05, 0.30, 4, 0.20, **common
+    ) == (2, 10)
 
 
 def test_dynamic_reserve_trace_converges_into_deadband():
@@ -651,6 +1062,36 @@ def test_version_adaptive_completion_is_attributed_before_learner_consumption():
     }
 
 
+def test_pending_group_gets_backfill_missing_queues():
+    async def run_test():
+        manager_cls = GroupQueueManager.__ray_metadata__.modified_class
+        manager = manager_cls.__new__(manager_cls)
+        manager.rollout_complete = {}
+
+        gate = asyncio.Event()
+
+        class BlockingQueue:
+            async def get(self):
+                await gate.wait()
+
+        manager.group_queue = {0: BlockingQueue(), 14: BlockingQueue()}
+        existing = asyncio.create_task(
+            manager.group_queue[14].get(), name="14"
+        )
+        manager.pending_gets = {existing}
+
+        pending = manager._take_pending_group_gets()
+
+        assert {task.get_name() for task in pending} == {"0", "14"}
+        assert manager.pending_gets == set()
+
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    asyncio.run(run_test())
+
+
 def test_trainable_frontier_uses_group_size_order_statistic():
     queue = GroupQueue.__new__(GroupQueue)
     queue.group_id = 1
@@ -803,7 +1244,7 @@ class MockRolloutScheduler(RolloutScheduler):
         env_num = self.env_manager_config.world_size * self.env_manager_config.max_env_num_per_worker
 
         self.env_output_queue = GroupQueueManager.options(
-            max_concurrency = env_num + 1 # reserve extra one for get_batch
+            max_concurrency=2 * env_num + 2,
         ).remote(
             self.config,
             self.env_manager_config,

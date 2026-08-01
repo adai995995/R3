@@ -105,6 +105,8 @@ class AgentRunner(ABC):
         messages: List[Dict],
         tools: Optional[List[Dict]] = None,
         tool_choice: str = "auto",
+        track_trajectory: bool = True,
+        request_role: str = "agent",
     ) -> Dict[str, Any]:
         """Send an OpenAI-compatible chat completion request to ``base_url``.
 
@@ -118,6 +120,8 @@ class AgentRunner(ABC):
                 "messages": messages,
                 "tools": tools or [],
                 "tool_choice": tool_choice if tools else "none",
+                "_roll_track_trajectory": track_trajectory,
+                "_roll_request_role": request_role,
             },
             headers={"Authorization": f"Bearer {self.env_id}"},
         )

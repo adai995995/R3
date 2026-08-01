@@ -12,7 +12,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from roll.distributed.scheduler.rollout_scheduler import build_version_runtime_plan
+from roll.distributed.scheduler.rollout_scheduler import (
+    apply_dynamic_reserve_hysteresis,
+    build_version_runtime_plan,
+    compute_closed_loop_reserve,
+)
 from roll.distributed.scheduler.router import (
     TrajectoryRuntimeState,
     build_runtime_priority_key,
@@ -41,6 +45,64 @@ class TestbedConfig:
     safety_reserve: int = 4
     workers: int = 4
     rebuild_budget: int = 8
+    phases: Tuple["TestbedPhase", ...] = ()
+    adaptive_reserve: bool = False
+    reserve_min: int = 0
+    reserve_max: int = 16
+    reserve_additive_step: int = 2
+    reserve_decay: float = 0.5
+    reserve_ewma_alpha: float = 0.5
+    reserve_wait_high: float = 0.5
+    reserve_overload_high: float = 0.25
+    reserve_warmup_versions: int = 0
+    reserve_signal_patience: int = 1
+    reserve_cooldown_versions: int = 0
+
+
+@dataclass(frozen=True)
+class TestbedPhase:
+    """Deterministic workload override starting at one policy version."""
+
+    start_version: int
+    learner_demand: Optional[int] = None
+    service_actions_per_version: Optional[float] = None
+    tool_delay_scale: float = 0.0
+    prefill_cost_per_1k_tokens: float = 0.0
+    worker_slowdowns: Tuple[float, ...] = ()
+
+
+def _phase_for_version(config: TestbedConfig, version: int) -> TestbedPhase:
+    active = TestbedPhase(start_version=0)
+    for phase in sorted(config.phases, key=lambda item: item.start_version):
+        if phase.start_version > version:
+            break
+        active = phase
+    return active
+
+
+def _phase_learner_demand(config: TestbedConfig, phase: TestbedPhase) -> int:
+    return max(
+        0,
+        config.learner_demand
+        if phase.learner_demand is None
+        else int(phase.learner_demand),
+    )
+
+
+def _phase_service_budget(config: TestbedConfig, phase: TestbedPhase) -> float:
+    return max(
+        0.0,
+        float(config.service_actions_per_version)
+        if phase.service_actions_per_version is None
+        else float(phase.service_actions_per_version),
+    )
+
+
+def _ewma(current: Optional[float], sample: float, alpha: float) -> float:
+    bounded_alpha = min(1.0, max(0.0, float(alpha)))
+    if current is None:
+        return float(sample)
+    return bounded_alpha * float(sample) + (1 - bounded_alpha) * current
 
 
 @dataclass
@@ -117,17 +179,53 @@ def _priority_key(state: _TrajectoryState) -> Tuple[int, int, int, int]:
 
 
 def _predict_timely_completions(
-    active: List[_TrajectoryState], service_budget: int
+    active: List[_TrajectoryState],
+    service_budget: float,
+    phase: TestbedPhase,
 ) -> int:
     """Predict completions using only remaining service and version urgency."""
-    budget = max(0, service_budget)
+    budget = max(0.0, float(service_budget))
     completed = 0
     for state in sorted((item for item in active if not item.complete), key=_priority_key):
-        if state.remaining_actions > budget:
+        remaining_cost = state.remaining_actions * (
+            1.0
+            + max(0.0, state.spec.tool_seconds_per_action)
+            * max(0.0, phase.tool_delay_scale)
+        )
+        if state.cached_prompt_tokens <= 0:
+            remaining_cost += (
+                state.prompt_tokens()
+                * max(0.0, phase.prefill_cost_per_1k_tokens)
+                / 1000.0
+            )
+        if remaining_cost > budget:
             continue
-        budget -= state.remaining_actions
+        budget -= remaining_cost
         completed += 1
     return completed
+
+
+def _worker_slowdown(phase: TestbedPhase, worker: int) -> float:
+    if worker < len(phase.worker_slowdowns):
+        return max(1e-6, float(phase.worker_slowdowns[worker]))
+    return 1.0
+
+
+def _action_service_cost(
+    state: _TrajectoryState,
+    worker: int,
+    prefill_tokens: int,
+    phase: TestbedPhase,
+) -> float:
+    base = (
+        1.0
+        + max(0.0, state.spec.tool_seconds_per_action)
+        * max(0.0, phase.tool_delay_scale)
+        + max(0, int(prefill_tokens))
+        * max(0.0, phase.prefill_cost_per_1k_tokens)
+        / 1000.0
+    )
+    return base * _worker_slowdown(phase, worker)
 
 
 def _select_worker(
@@ -137,11 +235,18 @@ def _select_worker(
     worker_prefixes: Dict[int, set],
     worker_assignments: Dict[int, int],
     rebuild_remaining: int,
+    phase: TestbedPhase,
 ) -> Tuple[int, str]:
     if state.worker is not None:
         return state.worker, "affinity"
     workers = sorted(worker_assignments)
-    least_loaded = min(workers, key=lambda rank: (worker_assignments[rank], rank))
+    least_loaded = min(
+        workers,
+        key=lambda rank: (
+            worker_assignments[rank] * _worker_slowdown(phase, rank),
+            rank,
+        ),
+    )
     if policy != "unified":
         return least_loaded, "least_loaded"
     if rebuild_remaining > 0 and state.policy_version < version:
@@ -167,7 +272,13 @@ def _select_worker(
         rank for rank in workers if state.spec.prefix_id in worker_prefixes[rank]
     ]
     if prefix_workers:
-        return min(prefix_workers, key=lambda rank: (worker_assignments[rank], rank)), "prefix"
+        return min(
+            prefix_workers,
+            key=lambda rank: (
+                worker_assignments[rank] * _worker_slowdown(phase, rank),
+                rank,
+            ),
+        ), "prefix"
     return least_loaded, "least_loaded"
 
 
@@ -183,6 +294,12 @@ def run_testbed(
     trace_cursor = 0
     admission_order = 0
     fifo_cursor = 0
+    adaptive_reserve = max(0, int(config.safety_reserve))
+    undersupply_ewma: Optional[float] = None
+    overload_ewma: Optional[float] = None
+    pending_direction = 0
+    pending_count = 0
+    cooldown_remaining = 0
     metrics: Dict[str, float] = {
         "admitted_trajectories": 0,
         "completed_trajectories": 0,
@@ -203,6 +320,12 @@ def run_testbed(
     boundaries = []
 
     for version in range(config.versions):
+        phase = _phase_for_version(config, version)
+        learner_demand = _phase_learner_demand(config, phase)
+        service_budget = _phase_service_budget(config, phase)
+        reserve_before = adaptive_reserve
+        stale_tokens_before = metrics["stale_inference_tokens"]
+        stale_trajectories_before = metrics["stale_trajectories"]
         survivors = []
         for state in active:
             age = version - state.policy_version
@@ -221,7 +344,7 @@ def run_testbed(
         ready_supply = sum(1 for state in active if state.complete)
         if policy == "unified":
             predicted = _predict_timely_completions(
-                active, config.service_actions_per_version
+                active, service_budget, phase
             )
             invested_candidates = [
                 (
@@ -236,8 +359,8 @@ def run_testbed(
             ]
             runtime_plan = build_version_runtime_plan(
                 version=version,
-                learner_demand=config.learner_demand,
-                safety_reserve=config.safety_reserve,
+                learner_demand=learner_demand,
+                safety_reserve=adaptive_reserve,
                 expected_existing_supply=ready_supply + predicted,
                 outstanding_trajectories=len(active),
                 max_outstanding_trajectories=config.max_outstanding,
@@ -250,7 +373,7 @@ def run_testbed(
             requested = runtime_plan.admission_budget
         else:
             predicted = 0
-            requested = config.learner_demand + config.safety_reserve
+            requested = learner_demand + config.safety_reserve
         capacity = max(0, config.max_outstanding - len(active))
         admitted = min(requested, capacity, len(trace) - trace_cursor)
         for _ in range(admitted):
@@ -272,7 +395,9 @@ def run_testbed(
             sum(1 for state in active if not state.complete and state.policy_version < version),
         ) if policy == "unified" else 0
 
-        for _ in range(max(0, config.service_actions_per_version)):
+        remaining_service_budget = service_budget
+        service_actions = 0
+        while remaining_service_budget > 0:
             runnable = [state for state in active if not state.complete]
             if not runnable:
                 break
@@ -291,12 +416,8 @@ def run_testbed(
                 worker_prefixes,
                 worker_assignments,
                 rebuild_remaining,
+                phase,
             )
-            if reason == "rebuild":
-                rebuild_remaining -= 1
-                metrics["rebuild_requests"] += 1
-            elif reason == "prefix":
-                metrics["prefix_routes"] += 1
 
             if state.worker == worker and state.cached_prompt_tokens > 0:
                 saved = min(prompt_tokens, state.cached_prompt_tokens)
@@ -304,12 +425,29 @@ def run_testbed(
                 saved = min(prompt_tokens, state.spec.prefix_tokens)
             else:
                 saved = 0
+            prefill_tokens = prompt_tokens - saved
+            action_cost = _action_service_cost(
+                state, worker, prefill_tokens, phase
+            )
+            if action_cost > remaining_service_budget:
+                break
+            remaining_service_budget -= action_cost
+            service_actions += 1
+
+            if reason == "rebuild":
+                rebuild_remaining -= 1
+                metrics["rebuild_requests"] += 1
+            elif reason == "prefix":
+                metrics["prefix_routes"] += 1
+
             response_tokens = state.spec.response_tokens_per_action
             metrics["prompt_tokens"] += prompt_tokens
             metrics["response_tokens"] += response_tokens
             metrics["saved_prefill_tokens"] += saved
-            metrics["prefill_tokens"] += prompt_tokens - saved
-            metrics["tool_seconds"] += state.spec.tool_seconds_per_action
+            metrics["prefill_tokens"] += prefill_tokens
+            metrics["tool_seconds"] += state.spec.tool_seconds_per_action * (
+                1.0 + max(0.0, phase.tool_delay_scale)
+            )
             state.invested_prompt_tokens += prompt_tokens
             state.invested_response_tokens += response_tokens
             state.worker = worker
@@ -327,23 +465,92 @@ def run_testbed(
             (state for state in active if state.complete),
             key=lambda state: (state.finish_version, state.admission_order),
         )
-        consumed = ready[: config.learner_demand]
+        consumed = ready[:learner_demand]
         consumed_ids = {state.spec.trajectory_id for state in consumed}
         active = [state for state in active if state.spec.trajectory_id not in consumed_ids]
         metrics["consumed_trajectories"] += len(consumed)
-        metrics["learner_shortfall_trajectories"] += max(
-            0, config.learner_demand - len(consumed)
-        )
+        learner_shortfall = max(0, learner_demand - len(consumed))
+        metrics["learner_shortfall_trajectories"] += learner_shortfall
         metrics["consumed_version_age_sum"] += sum(
             version - state.policy_version for state in consumed
         )
 
+        stale_tokens = max(
+            0.0, metrics["stale_inference_tokens"] - stale_tokens_before
+        )
+        stale_trajectories = max(
+            0.0, metrics["stale_trajectories"] - stale_trajectories_before
+        )
+        consumed_tokens = sum(
+            state.invested_prompt_tokens + state.invested_response_tokens
+            for state in consumed
+        )
+        overload_signal = (
+            stale_tokens / (stale_tokens + consumed_tokens)
+            if stale_tokens + consumed_tokens > 0
+            else 0.0
+        )
+        undersupply_signal = float(learner_shortfall)
+        undersupply_ewma = _ewma(
+            undersupply_ewma,
+            undersupply_signal,
+            config.reserve_ewma_alpha,
+        )
+        overload_ewma = _ewma(
+            overload_ewma,
+            overload_signal,
+            config.reserve_ewma_alpha,
+        )
+        reserve_reason = 0
+        if policy == "unified" and config.adaptive_reserve:
+            candidate_reserve, candidate_reason = compute_closed_loop_reserve(
+                adaptive_reserve,
+                version,
+                undersupply_ewma,
+                overload_ewma,
+                reserve_min=config.reserve_min,
+                reserve_max=config.reserve_max,
+                additive_step=config.reserve_additive_step,
+                multiplicative_decay=config.reserve_decay,
+                warmup_versions=config.reserve_warmup_versions,
+                wait_high=config.reserve_wait_high,
+                overload_high=config.reserve_overload_high,
+            )
+            (
+                adaptive_reserve,
+                reserve_reason,
+                pending_direction,
+                pending_count,
+                cooldown_remaining,
+            ) = apply_dynamic_reserve_hysteresis(
+                adaptive_reserve,
+                candidate_reserve,
+                candidate_reason,
+                pending_direction,
+                pending_count,
+                cooldown_remaining,
+                signal_patience=config.reserve_signal_patience,
+                cooldown_versions=config.reserve_cooldown_versions,
+            )
+
         boundaries.append(
             {
                 "version": version,
+                "learner_demand": learner_demand,
+                "service_budget": service_budget,
+                "service_actions": service_actions,
                 "ready_supply": ready_supply,
                 "predicted_existing_completions": predicted,
                 "admitted": admitted,
+                "learner_shortfall": learner_shortfall,
+                "stale_trajectories": stale_trajectories,
+                "undersupply_signal": undersupply_signal,
+                "undersupply_ewma": undersupply_ewma,
+                "overload_signal": overload_signal,
+                "overload_ewma": overload_ewma,
+                "reserve_before": reserve_before,
+                "reserve_after": adaptive_reserve,
+                "reserve_update_reason": reserve_reason,
                 "outstanding": len(active),
                 "carryover": sum(
                     1 for state in active if state.policy_version < version
