@@ -8,6 +8,8 @@ from roll.distributed.scheduler.rollout_scheduler import (
     VersionAwareRuntimeController,
     VersionRuntimeOutcome,
     VersionRuntimeState,
+    compute_admission_control_step,
+    compute_admission_search_step,
     update_latency_hill_climb,
 )
 from roll.pipeline.agentic.agentic_config import EnvMonitorConfig
@@ -896,6 +898,7 @@ def test_latency_hill_climb_uses_step_time_as_primary_objective():
         improvement_margin=0.03,
         starvation_high=0.02,
         waste_high=0.25,
+        queue_idle=0.001,
         queue_high=0.20,
     )
     improved, direction, improved_reason = update_latency_hill_climb(
@@ -912,6 +915,7 @@ def test_latency_hill_climb_uses_step_time_as_primary_objective():
         improvement_margin=0.03,
         starvation_high=0.02,
         waste_high=0.25,
+        queue_idle=0.001,
         queue_high=0.20,
     )
     reversed_reserve, reversed_direction, reversed_reason = (
@@ -929,6 +933,7 @@ def test_latency_hill_climb_uses_step_time_as_primary_objective():
             improvement_margin=0.03,
             starvation_high=0.02,
             waste_high=0.25,
+            queue_idle=0.001,
             queue_high=0.20,
         )
     )
@@ -940,7 +945,7 @@ def test_latency_hill_climb_uses_step_time_as_primary_objective():
     assert reversed_reason == 15
 
 
-def test_latency_hill_climb_backs_off_when_wait_and_overload_coexist():
+def test_latency_hill_climb_does_not_trade_starvation_for_token_efficiency():
     reserve, direction, reason = update_latency_hill_climb(
         12,
         1,
@@ -955,12 +960,74 @@ def test_latency_hill_climb_backs_off_when_wait_and_overload_coexist():
         improvement_margin=0.03,
         starvation_high=0.02,
         waste_high=0.25,
+        queue_idle=0.001,
         queue_high=0.20,
     )
 
-    assert reserve == 11
+    assert reserve == 13
+    assert direction == 1
+    assert reason == 16
+
+
+def test_latency_hill_climb_expands_when_starved_and_queue_is_idle():
+    reserve, direction, reason = update_latency_hill_climb(
+        12,
+        1,
+        15.0,
+        13.0,
+        0.20,
+        0.50,
+        0.0001,
+        reserve_min=0,
+        reserve_max=32,
+        additive_step=2,
+        improvement_margin=0.03,
+        starvation_high=0.02,
+        waste_high=0.25,
+        queue_idle=0.001,
+        queue_high=0.20,
+    )
+
+    assert reserve == 14
+    assert direction == 1
+    assert reason == 16
+
+
+def test_latency_hill_climb_reverses_regression_after_queue_forms():
+    reserve, direction, reason = update_latency_hill_climb(
+        12,
+        1,
+        15.0,
+        13.0,
+        0.20,
+        0.50,
+        0.05,
+        reserve_min=0,
+        reserve_max=32,
+        additive_step=2,
+        improvement_margin=0.03,
+        starvation_high=0.02,
+        waste_high=0.25,
+        queue_idle=0.001,
+        queue_high=0.20,
+    )
+
+    assert reserve == 10
     assert direction == -1
-    assert reason == 17
+    assert reason == 15
+
+
+def test_admission_control_step_scales_with_batch_and_preserves_group_units():
+    assert compute_admission_control_step(16, 1, 0, 0.25) == 4
+    assert compute_admission_control_step(64, 1, 0, 0.25) == 16
+    assert compute_admission_control_step(32, 4, 0, 0.25) == 8
+    assert compute_admission_control_step(32, 4, 5, 0.25) == 8
+
+
+def test_admission_search_step_uses_one_group_in_automatic_mode():
+    assert compute_admission_search_step(1, 0) == 1
+    assert compute_admission_search_step(4, 0) == 4
+    assert compute_admission_search_step(4, 5) == 8
 
 
 def test_admission_yield_uses_the_target_batch_deadline():

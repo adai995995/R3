@@ -5,12 +5,14 @@ from roll.distributed.scheduler.router import (
     build_runtime_priority_key,
     build_router_progress_snapshot,
     build_boundary_recovery_record,
+    build_prefix_directory_keys,
     build_prefix_fingerprints,
     build_refresh_request_record,
     common_prefix_tokens,
     is_post_boundary_request,
     select_rebuild_worker,
     select_prefix_locality_worker,
+    select_prefix_directory_worker,
     select_soft_locality_worker,
 )
 
@@ -135,6 +137,27 @@ def test_prefix_fingerprints_are_block_aligned_and_deterministic():
     assert first == second
     assert [item["prefix_tokens"] for item in first] == [128, 256, 288]
     assert len({item["fingerprint"] for item in first}) == 3
+
+
+def test_prefix_directory_prefers_deepest_ready_owner_without_prompt_scan():
+    prompt = list(range(320))
+    keys = build_prefix_directory_keys(prompt, prefix_limit=256)
+    ready = {
+        keys[0]: {0},
+        keys[-1]: {1},
+    }
+
+    selected, reason, cached = select_prefix_directory_worker(
+        keys,
+        ready,
+        {0, 1},
+        {0: 0, 1: 1},
+        load_slack=1,
+    )
+
+    assert selected == 1
+    assert reason == "prefix_directory"
+    assert cached == 256
 
 
 def test_refresh_request_record_is_aligned_to_boundary():

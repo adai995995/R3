@@ -450,8 +450,9 @@ class ProxyEnvManager(BaseEnvManager):
         if harbor_result.get("agent_exit_reason"):
             self.logger.warning(f"[Harbor] agent_exit_reason: {harbor_result['agent_exit_reason']}")
         trajectory_samples = self.message_tracker.get_trajectory_data(mode=self.trajectory_mode)
+        placeholder_rollout = not trajectory_samples
 
-        if not trajectory_samples:
+        if placeholder_rollout:
             self.logger.info(f"[PLACEHOLDER_ROLLOUT] Creating for episode_id: {self.episode_id}")
             trajectory_samples = [{
                 "token_ids": [self.tokenizer.pad_token_id],
@@ -603,7 +604,9 @@ class ProxyEnvManager(BaseEnvManager):
         env_metric["total_tokens"] = float(total_tokens)
         env_metric["num_branches_or_steps"] = len(trajectory_samples)
         batch.meta_info = {
-            "metrics": {f"env/{tag}/{k}": v for k, v in env_metric.items()}
+            "metrics": {f"env/{tag}/{k}": v for k, v in env_metric.items()},
+            "drop_flag": placeholder_rollout,
+            "invalid_training_sample": placeholder_rollout,
         }
         batch.meta_info["metrics"]["env/response_length"] = avg_resp_len
         batch.meta_info["COLUMMNS_CONFIG"] = [

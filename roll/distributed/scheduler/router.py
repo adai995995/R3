@@ -10,7 +10,7 @@ import weakref
 from abc import abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, List, MutableMapping, Optional, Sequence, Set
+from typing import Any, Dict, List, MutableMapping, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
 import ray
@@ -220,6 +220,20 @@ def summarize_request_metric_totals(
         metrics["router/post_update_rebuild_coalesced_ratio"] = (
             metrics.get("router/post_update_rebuild_coalesced", 0.0)
             / rebuild_requests
+        )
+        metrics["router/rebuild_seed_ratio"] = (
+            metrics.get("router/rebuild_seed_request", 0.0)
+            / rebuild_requests
+        )
+        metrics["router/rebuild_follower_ratio"] = (
+            metrics.get("router/rebuild_follower_request", 0.0)
+            / rebuild_requests
+        )
+    rebuild_followers = metrics.get("router/rebuild_follower_request", 0.0)
+    if rebuild_followers:
+        metrics["router/rebuild_follower_wait_seconds_mean"] = (
+            metrics.get("router/rebuild_follower_wait_seconds", 0.0)
+            / rebuild_followers
         )
     batch_reported = metrics.get("vllm/request_scheduler_batch_reported", 0.0)
     if batch_reported:
@@ -557,6 +571,33 @@ def build_prefix_fingerprints(
     return fingerprints
 
 
+PrefixDirectoryKey = Tuple[int, str]
+
+
+def build_prefix_directory_keys(
+    prompt_tokens: Sequence[int],
+    prefix_limit: int,
+    block_size: int = 16,
+) -> Tuple[PrefixDirectoryKey, ...]:
+    """Return block-aligned prefix keys from shallowest to deepest."""
+    limit = max(0, min(len(prompt_tokens), int(prefix_limit)))
+    if limit < block_size:
+        return ()
+    depths = tuple(
+        depth
+        for depth in (128, 256, 512, 1024, 2048, 4096, 8192)
+        if depth <= limit
+    )
+    if not depths or depths[-1] != limit:
+        depths = (*depths, limit)
+    return tuple(
+        (int(item["prefix_tokens"]), str(item["fingerprint"]))
+        for item in build_prefix_fingerprints(
+            prompt_tokens[:limit], depths=depths, block_size=block_size
+        )
+    )
+
+
 def build_refresh_request_record(
     runtime_state: TrajectoryRuntimeState,
     *,
@@ -767,6 +808,37 @@ def select_prefix_locality_worker(
     ):
         return best_rank, "prefix_locality", best_cached
     return least_loaded, "prefix_load_override", 0
+
+
+def select_prefix_directory_worker(
+    prefix_keys: Sequence[PrefixDirectoryKey],
+    ready_workers: Dict[PrefixDirectoryKey, Set[int]],
+    active_dp_ranks,
+    worker_pressure,
+    load_slack: int,
+):
+    """Use the deepest ready prefix owner without scanning stored prompts."""
+    candidates = list(active_dp_ranks)
+    if not candidates:
+        raise RuntimeError("No active DP ranks")
+    least_loaded = min(
+        candidates, key=lambda rank: (worker_pressure.get(rank, 0), rank)
+    )
+    for prefix_tokens, fingerprint in reversed(tuple(prefix_keys)):
+        owners = ready_workers.get((prefix_tokens, fingerprint), set())
+        owners = [rank for rank in owners if rank in active_dp_ranks]
+        if not owners:
+            continue
+        owner = min(
+            owners, key=lambda rank: (worker_pressure.get(rank, 0), rank)
+        )
+        if (
+            worker_pressure.get(owner, 0)
+            <= worker_pressure.get(least_loaded, 0) + max(0, load_slack)
+        ):
+            return owner, "prefix_directory", int(prefix_tokens)
+        return least_loaded, "prefix_load_override", 0
+    return least_loaded, "least_loaded", 0
 
 
 def select_completion_eta_worker(
@@ -1935,6 +2007,23 @@ class EnvAffinityRouter(Router):
             0.0,
             float(config.get("post_update_rebuild_coalesce_seconds", 0.0)),
         )
+        self.post_update_rebuild_seed_slots_per_worker = max(
+            1,
+            int(config.get("post_update_rebuild_seed_slots_per_worker", 2)),
+        )
+        self.post_update_rebuild_min_reuse_requests = max(
+            1,
+            int(config.get("post_update_rebuild_min_reuse_requests", 1)),
+        )
+        self.post_update_rebuild_min_outstanding_per_worker = max(
+            0,
+            int(
+                config.get(
+                    "post_update_rebuild_min_outstanding_per_worker",
+                    self.priority_max_running_requests,
+                )
+            ),
+        )
         self.soft_locality_enabled = bool(
             config.get("soft_locality_enabled", False)
         )
@@ -1973,6 +2062,7 @@ class EnvAffinityRouter(Router):
             1, int(config.get("refresh_profile_max_records", 20000))
         )
         self.rebuild_epoch = None
+        self.rebuild_load_eligible = True
         self.boundary_resumed_at: Dict[int, float] = {}
         self.rebuild_remaining = 0
         self.rebuild_target = 0
@@ -1986,6 +2076,11 @@ class EnvAffinityRouter(Router):
         self.rebuild_pending = []
         self.rebuild_coalesce_lock = asyncio.Lock()
         self.rebuild_flush_task = None
+        self.rebuild_prefix_ready_workers = defaultdict(set)
+        self.rebuild_prefix_warming_workers = defaultdict(set)
+        self.rebuild_prefix_waiters = defaultdict(list)
+        self.prefix_ready_workers = defaultdict(set)
+        self.prefix_keys_by_worker = defaultdict(list)
         self.working_set_worker_prompts = defaultdict(list)
         self.runtime_plan = {}
         self.boundary_recovery_records: List[Dict[str, Any]] = []
@@ -2001,6 +2096,16 @@ class EnvAffinityRouter(Router):
             }
             for _ in self.workers
         ]
+
+    def _is_rebuild_load_eligible(self, plan: Dict[str, Any]) -> bool:
+        minimum = self.post_update_rebuild_min_outstanding_per_worker
+        if minimum <= 0 or "outstanding_trajectories" not in plan:
+            return True
+        worker_count = max(
+            1, int(plan.get("worker_count", len(self.workers)))
+        )
+        outstanding = max(0, int(plan.get("outstanding_trajectories", 0)))
+        return outstanding >= worker_count * minimum
 
     def on_version_resume(self, version=None):
         plan = dict(version) if isinstance(version, dict) else {"version": version}
@@ -2034,10 +2139,13 @@ class EnvAffinityRouter(Router):
         self.rebuild_cohort_exact = bool(
             plan.get("rebuild_cohort_exact", False)
         )
+        self.rebuild_load_eligible = self._is_rebuild_load_eligible(plan)
         planned_target = int(
             plan.get("rebuild_target_trajectories", self.post_update_rebuild_requests)
         )
-        if (
+        if not self.rebuild_load_eligible:
+            planned_target = 0
+        elif (
             not self.rebuild_cohort_exact
             and not self.rebuild_candidate_groups
             and planned_target <= 0
@@ -2055,12 +2163,15 @@ class EnvAffinityRouter(Router):
         self.rebuild_seen_trajectories.clear()
         self.rebuild_worker_prompts.clear()
         self.rebuild_assigned_counts.clear()
+        self.rebuild_prefix_ready_workers.clear()
+        self.rebuild_prefix_warming_workers.clear()
+        self.rebuild_prefix_waiters.clear()
+        self.prefix_ready_workers.clear()
+        self.prefix_keys_by_worker.clear()
         self.working_set_worker_prompts.clear()
-        if self.post_update_rebuild_enabled or self.working_set_routing_enabled:
-            # Prefix cache is flushed with the new weights, so old placement has no KV value.
-            self.src_rank2_dp_rank.clear()
-            self.src_rank_cache_epoch.clear()
-            self.src_rank_last_prompt_tokens.clear()
+        # A refresh invalidates KV, but the previous trajectory-to-worker map is
+        # still a safe, balanced fallback. Keep it unless a rebuild cluster has
+        # enough followers to justify changing placement.
 
     def _cancel_pending_rebuild_wave(self):
         task = self.rebuild_flush_task
@@ -2073,6 +2184,13 @@ class EnvAffinityRouter(Router):
             future = item.get("future")
             if future is not None and not future.done():
                 future.set_result(None)
+        waiters = self.rebuild_prefix_waiters
+        self.rebuild_prefix_waiters = defaultdict(list)
+        for prefix_waiters in waiters.values():
+            for item in prefix_waiters:
+                future = item.get("future")
+                if future is not None and not future.done():
+                    future.set_result(None)
 
     def _observe_first_epoch_request(self, trajectory_id: str) -> bool:
         if trajectory_id in self.rebuild_seen_trajectories:
@@ -2096,27 +2214,73 @@ class EnvAffinityRouter(Router):
                 )
             )
             wave_size = len(pending)
+            groups = {}
             for item in pending:
-                dp_rank, lcp_tokens = select_rebuild_worker(
+                prefix_keys = build_prefix_directory_keys(
                     item["prompt_tokens"],
-                    self.rebuild_worker_prompts,
-                    self.active_dp_ranks,
-                    self.rebuild_assigned_counts,
                     self.post_update_rebuild_prefix_tokens,
                 )
-                self.rebuild_worker_prompts[dp_rank].append(
-                    tuple(
-                        int(token)
-                        for token in item["prompt_tokens"][
-                            : self.post_update_rebuild_prefix_tokens
-                        ]
-                    )
+                item["prefix_keys"] = prefix_keys
+                cluster_key = (
+                    prefix_keys[-1]
+                    if prefix_keys
+                    else (0, f'trajectory:{item["trajectory_id"]}')
                 )
-                self.rebuild_assigned_counts[dp_rank] += 1
-                if not item["future"].done():
-                    item["future"].set_result(
-                        (dp_rank, lcp_tokens, wave_size)
+                item["cluster_key"] = cluster_key
+                groups.setdefault(cluster_key, []).append(item)
+
+            active_ranks = sorted(self.active_dp_ranks)
+            for cluster_key, cluster in groups.items():
+                # One seed per worker preserves rollout parallelism. Additional
+                # same-prefix requests wait until a seed publishes current-epoch KV.
+                seed_count = min(
+                    len(cluster),
+                    max(
+                        1,
+                        len(active_ranks)
+                        * self.post_update_rebuild_seed_slots_per_worker,
+                    ),
+                )
+                reuse_requests = len(cluster) - seed_count
+                if reuse_requests < self.post_update_rebuild_min_reuse_requests:
+                    # No realizable reuse in this wave. Preserve the normal
+                    # affinity path instead of perturbing placement for a
+                    # reconstruction plan that cannot save any prefill.
+                    for item in cluster:
+                        if not item["future"].done():
+                            item["future"].set_result(None)
+                    continue
+                cluster_seed_workers = set()
+                for index, item in enumerate(cluster):
+                    if index >= seed_count:
+                        item["wave_size"] = wave_size
+                        item["wait_started"] = time.perf_counter()
+                        self.rebuild_prefix_waiters[cluster_key].append(item)
+                        continue
+                    dp_rank = min(
+                        active_ranks,
+                        key=lambda rank: (
+                            int(rank in cluster_seed_workers),
+                            self.rebuild_assigned_counts.get(rank, 0),
+                            self._worker_pressure().get(rank, 0),
+                            rank,
+                        ),
                     )
+                    cluster_seed_workers.add(dp_rank)
+                    self.rebuild_assigned_counts[dp_rank] += 1
+                    self.rebuild_prefix_warming_workers[cluster_key].add(dp_rank)
+                    if not item["future"].done():
+                        item["future"].set_result(
+                            (
+                                dp_rank,
+                                0,
+                                wave_size,
+                                cluster_key,
+                                "seed",
+                                self.cache_epoch,
+                                0.0,
+                            )
+                        )
 
     async def _prepare_first_epoch_request(
         self,
@@ -2151,6 +2315,7 @@ class EnvAffinityRouter(Router):
                 self.rebuild_pending.append(
                     {
                         "runtime_state": runtime_state,
+                        "trajectory_id": trajectory_id,
                         "prompt_tokens": prompt_tokens,
                         "future": future,
                     }
@@ -2162,6 +2327,142 @@ class EnvAffinityRouter(Router):
                     )
         assignment = await future if future is not None else None
         return first_epoch_request, assignment
+
+    def _register_prefix_keys_ready(self, dp_rank: int, prompt_tokens) -> None:
+        keys = build_prefix_directory_keys(
+            prompt_tokens, self.post_update_rebuild_prefix_tokens
+        )
+        if not keys:
+            return
+        worker_keys = self.prefix_keys_by_worker[dp_rank]
+        max_keys = max(1, self.working_set_max_prompts_per_worker) * 8
+        for key in keys:
+            owners = self.prefix_ready_workers[key]
+            if dp_rank in owners:
+                continue
+            owners.add(dp_rank)
+            worker_keys.append(key)
+        while len(worker_keys) > max_keys:
+            evicted = worker_keys.pop(0)
+            owners = self.prefix_ready_workers.get(evicted)
+            if owners is None:
+                continue
+            owners.discard(dp_rank)
+            if not owners:
+                self.prefix_ready_workers.pop(evicted, None)
+
+    def _invalidate_prefix_worker(self, dp_rank: int) -> None:
+        for key in self.prefix_keys_by_worker.pop(dp_rank, []):
+            owners = self.prefix_ready_workers.get(key)
+            if owners is not None:
+                owners.discard(dp_rank)
+                if not owners:
+                    self.prefix_ready_workers.pop(key, None)
+        for mapping in (
+            self.rebuild_prefix_ready_workers,
+            self.rebuild_prefix_warming_workers,
+        ):
+            for key in list(mapping):
+                mapping[key].discard(dp_rank)
+                if not mapping[key]:
+                    mapping.pop(key, None)
+
+    async def _complete_rebuild_seed(
+        self,
+        *,
+        cache_epoch: int,
+        cluster_key: PrefixDirectoryKey,
+        dp_rank: int,
+        prompt_tokens,
+        success: bool,
+    ) -> None:
+        """Publish a seed's KV and release same-prefix followers conservatively."""
+        async with self.rebuild_coalesce_lock:
+            if cache_epoch != self.cache_epoch:
+                return
+            warming = self.rebuild_prefix_warming_workers.get(cluster_key, set())
+            warming.discard(dp_rank)
+            if not warming:
+                self.rebuild_prefix_warming_workers.pop(cluster_key, None)
+            if success:
+                self.rebuild_prefix_ready_workers[cluster_key].add(dp_rank)
+                self._register_prefix_keys_ready(dp_rank, prompt_tokens)
+
+            waiters = self.rebuild_prefix_waiters.get(cluster_key, [])
+            if not waiters:
+                return
+            ready = sorted(self.rebuild_prefix_ready_workers.get(cluster_key, set()))
+            warming_count = len(
+                self.rebuild_prefix_warming_workers.get(cluster_key, set())
+            )
+            if not ready:
+                if warming_count:
+                    return
+                replacement = waiters.pop(0)
+                replacement_rank = min(
+                    self.active_dp_ranks,
+                    key=lambda rank: (self._worker_pressure().get(rank, 0), rank),
+                )
+                self.rebuild_prefix_warming_workers[cluster_key].add(
+                    replacement_rank
+                )
+                future = replacement["future"]
+                if not future.done():
+                    future.set_result(
+                        (
+                            replacement_rank,
+                            0,
+                            replacement["wave_size"],
+                            cluster_key,
+                            "seed",
+                            self.cache_epoch,
+                            max(
+                                0.0,
+                                time.perf_counter()
+                                - replacement["wait_started"],
+                            ),
+                        )
+                    )
+                return
+
+            release_count = (
+                len(waiters)
+                if warming_count == 0
+                else max(1, math.ceil(len(waiters) / (warming_count + 1)))
+            )
+            assigned = defaultdict(int)
+            for _ in range(min(release_count, len(waiters))):
+                follower = waiters.pop(0)
+                if warming_count:
+                    follower_rank = dp_rank
+                else:
+                    follower_rank = min(
+                        ready,
+                        key=lambda rank: (
+                            self._worker_pressure().get(rank, 0)
+                            + assigned[rank],
+                            rank,
+                        ),
+                    )
+                assigned[follower_rank] += 1
+                future = follower["future"]
+                if not future.done():
+                    future.set_result(
+                        (
+                            follower_rank,
+                            int(cluster_key[0]),
+                            follower["wave_size"],
+                            cluster_key,
+                            "follower",
+                            self.cache_epoch,
+                            max(
+                                0.0,
+                                time.perf_counter() - follower["wait_started"],
+                            ),
+                        )
+                    )
+            if not waiters:
+                self.rebuild_prefix_waiters.pop(cluster_key, None)
 
     def on_runtime_plan_update(self, plan=None):
         revised = dict(plan) if isinstance(plan, dict) else {}
@@ -2200,9 +2501,12 @@ class EnvAffinityRouter(Router):
         self.rebuild_cohort_exact = bool(
             revised.get("rebuild_cohort_exact", False)
         )
+        self.rebuild_load_eligible = self._is_rebuild_load_eligible(revised)
         planned_target = int(
             revised.get("rebuild_target_trajectories", self.rebuild_target)
         )
+        if not self.rebuild_load_eligible:
+            planned_target = 0
         self.rebuild_target = min(
             max(0, self.post_update_rebuild_requests),
             max(0, planned_target),
@@ -2240,6 +2544,7 @@ class EnvAffinityRouter(Router):
         )
         invalidated = 0
         if resets:
+            self._invalidate_prefix_worker(dp_rank)
             self.working_set_worker_prompts.pop(dp_rank, None)
             self.rebuild_worker_prompts.pop(dp_rank, None)
             self.rebuild_assigned_counts.pop(dp_rank, None)
@@ -2312,6 +2617,10 @@ class EnvAffinityRouter(Router):
             runtime_state.trajectory_id if isinstance(priority, dict) else str(routing_key)
         )
         prompt_tokens = payload.get("input_ids", [])
+        # Most requests resume an existing trajectory and use O(1) sticky
+        # affinity. Build cross-trajectory prefix keys only when that affinity
+        # is unavailable and the prefix directory can affect placement.
+        prefix_keys = ()
         if runtime_state.group_id >= 0 and runtime_state.episode_id >= 0:
             self.latest_trajectory_progress[runtime_state.trajectory_id] = (
                 build_router_progress_snapshot(runtime_state, len(prompt_tokens))
@@ -2352,6 +2661,11 @@ class EnvAffinityRouter(Router):
         else:
             first_epoch_request, rebuild_assignment = False, None
         rebuild_wave_size = 0
+        rebuild_cluster_key = None
+        rebuild_role = "none"
+        rebuild_assignment_epoch = self.cache_epoch
+        rebuild_follower_wait_seconds = 0.0
+        rebuild_seed_resolved = False
         # Atomic routing assignment under lock to prevent TOCTOU race with shrink/expand
         async with self.routing_lock:
             affinity_rank = self.src_rank2_dp_rank.get(routing_key)
@@ -2371,14 +2685,24 @@ class EnvAffinityRouter(Router):
                     int(self.src_rank_last_prompt_tokens.get(routing_key, 0)),
                 )
 
-            if affinity_rank is None:
-                if rebuild_assignment is not None:
-                    dp_rank, rebuild_lcp_tokens, rebuild_wave_size = (
-                        rebuild_assignment
-                    )
-                    rebuild_request = True
-                    route_reason = "rebuild"
-                elif completion_eta_model_ready:
+            if rebuild_assignment is not None:
+                (
+                    dp_rank,
+                    rebuild_lcp_tokens,
+                    rebuild_wave_size,
+                    rebuild_cluster_key,
+                    rebuild_role,
+                    rebuild_assignment_epoch,
+                    rebuild_follower_wait_seconds,
+                ) = rebuild_assignment
+                rebuild_request = True
+                route_reason = f"rebuild_{rebuild_role}"
+                if dp_rank != affinity_rank:
+                    self.src_rank2_dp_rank[routing_key] = dp_rank
+                    self.src_rank_cache_epoch.pop(routing_key, None)
+                    self.src_rank_last_prompt_tokens.pop(routing_key, None)
+            elif affinity_rank is None:
+                if completion_eta_model_ready:
                     dp_rank, route_reason, eta_estimate = (
                         select_completion_eta_worker(
                             prompt_tokens,
@@ -2412,14 +2736,16 @@ class EnvAffinityRouter(Router):
                         eta_estimate["prefill_tokens"]
                     )
                 elif self.working_set_routing_enabled and len(prompt_tokens) > 0:
+                    prefix_keys = build_prefix_directory_keys(
+                        prompt_tokens, self.post_update_rebuild_prefix_tokens
+                    )
                     dp_rank, route_reason, estimated_cached_tokens = (
-                        select_prefix_locality_worker(
-                            prompt_tokens,
-                            self.working_set_worker_prompts,
+                        select_prefix_directory_worker(
+                            prefix_keys,
+                            self.prefix_ready_workers,
                             self.active_dp_ranks,
                             worker_pressure,
                             self.soft_locality_load_slack,
-                            self.post_update_rebuild_prefix_tokens,
                         )
                     )
                 else:
@@ -2630,19 +2956,41 @@ class EnvAffinityRouter(Router):
                     )
                 )
             finish_reasons = response.get("finish_reasons", [])
-            if not any(reason == "abort" for reason in finish_reasons):
-                self.src_rank_cache_epoch[routing_key] = self.cache_epoch
+            request_succeeded = not any(
+                reason == "abort" for reason in finish_reasons
+            )
+            if request_succeeded and request_cache_epoch == self.cache_epoch:
+                self.src_rank_cache_epoch[routing_key] = request_cache_epoch
                 self.src_rank_last_prompt_tokens[routing_key] = len(prompt_tokens)
-                cached_prompts = self.working_set_worker_prompts[dp_rank]
-                cached_prompts.append(
-                    tuple(
-                        int(token)
-                        for token in prompt_tokens[:self.post_update_rebuild_prefix_tokens]
+                if rebuild_role != "seed" and (
+                    first_epoch_request
+                    or not affinity_candidate
+                    or route_reason == "prefix_directory"
+                    or rebuild_role == "follower"
+                ):
+                    self._register_prefix_keys_ready(dp_rank, prompt_tokens)
+                if self.completion_eta_routing_enabled:
+                    cached_prompts = self.working_set_worker_prompts[dp_rank]
+                    cached_prompts.append(
+                        tuple(
+                            int(token)
+                            for token in prompt_tokens[
+                                : self.post_update_rebuild_prefix_tokens
+                            ]
+                        )
                     )
+                    max_prompts = max(1, self.working_set_max_prompts_per_worker)
+                    if len(cached_prompts) > max_prompts:
+                        del cached_prompts[:-max_prompts]
+            if rebuild_role == "seed" and rebuild_cluster_key is not None:
+                await self._complete_rebuild_seed(
+                    cache_epoch=rebuild_assignment_epoch,
+                    cluster_key=rebuild_cluster_key,
+                    dp_rank=dp_rank,
+                    prompt_tokens=prompt_tokens,
+                    success=request_succeeded,
                 )
-                max_prompts = max(1, self.working_set_max_prompts_per_worker)
-                if len(cached_prompts) > max_prompts:
-                    del cached_prompts[:-max_prompts]
+                rebuild_seed_resolved = True
             response_metrics.update({
                 "router/scheduling_decisions": 1,
                 "router/scheduling_decision_seconds": routing_decision_seconds,
@@ -2658,10 +3006,22 @@ class EnvAffinityRouter(Router):
                 ),
                 "router/least_loaded_selected": int(route_reason == "least_loaded"),
                 "router/working_set_prefix_selected": int(
-                    route_reason == "prefix_locality"
+                    route_reason in ("prefix_locality", "prefix_directory")
                 ),
-                "router/rebuild_selected": int(route_reason == "rebuild"),
+                "router/rebuild_selected": int(
+                    route_reason.startswith("rebuild_")
+                ),
+                "router/rebuild_seed_request": int(rebuild_role == "seed"),
+                "router/rebuild_follower_request": int(
+                    rebuild_role == "follower"
+                ),
+                "router/rebuild_follower_wait_seconds": (
+                    rebuild_follower_wait_seconds
+                ),
                 "router/rebuild_candidate_request": int(rebuild_candidate),
+                "router/rebuild_load_eligible": int(
+                    self.rebuild_load_eligible
+                ),
                 "router/planned_priority_candidate_request": int(
                     priority_candidate
                 ),
@@ -2771,6 +3131,18 @@ class EnvAffinityRouter(Router):
             return response
         finally:
             self.running_requests[dp_rank].remove(request_id)
+            if (
+                rebuild_role == "seed"
+                and rebuild_cluster_key is not None
+                and not rebuild_seed_resolved
+            ):
+                await self._complete_rebuild_seed(
+                    cache_epoch=rebuild_assignment_epoch,
+                    cluster_key=rebuild_cluster_key,
+                    dp_rank=dp_rank,
+                    prompt_tokens=prompt_tokens,
+                    success=False,
+                )
             # Cleanup tracking (on both success and abort paths)
             self.request_id_2_src_rank.pop(request_id, None)
             if has_priority_slot:
@@ -2966,15 +3338,24 @@ class EnvAffinityRouter(Router):
         entry = (runtime_priority_key, next(self.priority_sequence), request_id)
         async with condition:
             queue_depth = len(self.priority_waiters[dp_rank])
+            capacity_full = self.priority_inflight[dp_rank] >= capacity
+            should_coalesce = self.priority_coalesce_seconds > 0 and (
+                queue_depth > 0 or capacity_full
+            )
             if queue_depth == 0:
                 self.priority_batch_deadline[dp_rank] = (
-                    asyncio.get_running_loop().time() + self.priority_coalesce_seconds
+                    asyncio.get_running_loop().time()
+                    + (
+                        self.priority_coalesce_seconds
+                        if should_coalesce
+                        else 0.0
+                    )
                 )
             was_queued = (
                 queue_depth > 0
-                or self.priority_inflight[dp_rank] >= capacity
+                or capacity_full
             )
-            was_coalesced = self.priority_coalesce_seconds > 0
+            was_coalesced = should_coalesce
             heapq.heappush(self.priority_waiters[dp_rank], entry)
             try:
                 while True:

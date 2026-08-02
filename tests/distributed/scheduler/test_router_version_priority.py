@@ -400,7 +400,10 @@ def test_exact_rebuild_cohort_rejects_uninvested_trajectory_in_same_group():
         )
 
         assert uninvested_assignment is None
-        assert invested_assignment is not None
+        # The exact candidate consumes the rebuild budget, but a singleton
+        # cluster deliberately falls back to normal affinity because it has no
+        # follower that could reuse the reconstructed prefix.
+        assert invested_assignment is None
         assert router.rebuild_remaining == 0
 
     asyncio.run(run_test())
@@ -483,6 +486,11 @@ def test_priority_coalesce_compares_arrivals_before_dispatch():
         )
         await router.initialize()
 
+        running = await router._acquire_priority_slot(
+            0, priority=5, request_id="running"
+        )
+        assert running[0] is True
+
         newer = asyncio.create_task(
             router._acquire_priority_slot(0, priority=3, request_id="newer")
         )
@@ -490,6 +498,11 @@ def test_priority_coalesce_compares_arrivals_before_dispatch():
         older = asyncio.create_task(
             router._acquire_priority_slot(0, priority=1, request_id="older")
         )
+        await asyncio.sleep(0)
+        assert not newer.done()
+        assert not older.done()
+
+        await router._release_priority_slot(0)
         done, _ = await asyncio.wait(
             {newer, older}, return_when=asyncio.FIRST_COMPLETED
         )
@@ -504,6 +517,85 @@ def test_priority_coalesce_compares_arrivals_before_dispatch():
         newer_result = await newer
         assert newer_result[3] is True
         await router._release_priority_slot(0)
+
+    asyncio.run(run_test())
+
+
+def test_priority_coalesce_is_work_conserving_when_capacity_is_available():
+    async def run_test():
+        router = EnvAffinityRouter(
+            RouterManagerStub(),
+            [object()],
+            None,
+            SimpleNamespace(
+                max_running_requests=8,
+                router_config={
+                    "priority_max_running_requests": 1,
+                    "priority_coalesce_seconds": 10.0,
+                },
+            ),
+        )
+        await router.initialize()
+
+        result = await asyncio.wait_for(
+            router._acquire_priority_slot(
+                0, priority=1, request_id="uncontended"
+            ),
+            timeout=0.1,
+        )
+
+        assert result == (True, 0, False, False, False)
+        await router._release_priority_slot(0)
+
+    asyncio.run(run_test())
+
+
+def test_rebuild_is_bypassed_below_worker_execution_window():
+    async def run_test():
+        router = EnvAffinityRouter(
+            RouterManagerStub(),
+            [object(), object()],
+            None,
+            SimpleNamespace(
+                max_running_requests=8,
+                router_config={
+                    "post_update_rebuild_enabled": True,
+                    "post_update_rebuild_requests": 4,
+                    "post_update_rebuild_min_outstanding_per_worker": 4,
+                },
+            ),
+        )
+        await router.initialize()
+
+        router.on_version_resume(
+            {
+                "version": 3,
+                "revision": 0,
+                "worker_count": 2,
+                "outstanding_trajectories": 7,
+                "rebuild_candidate_trajectories": ["a", "b"],
+                "rebuild_cohort_exact": True,
+                "rebuild_target_trajectories": 2,
+            }
+        )
+        assert router.rebuild_load_eligible is False
+        assert router.rebuild_target == 0
+        assert router.rebuild_remaining == 0
+
+        router.on_version_resume(
+            {
+                "version": 4,
+                "revision": 0,
+                "worker_count": 2,
+                "outstanding_trajectories": 8,
+                "rebuild_candidate_trajectories": ["a", "b"],
+                "rebuild_cohort_exact": True,
+                "rebuild_target_trajectories": 2,
+            }
+        )
+        assert router.rebuild_load_eligible is True
+        assert router.rebuild_target == 2
+        assert router.rebuild_remaining == 2
 
     asyncio.run(run_test())
 
@@ -615,7 +707,7 @@ def test_boundary_profile_proves_engine_cobatching_per_worker():
     asyncio.run(run_test())
 
 
-def test_rebuild_wave_coalesces_and_places_first_epoch_requests_together():
+def test_rebuild_wave_preserves_affinity_when_no_reuse_is_possible():
     async def run_test():
         router = EnvAffinityRouter(
             RouterManagerStub(),
@@ -648,7 +740,90 @@ def test_rebuild_wave_coalesces_and_places_first_epoch_requests_together():
         )
 
         assert first[0] is True and second[0] is True
-        assert first[1][2] == 2 and second[1][2] == 2
-        assert {first[1][0], second[1][0]} == {0, 1}
+        assert first[1] is None and second[1] is None
+
+    asyncio.run(run_test())
+
+
+def test_version_resume_preserves_placement_as_rebuild_fallback():
+    async def run_test():
+        router = EnvAffinityRouter(
+            RouterManagerStub(),
+            [object(), object()],
+            None,
+            SimpleNamespace(
+                max_running_requests=8,
+                router_config={"post_update_rebuild_enabled": True},
+            ),
+        )
+        await router.initialize()
+        router.src_rank2_dp_rank["trajectory-a"] = 1
+        router.src_rank_cache_epoch["trajectory-a"] = 0
+
+        router.on_version_resume({"version": 4})
+
+        assert router.src_rank2_dp_rank["trajectory-a"] == 1
+        assert router.src_rank_cache_epoch["trajectory-a"] == 0
+
+    asyncio.run(run_test())
+
+
+def test_rebuild_follower_waits_until_same_prefix_seed_is_ready():
+    async def run_test():
+        router = EnvAffinityRouter(
+            RouterManagerStub(),
+            [object(), object()],
+            None,
+            SimpleNamespace(
+                max_running_requests=8,
+                router_config={
+                    "post_update_rebuild_enabled": True,
+                    "post_update_rebuild_requests": 3,
+                    "post_update_rebuild_coalesce_seconds": 0.01,
+                    "post_update_rebuild_seed_slots_per_worker": 1,
+                },
+            ),
+        )
+        await router.initialize()
+        router.on_version_resume(
+            {
+                "version": 4,
+                "rebuild_candidate_groups": ["1:1", "2:2", "3:3"],
+                "rebuild_target_trajectories": 3,
+            }
+        )
+        states = [
+            TrajectoryRuntimeState("a", 3, 4, 1, 5, 10, 1, 1),
+            TrajectoryRuntimeState("b", 3, 4, 1, 4, 10, 2, 2),
+            TrajectoryRuntimeState("c", 3, 4, 1, 3, 10, 3, 3),
+        ]
+        prompt = list(range(256))
+        tasks = [
+            asyncio.create_task(
+                router._prepare_first_epoch_request(state, state.trajectory_id, prompt)
+            )
+            for state in states
+        ]
+        await asyncio.sleep(0.03)
+
+        completed = [task for task in tasks if task.done()]
+        waiting = [task for task in tasks if not task.done()]
+        assert len(completed) == 2
+        assert len(waiting) == 1
+        seed_assignment = completed[0].result()[1]
+        assert seed_assignment[4] == "seed"
+
+        await router._complete_rebuild_seed(
+            cache_epoch=seed_assignment[5],
+            cluster_key=seed_assignment[3],
+            dp_rank=seed_assignment[0],
+            prompt_tokens=prompt,
+            success=True,
+        )
+        follower_assignment = (await waiting[0])[1]
+
+        assert follower_assignment[4] == "follower"
+        assert follower_assignment[0] == seed_assignment[0]
+        assert follower_assignment[1] == 256
 
     asyncio.run(run_test())

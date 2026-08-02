@@ -874,6 +874,43 @@ def test_tensor_progress_recovers_completed_rollout_without_metadata():
     }
 
 
+def test_group_queue_rejects_zero_response_rollout_before_learner_pool():
+    class ProgressBar:
+        def update(self, count):
+            pass
+
+    class NeverFilter:
+        def filter(self, **kwargs):
+            return False
+
+    queue = GroupQueue(
+        group_id=0,
+        progress_bar=ProgressBar(),
+        group_size=1,
+        group_size_redundancy=0,
+        max_traj_per_env=1,
+        async_generation_ratio=0,
+        staleness_tolerance=2,
+        group_filter=NeverFilter(),
+        scheduling_policy="fifo",
+        fixed_step_admission=False,
+    )
+    queue.advance_group(create_step=0)
+    placeholder = DataProto.from_single_dict(
+        {
+            "response_mask": torch.zeros((1, 4), dtype=torch.long),
+            "attention_mask": torch.ones((1, 4), dtype=torch.long),
+            "env_ids": np.array([0], dtype=object),
+            "traj_id": np.array(["reset-only"], dtype=object),
+        }
+    )
+
+    assert queue.put(0, 0, placeholder) is False
+    assert 0 not in queue.groups
+    assert queue.invalid_trainable_group_count == 1
+    assert queue.discard_records[0]["discard_reason"] == "invalid_zero_response"
+
+
 def test_consumed_metrics_preserve_version_age_and_progress_distribution():
     records = [
         {
@@ -1277,6 +1314,65 @@ def test_learner_unit_becomes_ready_only_when_its_group_is_complete(group_size):
     unit = queue.pop_completed_group(0)
     assert unit is not None
     assert len(unit.rollouts) == group_size
+
+
+def test_group_queue_does_not_admit_new_work_after_stop():
+    class ProgressBar:
+        def update(self, count):
+            pass
+
+    class GroupFilter:
+        def filter(self, **kwargs):
+            return False
+
+    queue = GroupQueue(
+        group_id=0,
+        progress_bar=ProgressBar(),
+        group_size=1,
+        group_size_redundancy=0,
+        max_traj_per_env=1,
+        async_generation_ratio=0,
+        staleness_tolerance=2,
+        group_filter=GroupFilter(),
+        scheduling_policy="fifo",
+        fixed_step_admission=True,
+    )
+    queue.advance_group(create_step=0)
+    queue.stop_admission()
+
+    assert queue.advance_group(create_step=1) is False
+    assert list(queue.groups) == [0]
+    assert queue.next_episode_id == 1
+
+
+def test_shutdown_records_include_completed_unconsumed_pool():
+    manager_cls = GroupQueueManager.__ray_metadata__.modified_class
+    manager = manager_cls.__new__(manager_cls)
+    buffered_group = type(
+        "Group",
+        (),
+        {"group_id": 0, "episode_id": 1, "rollouts": ["buffered"]},
+    )()
+    completed_group = type(
+        "Group",
+        (),
+        {"group_id": 0, "episode_id": 2, "rollouts": ["completed"]},
+    )()
+    queue = type("Queue", (), {"groups": {1: buffered_group}})()
+    manager.group_queue = {0: queue}
+    manager.completed_pool = CompletedLearnerUnitPool()
+    manager.completed_pool.put(completed_group)
+    manager._completed_rollout_record = lambda rollout, group: {
+        "trajectory_id": rollout,
+        "episode_id": group.episode_id,
+    }
+
+    records = manager._collect_shutdown_buffered_records()
+
+    assert records == [
+        {"trajectory_id": "buffered", "episode_id": 1},
+        {"trajectory_id": "completed", "episode_id": 2},
+    ]
 
 
 def test_get_batch_drains_global_completed_pool_until_batch_is_full():

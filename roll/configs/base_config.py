@@ -677,7 +677,21 @@ class PPOConfig(BaseConfig):
     )
     dynamic_admission_reserve_additive_step: int = field(
         default=2,
-        metadata={"help": "Additive reserve increase when the learner waits for rollout data."},
+        metadata={
+            "help": (
+                "Additive reserve step in learner trajectories. A non-positive "
+                "value enables a batch-proportional automatic step."
+            )
+        },
+    )
+    dynamic_admission_reserve_auto_step_fraction: float = field(
+        default=0.25,
+        metadata={
+            "help": (
+                "Fraction of rollout_batch_size used as the reserve and "
+                "reconciliation step when additive_step is non-positive."
+            )
+        },
     )
     dynamic_admission_reserve_multiplicative_decay: float = field(
         default=0.5,
@@ -705,6 +719,15 @@ class PPOConfig(BaseConfig):
         default=0.20,
         metadata={
             "help": "vLLM queue-time fraction above which admission defers to request scheduling."
+        },
+    )
+    dynamic_admission_queue_idle_fraction: float = field(
+        default=0.001,
+        metadata={
+            "help": (
+                "vLLM queue-time fraction below which the inference engine is "
+                "treated as effectively idle for starvation-driven fast expansion."
+            )
         },
     )
     dynamic_admission_tool_wait_high_fraction: float = field(

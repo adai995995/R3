@@ -380,13 +380,16 @@ def update_latency_hill_climb(
     improvement_margin: float,
     starvation_high: float,
     waste_high: float,
+    queue_idle: float,
     queue_high: float,
 ) -> Tuple[int, int, int]:
     """Probe the in-flight operating point using learner-step latency.
 
-    Waste and queue pressure are secondary signals. They reverse an
-    under-supplied controller only when adding work is already producing
-    overload, or break a latency deadband in favor of less outstanding work.
+    End-to-end update latency is the primary signal once inference contention
+    exists.  Before that point, measured learner starvation with an effectively
+    idle inference queue expands supply directly because there is no queueing
+    tradeoff for the latency probe to resolve.  Waste only breaks a latency
+    deadband in the contended regime.
     """
     reserve_min = max(0, int(reserve_min))
     reserve_max = max(reserve_min, int(reserve_max))
@@ -406,15 +409,19 @@ def update_latency_hill_climb(
         or queue > max(0.0, float(queue_high))
     )
 
+    starvation_without_queue = (
+        starvation > max(0.0, float(starvation_high))
+        and queue <= max(0.0, float(queue_idle))
+    )
+
     if interval <= 0:
         return reserve, direction, 20  # no complete latency observation
-    if starvation > max(0.0, float(starvation_high)):
-        if overloaded:
-            direction = -1
-            reason = 17  # waiting while overloaded: back off
-        else:
-            direction = 1
-            reason = 16  # rollout under-supply: expand
+    if starvation_without_queue:
+        # An empty inference queue means there is no contention to trade off.
+        # Grow immediately instead of interpreting trajectory-length noise as
+        # evidence that the learner should remain starved.
+        direction = 1
+        reason = 16
     elif previous is None or previous <= 0:
         direction = 1
         reason = 13  # establish a baseline and probe upward
@@ -426,6 +433,12 @@ def update_latency_hill_climb(
             reason = 15  # update latency regressed: reverse
         elif relative_change < -margin:
             reason = 14  # update latency improved: continue
+        elif (
+            starvation > max(0.0, float(starvation_high))
+            and queue <= max(0.0, float(queue_high))
+        ):
+            direction = 1
+            reason = 16  # latency tie while rollout under-supplied: expand
         elif overloaded:
             direction = -1
             reason = 18  # equal latency: prefer the cheaper point
@@ -478,6 +491,49 @@ def compute_admission_operating_target(
         max(0, int(max_outstanding_trajectories)),
         target_groups * physical_width,
     )
+
+
+def compute_admission_control_step(
+    learner_demand: int,
+    group_size: int,
+    configured_step: int,
+    auto_fraction: float,
+) -> int:
+    """Return a learner-unit-aligned admission-control quantum.
+
+    A literal one-trajectory step reacts far too slowly once learner batches
+    contain tens of trajectories. A non-positive configured step selects an
+    automatic quantum proportional to the learner batch while preserving the
+    algorithm's indivisible rollout-group unit.
+    """
+    trainable_width = max(1, int(group_size))
+    configured = int(configured_step)
+    if configured > 0:
+        raw_step = configured
+    else:
+        fraction = min(1.0, max(0.0, float(auto_fraction)))
+        raw_step = max(
+            trainable_width,
+            math.ceil(max(0, int(learner_demand)) * fraction),
+        )
+    return math.ceil(raw_step / trainable_width) * trainable_width
+
+
+def compute_admission_search_step(
+    group_size: int,
+    configured_step: int,
+) -> int:
+    """Return the fine-grained step used after inference contention appears.
+
+    Automatic control uses a batch-scaled quantum to leave an underloaded
+    regime quickly, but that quantum is too coarse for searching near a busy
+    operating point.  Congested search therefore moves one indivisible
+    rollout group unless the user explicitly configured a larger step.
+    """
+    trainable_width = max(1, int(group_size))
+    configured = int(configured_step)
+    raw_step = configured if configured > 0 else trainable_width
+    return math.ceil(raw_step / trainable_width) * trainable_width
 
 
 FINISH_RATE_AGE_BUCKETS = ("age_0", "age_1", "age_2", "age_3", "age_ge_4")
@@ -2697,6 +2753,7 @@ class GroupQueue:
         self.group_filter_response_tokens = 0.0
         self.group_filter_inference_tokens = 0.0
         self.group_filter_env_seconds = 0.0
+        self.invalid_trainable_group_count = 0
         self.version_priority_ready_bypass_total = 0
         self.env_monitor = env_monitor
 
@@ -2923,6 +2980,31 @@ class GroupQueue:
             "inference_tokens": prompt_tokens + response_tokens,
             "current_context_tokens": current_context_tokens,
         }
+
+    @staticmethod
+    def _has_trainable_response(rollout: Any) -> bool:
+        """Reject reset-only placeholders that cannot produce a policy gradient."""
+        if rollout is None:
+            return False
+        meta_info = getattr(rollout, "meta_info", None)
+        if isinstance(meta_info, dict) and bool(
+            meta_info.get("invalid_training_sample", False)
+        ):
+            return False
+        batch = getattr(rollout, "batch", None)
+        if batch is None:
+            # Keep compatibility with light-weight test and user-defined payloads.
+            return True
+        try:
+            response_mask = batch.get("response_mask")
+        except (AttributeError, TypeError):
+            response_mask = None
+        if response_mask is None:
+            return True
+        try:
+            return bool((response_mask > 0).any().item())
+        except (AttributeError, TypeError, RuntimeError):
+            return bool(response_mask)
 
     def record_discarded_rollout(
         self,
@@ -3277,12 +3359,15 @@ class GroupQueue:
         self.group_filter_response_tokens = 0.0
         self.group_filter_inference_tokens = 0.0
         self.group_filter_env_seconds = 0.0
+        self.invalid_trainable_group_count = 0
 
     def advance_group(self, create_step):
-        assert not self.quit
+        if self.quit:
+            return False
         self.groups[self.next_episode_id] = GroupData(
             group_id=self.group_id, episode_id=self.next_episode_id, create_step=create_step)
         self.next_episode_id += 1
+        return True
 
     def _ordered_groups(self):
         if self.scheduling_policy == "version_priority":
@@ -3689,6 +3774,30 @@ class GroupQueue:
                 logger.info(f"GroupQueue: group {self.group_id} exit")
                 self.complete.set()
                 return False
+            elif any(
+                not self._has_trainable_response(item)
+                for item in group.rollouts[: self.group_size]
+            ):
+                logger.warning(
+                    "Discard non-trainable rollout group %s episode %s: "
+                    "no generated response tokens",
+                    group.group_id,
+                    group.episode_id,
+                )
+                self.invalid_trainable_group_count += 1
+                self.group_filter_count += 1
+                self.record_filtered_group(group)
+                self.record_discarded_group(
+                    group,
+                    "invalid_zero_response",
+                    self.current_step,
+                )
+                self.groups.pop(episode_id)
+                if self.env_monitor:
+                    self.env_monitor.cleanup_episode(self.group_id, episode_id)
+                if self.fixed_step_admission:
+                    self.advance_group(create_step=self.current_step)
+                return False
             elif self.group_filter.filter(group_id=self.group_id, episode_id=episode_id, group=group.rollouts):
                 logger.info(f"filter rollout group {group.group_id} episode {group.episode_id}")
                 self.group_filter_count += 1
@@ -3889,6 +3998,13 @@ class GroupQueueManager:
         self.dynamic_reserve_additive_step = int(
             getattr(config, "dynamic_admission_reserve_additive_step", 2)
         )
+        self.dynamic_reserve_auto_step_fraction = float(
+            getattr(
+                config,
+                "dynamic_admission_reserve_auto_step_fraction",
+                0.25,
+            )
+        )
         self.dynamic_reserve_decay = float(
             getattr(config, "dynamic_admission_reserve_multiplicative_decay", 0.5)
         )
@@ -3906,6 +4022,9 @@ class GroupQueueManager:
         )
         self.dynamic_queue_high = float(
             getattr(config, "dynamic_admission_queue_high_fraction", 0.20)
+        )
+        self.dynamic_queue_idle = float(
+            getattr(config, "dynamic_admission_queue_idle_fraction", 0.001)
         )
         self.dynamic_tool_wait_high = float(
             getattr(config, "dynamic_admission_tool_wait_high_fraction", 0.50)
@@ -4828,6 +4947,58 @@ class GroupQueueManager:
             self.dynamic_reserve_hold_total += 1
             return
 
+        aligned_step = compute_admission_control_step(
+            self.rollout_batch_size,
+            self.group_size,
+            self.dynamic_reserve_additive_step,
+            self.dynamic_reserve_auto_step_fraction,
+        )
+        starvation_without_queue = (
+            latest.starvation_fraction > self.dynamic_starvation_high
+            and latest.queue_pressure <= self.dynamic_queue_idle
+        )
+        if starvation_without_queue:
+            updated, direction, reason = update_latency_hill_climb(
+                previous_reserve,
+                self.dynamic_latency_direction,
+                latest.policy_update_interval_seconds,
+                self.dynamic_latency_previous_window,
+                latest.starvation_fraction,
+                latest.waste_fraction,
+                latest.queue_pressure,
+                reserve_min=self.dynamic_reserve_min,
+                reserve_max=self.dynamic_reserve_max,
+                additive_step=aligned_step,
+                improvement_margin=self.dynamic_utility_improvement_margin,
+                starvation_high=self.dynamic_starvation_high,
+                waste_high=self.dynamic_reserve_stale_high,
+                queue_idle=self.dynamic_queue_idle,
+                queue_high=self.dynamic_queue_high,
+            )
+            self.dynamic_latency_previous_window = (
+                latest.policy_update_interval_seconds
+            )
+            self.dynamic_latency_last_window = (
+                latest.policy_update_interval_seconds
+            )
+            self.dynamic_latency_window_sum = 0.0
+            self.dynamic_latency_window_count = 0
+            self.dynamic_latency_direction = direction
+            self.dynamic_reserve_update_reason = reason
+            if shadow_mode:
+                self.dynamic_shadow_reserve = updated
+                self.dynamic_shadow_update_reason = reason
+                self.dynamic_reserve_hold_total += 1
+                return
+            self.adaptive_reserve = updated
+            if updated > previous_reserve:
+                self.dynamic_reserve_increase_total += 1
+            elif updated < previous_reserve:
+                self.dynamic_reserve_decrease_total += 1
+            else:
+                self.dynamic_reserve_hold_total += 1
+            return
+
         self.dynamic_latency_window_sum += (
             latest.policy_update_interval_seconds
         )
@@ -4842,10 +5013,9 @@ class GroupQueueManager:
             self.dynamic_latency_window_sum
             / self.dynamic_latency_window_count
         )
-        group_step = max(1, self.group_size)
-        configured_step = max(1, self.dynamic_reserve_additive_step)
-        aligned_step = (
-            math.ceil(configured_step / group_step) * group_step
+        search_step = compute_admission_search_step(
+            self.group_size,
+            self.dynamic_reserve_additive_step,
         )
         updated, direction, reason = update_latency_hill_climb(
             previous_reserve,
@@ -4857,10 +5027,11 @@ class GroupQueueManager:
             latest.queue_pressure,
             reserve_min=self.dynamic_reserve_min,
             reserve_max=self.dynamic_reserve_max,
-            additive_step=aligned_step,
+            additive_step=search_step,
             improvement_margin=self.dynamic_utility_improvement_margin,
             starvation_high=self.dynamic_starvation_high,
             waste_high=self.dynamic_reserve_stale_high,
+            queue_idle=self.dynamic_queue_idle,
             queue_high=self.dynamic_queue_high,
         )
         self.dynamic_latency_previous_window = current_interval
@@ -5395,6 +5566,18 @@ class GroupQueueManager:
             and measured_missing > 0
         ):
             self.version_progress_topup_supply_sufficient_total += 1
+        max_topup_groups = 1
+        if self.dynamic_reserve_enabled:
+            control_step = compute_admission_control_step(
+                self.rollout_batch_size,
+                self.group_size,
+                self.dynamic_reserve_additive_step,
+                self.dynamic_reserve_auto_step_fraction,
+            )
+            max_topup_groups = max(
+                1,
+                math.ceil(control_step / max(1, self.group_size)),
+            )
         revised_plan = self.version_runtime_controller.decide(
             state,
             active_plan=self.version_runtime_plan,
@@ -5408,7 +5591,7 @@ class GroupQueueManager:
             max_revisions_per_version=(
                 self.version_runtime_max_revisions_per_version
             ),
-            max_admission_groups=1,
+            max_admission_groups=max_topup_groups,
         )
         if revised_plan is None:
             return None
@@ -6573,6 +6756,7 @@ class GroupQueueManager:
             "scheduler/group_filter_response_tokens": 0.0,
             "scheduler/group_filter_inference_tokens": 0.0,
             "scheduler/group_filter_env_seconds": 0.0,
+            "scheduler/invalid_trainable_groups": 0,
         }
         for bucket in FINISH_RATE_BUCKET_KEYS:
             filter_metrics[f"scheduler/finish_ratio/{bucket}"] = self.bucketed_finish_ratios.get(
@@ -6600,6 +6784,9 @@ class GroupQueueManager:
             filter_metrics["scheduler/group_filter_response_tokens"] += group_queue.group_filter_response_tokens
             filter_metrics["scheduler/group_filter_inference_tokens"] += group_queue.group_filter_inference_tokens
             filter_metrics["scheduler/group_filter_env_seconds"] += group_queue.group_filter_env_seconds
+            filter_metrics["scheduler/invalid_trainable_groups"] += (
+                group_queue.invalid_trainable_group_count
+            )
             group_queue.reset_filter_metrics()
         for age in range(4):
             filter_metrics[f"scheduler/outstanding_version_age_{age}"] = outstanding["age_counts"].get(age, 0)
@@ -7109,13 +7296,21 @@ class GroupQueueManager:
 
         return result, duplicates_removed
 
-    def collect_shutdown_waste(self, inflight_records: List[Dict[str, Any]]):
+    def _collect_shutdown_buffered_records(self) -> List[Dict[str, Any]]:
         records = []
         for group_queue in self.group_queue.values():
             for group in group_queue.groups.values():
                 for rollout in group.rollouts:
                     if rollout is not None:
                         records.append(self._completed_rollout_record(rollout, group))
+        for group in self.completed_pool.snapshot():
+            for rollout in group.rollouts:
+                if rollout is not None:
+                    records.append(self._completed_rollout_record(rollout, group))
+        return records
+
+    def collect_shutdown_waste(self, inflight_records: List[Dict[str, Any]]):
+        records = self._collect_shutdown_buffered_records()
         records.extend(record for record in inflight_records if record is not None)
         records, duplicate_records_removed = self._deduplicate_shutdown_records(records)
         for record in records:

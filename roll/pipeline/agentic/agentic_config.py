@@ -384,8 +384,11 @@ class AgenticConfig(PPOConfig):
                 assert self.dynamic_admission_reserve_max >= self.dynamic_admission_reserve_min, (
                     "dynamic_admission_reserve_max must be >= dynamic_admission_reserve_min"
                 )
-                assert self.dynamic_admission_reserve_additive_step > 0, (
-                    "dynamic_admission_reserve_additive_step must be positive"
+                assert self.dynamic_admission_reserve_additive_step >= 0, (
+                    "dynamic_admission_reserve_additive_step must be non-negative"
+                )
+                assert 0 < self.dynamic_admission_reserve_auto_step_fraction <= 1, (
+                    "dynamic_admission_reserve_auto_step_fraction must be in (0, 1]"
                 )
                 assert 0 < self.dynamic_admission_reserve_multiplicative_decay < 1, (
                     "dynamic_admission_reserve_multiplicative_decay must be in (0, 1)"
@@ -404,6 +407,16 @@ class AgenticConfig(PPOConfig):
                 )
                 assert 0 <= self.dynamic_admission_queue_high_fraction <= 1, (
                     "dynamic_admission_queue_high_fraction must be in [0, 1]"
+                )
+                assert 0 <= self.dynamic_admission_queue_idle_fraction <= 1, (
+                    "dynamic_admission_queue_idle_fraction must be in [0, 1]"
+                )
+                assert (
+                    self.dynamic_admission_queue_idle_fraction
+                    <= self.dynamic_admission_queue_high_fraction
+                ), (
+                    "dynamic_admission_queue_idle_fraction must be <= "
+                    "dynamic_admission_queue_high_fraction"
                 )
                 assert 0 <= self.dynamic_admission_tool_wait_high_fraction <= 1, (
                     "dynamic_admission_tool_wait_high_fraction must be in [0, 1]"
