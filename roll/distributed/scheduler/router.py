@@ -2912,6 +2912,25 @@ class EnvAffinityRouter(Router):
             else 0.0
         )
         totals["workers"] = [dict(worker) for worker in self.worker_engine_kv_feedback]
+        running_by_worker = [
+            len(requests) for requests in self.running_requests
+        ]
+        queued_by_worker = [
+            len(waiters) for waiters in self.priority_waiters
+        ]
+        totals.update(
+            worker_count=len(self.workers),
+            busy_workers=sum(
+                int(running > 0 or queued > 0)
+                for running, queued in zip(
+                    running_by_worker, queued_by_worker
+                )
+            ),
+            running_requests=sum(running_by_worker),
+            queued_requests=sum(queued_by_worker),
+            running_requests_by_worker=running_by_worker,
+            queued_requests_by_worker=queued_by_worker,
+        )
         return totals
 
     async def _acquire_priority_slot(

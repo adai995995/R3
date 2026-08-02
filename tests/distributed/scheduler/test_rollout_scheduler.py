@@ -16,6 +16,7 @@ from roll.distributed.scheduler.rollout_scheduler import (
     compute_stale_control_signal,
     finish_rate_bucket,
     consume_utility_settle,
+    CompletedLearnerUnitPool,
     GroupQueue,
     RolloutScheduler,
     GroupQueueManager,
@@ -25,6 +26,10 @@ from roll.distributed.scheduler.rollout_scheduler import (
     VersionRuntimeOutcome,
     compute_closed_loop_reserve,
     compute_state_feedback_reserve,
+    compute_reconcile_poll_interval,
+    compute_reconcile_wait_threshold,
+    compute_timely_ready_supply,
+    probability_lower_bound,
     runtime_finish_rate_bucket,
     compute_dynamic_reserve,
     update_utility_hill_climb,
@@ -313,21 +318,44 @@ def test_version_runtime_plan_unifies_admission_deadline_and_rebuild_cohort():
         ],
     )
 
-    assert plan.admission_budget == 4
-    assert plan.admission_budget_trainable == 4
-    assert plan.admission_reason == "supply_deficit"
+    assert plan.admission_budget == 0
+    assert plan.admission_budget_trainable == 0
+    assert plan.admission_operating_target == 6
+    assert plan.admission_reason == "operating_target"
     assert plan.admission_deficit == 3.5
     assert plan.priority_deadline_version == 9
     assert plan.priority_candidate_groups == ("1:5", "2:4", "3:9")
     assert plan.rebuild_candidate_groups == ("1:5", "2:4", "3:9")
     assert plan.rebuild_target_trajectories == 4
     assert plan.revision == 0
-    assert plan.admission_delta_trajectories == 4
+    assert plan.admission_delta_trajectories == 0
     assert plan.plan_id == "version-7-revision-0"
     assert plan.forecast_id == "version-7-estimator-0"
 
 
-def test_version_runtime_plan_uses_shared_completion_estimates_for_priority():
+def test_version_runtime_plan_reports_yield_without_inverse_gain():
+    plan = build_version_runtime_plan(
+        version=1,
+        learner_demand=4,
+        safety_reserve=0,
+        expected_existing_supply=0,
+        outstanding_trajectories=0,
+        max_outstanding_trajectories=8,
+        admission_width=1,
+        group_size=1,
+        staleness_tolerance=2,
+        invested_candidate_groups=[],
+        admission_yield_probability=0.5,
+    )
+
+    assert plan.admission_budget == 4
+    assert plan.admission_budget_trainable == 4
+    assert plan.admission_operating_target == 4
+    assert plan.admission_yield_probability == 0.5
+    assert plan.projected_new_supply == 2
+
+
+def test_version_runtime_plan_boosts_only_feasible_completion_candidates():
     plan = build_version_runtime_plan(
         version=4,
         learner_demand=2,
@@ -356,11 +384,12 @@ def test_version_runtime_plan_uses_shared_completion_estimates_for_priority():
         ],
     )
 
-    assert plan.priority_candidate_groups == ("1:1", "1:2", "1:3")
+    assert plan.priority_candidate_groups == ("1:1", "1:2")
     assert [
         estimate.group_key
         for estimate in plan.priority_candidate_estimates
-    ] == ["1:1", "1:2", "1:3"]
+    ] == ["1:1", "1:2"]
+    assert plan.rebuild_candidate_groups == ("1:1", "1:2")
 
 
 def test_runtime_estimator_attributes_forecast_and_updates_from_outcome():
@@ -398,6 +427,84 @@ def test_runtime_estimator_attributes_forecast_and_updates_from_outcome():
     assert next_forecast.predicted_inflight_slots == 3
     assert estimator.supply_error_ewma == -1
     assert estimator.supply_abs_error_ewma == 1
+
+
+def test_runtime_estimator_learns_admission_yield_at_version_boundaries():
+    estimator = RuntimeEstimator(
+        initial_finish_ratio=0.5,
+        ewma_alpha=0.5,
+        bucketed_finish_enabled=True,
+        bucket_min_samples=1,
+    )
+
+    assert estimator.safe_admission_yield() == 0.5
+    estimator.observe_admission_yield(
+        admitted_trainable_slots=8,
+        timely_valid_slots=4,
+    )
+    assert estimator.admission_yield_ratio == 0.5
+    assert estimator.admission_yield_sample_count == 8
+
+    estimator.observe_admission_yield(
+        admitted_trainable_slots=8,
+        timely_valid_slots=8,
+    )
+    assert estimator.admission_yield_ratio == 0.75
+    assert estimator.safe_admission_yield() == 0.75
+
+
+def test_safe_runtime_forecast_does_not_credit_unknown_supply():
+    estimator = RuntimeEstimator(
+        initial_finish_ratio=0.5,
+        ewma_alpha=1.0,
+        bucketed_finish_enabled=True,
+        bucket_min_samples=2,
+        safe_forecast_enabled=True,
+        forecast_confidence_z=1.0,
+    )
+    bucket = "age_1__actions_2_3__ready"
+
+    cold = estimator.build_forecast(
+        1,
+        ready_valid_slots=1,
+        salvageable_inflight=4,
+        unfinished_bucket_counts={bucket: 4},
+    )
+
+    assert cold.raw_predicted_inflight_slots == 2
+    assert cold.predicted_inflight_slots == 0
+    assert cold.expected_existing_supply == 1
+    assert cold.fallback_population == 4
+
+    estimator.observe_supply(
+        salvageable_inflight=4,
+        completed_inflight=3,
+        cohort_counts={bucket: 4},
+        completed_counts={bucket: 3},
+    )
+    learned = estimator.build_forecast(
+        2,
+        ready_valid_slots=0,
+        salvageable_inflight=4,
+        unfinished_bucket_counts={bucket: 4},
+    )
+
+    assert 0 < learned.predicted_inflight_slots < 3
+    assert learned.raw_predicted_inflight_slots == 3
+    assert learned.learned_population == 4
+
+
+def test_probability_lower_bound_converges_with_evidence():
+    assert probability_lower_bound(0.5, 0, 1.0) == 0
+    assert probability_lower_bound(0.75, 4, 1.0) < 0.75
+    assert probability_lower_bound(0.75, 400, 1.0) > 0.70
+
+
+def test_timely_ready_supply_respects_freshness_deadlines():
+    assert compute_timely_ready_supply({2: 9}, 4, 2) == 4
+    assert compute_timely_ready_supply({1: 9}, 4, 2) == 8
+    assert compute_timely_ready_supply({2: 4, 1: 4}, 4, 2) == 8
+    assert compute_timely_ready_supply({0: 20}, 4, 2) == 12
 
 
 def test_runtime_estimator_uses_readiness_bucket_with_coarse_fallback():
@@ -490,6 +597,10 @@ def test_version_runtime_outcome_exposes_signed_forecast_residual():
         consumed_valid_slots=4,
         learner_wait_seconds=3.0,
         next_batch_latency_seconds=3.0,
+        admitted_trainable_slots=8,
+        timely_admitted_valid_slots=4,
+        predicted_admission_yield=0.6,
+        projected_next_batch_supply=3.5,
         reprefill_tokens=800,
         prefill_tokens=1200,
         prefill_seconds=0.75,
@@ -502,6 +613,9 @@ def test_version_runtime_outcome_exposes_signed_forecast_residual():
     assert outcome.to_dict()["supply_prediction_error"] == -2.5
     assert outcome.to_dict()["reprefill_tokens"] == 800
     assert outcome.to_dict()["scheduling_wait_mean_seconds"] == 0.0625
+    assert outcome.to_dict()["observed_admission_yield"] == 0.5
+    assert outcome.to_dict()["predicted_admission_yield"] == 0.6
+    assert outcome.to_dict()["projected_next_batch_supply"] == 3.5
 
 
 def test_policy_update_trace_checks_activation_to_activation_decomposition():
@@ -616,6 +730,27 @@ def test_version_runtime_plan_keeps_priority_and_kv_when_admission_is_disabled()
     assert plan.admission_reason == "disabled"
     assert plan.priority_candidate_groups == ("2:3", "1:7")
     assert plan.rebuild_candidate_groups == ("2:3", "1:7")
+
+
+def test_version_runtime_plan_keeps_kv_reconstruction_when_priority_is_disabled():
+    plan = build_version_runtime_plan(
+        version=5,
+        learner_demand=4,
+        safety_reserve=0,
+        expected_existing_supply=1,
+        outstanding_trajectories=4,
+        max_outstanding_trajectories=8,
+        admission_width=1,
+        group_size=1,
+        staleness_tolerance=1,
+        invested_candidate_groups=[(2, 3, 1, 4, 1)],
+        priority_enabled=False,
+    )
+
+    assert plan.priority_candidate_groups == ()
+    assert plan.priority_candidate_estimates == ()
+    assert plan.rebuild_candidate_groups == ("2:3",)
+    assert plan.rebuild_target_trajectories == 1
 
 
 def test_version_runtime_plan_explains_outstanding_capacity_limit():
@@ -850,7 +985,16 @@ def test_state_feedback_reserve_distinguishes_supply_and_queue_pressure():
     ) == (3, 7)
     assert compute_state_feedback_reserve(
         3, 4, 0.30, 0.40, 0.05, 1, 0.20, **common
-    ) == (3, 8)
+    ) == (4, 11)
+    assert compute_state_feedback_reserve(
+        3, 4, 0.30, 0.40, 0.05, 4, 0.20, **common
+    ) == (4, 11)
+    assert compute_state_feedback_reserve(
+        3, 4, 0.30, 0.40, 0.30, 1, 0.20, **common
+    ) == (3, 7)
+    assert compute_state_feedback_reserve(
+        8, 4, 0.30, 0.40, 0.05, 0, 0.20, **{**common, "reserve_max": 32}
+    ) == (9, 11)
     assert compute_state_feedback_reserve(
         3, 4, 0.30, 0.05, 0.05, 1, 0.80, **common
     ) == (4, 9)
@@ -860,6 +1004,44 @@ def test_state_feedback_reserve_distinguishes_supply_and_queue_pressure():
     assert compute_state_feedback_reserve(
         3, 4, 0.01, 0.05, 0.30, 4, 0.20, **common
     ) == (2, 10)
+
+
+def test_reconcile_wait_threshold_tracks_state_feedback_target():
+    assert compute_reconcile_wait_threshold(10.0, None, 0.1) == 1.0
+    assert compute_reconcile_wait_threshold(
+        10.0, 12.0, 0.1
+    ) == pytest.approx(1.2)
+    assert compute_reconcile_wait_threshold(0.5, 12.0, 0.1) == 0.5
+    assert compute_reconcile_wait_threshold(10.0, 12.0, 0.0) == 10.0
+
+
+def test_reconcile_poll_interval_reacts_before_wait_deadline():
+    assert compute_reconcile_poll_interval(2.0, 1.0) == 0.5
+    assert compute_reconcile_poll_interval(0.2, 1.0) == 0.2
+    assert compute_reconcile_poll_interval(5.0, 10.0) == 1.0
+
+
+def test_runtime_summary_counts_running_inference_and_environment_service():
+    queue = GroupQueue.__new__(GroupQueue)
+    queue.group_size = 2
+    queue.progress_snapshots = {
+        (8, 0): {
+            "actions_completed": 3,
+            "remaining_actions": 4,
+            "runtime_phase": "policy_inference",
+        },
+        (8, 1): {
+            "actions_completed": 2,
+            "remaining_actions": 5,
+            "runtime_phase": "environment_model",
+        },
+    }
+    group = type("Group", (), {"episode_id": 8, "rollouts": []})()
+
+    summary = queue.trainable_runtime_summary(group)
+
+    assert summary["inference_ready"] == 1
+    assert summary["tool_waiting"] == 1
 
 
 def test_dynamic_reserve_trace_converges_into_deadband():
@@ -1047,6 +1229,7 @@ def test_version_adaptive_completion_is_attributed_before_learner_consumption():
     manager = manager_cls.__new__(manager_cls)
     manager.admission_policy = "version_adaptive"
     manager.group_size = 2
+    manager._tracked_admitted_groups = set()
     manager._tracked_unfinished_groups = {(3, 7)}
     manager._tracked_unfinished_group_buckets = {
         (3, 7): "age_1__actions_4_7",
@@ -1062,34 +1245,119 @@ def test_version_adaptive_completion_is_attributed_before_learner_consumption():
     }
 
 
-def test_pending_group_gets_backfill_missing_queues():
+@pytest.mark.parametrize("group_size", [1, 2])
+def test_learner_unit_becomes_ready_only_when_its_group_is_complete(group_size):
+    class ProgressBar:
+        def update(self, count):
+            pass
+
+    class GroupFilter:
+        def filter(self, **kwargs):
+            return False
+
+    queue = GroupQueue(
+        group_id=0,
+        progress_bar=ProgressBar(),
+        group_size=group_size,
+        group_size_redundancy=0,
+        max_traj_per_env=1,
+        async_generation_ratio=0,
+        staleness_tolerance=2,
+        group_filter=GroupFilter(),
+        scheduling_policy="fifo",
+        fixed_step_admission=False,
+    )
+    queue.advance_group(create_step=0)
+
+    for index in range(group_size - 1):
+        assert queue.put(0, 0, object()) is False
+        assert queue.pop_completed_group(0) is None
+
+    assert queue.put(0, 0, object()) is True
+    unit = queue.pop_completed_group(0)
+    assert unit is not None
+    assert len(unit.rollouts) == group_size
+
+
+def test_get_batch_drains_global_completed_pool_until_batch_is_full():
     async def run_test():
         manager_cls = GroupQueueManager.__ray_metadata__.modified_class
         manager = manager_cls.__new__(manager_cls)
+        manager.mode = "train"
+        manager.group_size = 1
+        manager.scheduling_policy = "fifo"
+        manager.admission_policy = "fixed_per_step"
+        manager.staleness_tolerance = 2
         manager.rollout_complete = {}
+        manager.completed_pool = CompletedLearnerUnitPool()
+        manager.current_batch_missing = 0
+        manager.total = 2
+        manager.consumed_records = []
+        manager.new_consumed_records = []
+        manager._record_version_adaptive_consumption = lambda group, count: None
+        manager._completed_rollout_record = lambda rollout, group: {}
+        manager._refill_to_watermark = lambda current_step: 0
 
-        gate = asyncio.Event()
+        class FakeQueue:
+            def record_discarded_group(self, *args):
+                pass
 
-        class BlockingQueue:
-            async def get(self):
-                await gate.wait()
+            def record_discarded_rollout(self, *args):
+                pass
 
-        manager.group_queue = {0: BlockingQueue(), 14: BlockingQueue()}
-        existing = asyncio.create_task(
-            manager.group_queue[14].get(), name="14"
+        def make_group(episode_id):
+            rollout = type(
+                "Rollout", (), {"meta_info": {}, "episode_id": episode_id}
+            )()
+            return type(
+                "Group",
+                (),
+                {
+                    "group_id": 0,
+                    "episode_id": episode_id,
+                    "create_step": 0,
+                    "rollouts": [rollout],
+                },
+            )()
+
+        manager.group_queue = {0: FakeQueue(), 1: FakeQueue()}
+        manager.completed_pool.put(make_group(0))
+        manager.completed_pool.put(make_group(1))
+
+        batch = await asyncio.wait_for(
+            manager.get_batch(batch_size=2, current_step=0), timeout=0.5
         )
-        manager.pending_gets = {existing}
 
-        pending = manager._take_pending_group_gets()
-
-        assert {task.get_name() for task in pending} == {"0", "14"}
-        assert manager.pending_gets == set()
-
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        assert len(batch) == 2
+        assert [rollout.episode_id for rollout in batch] == [0, 1]
 
     asyncio.run(run_test())
+
+
+def test_completed_pool_evicts_stale_units_but_preserves_fresh_and_shutdown_units():
+    pool = CompletedLearnerUnitPool()
+
+    def make_group(episode_id, create_step, rollouts):
+        return type(
+            "Group",
+            (),
+            {
+                "group_id": 0,
+                "episode_id": episode_id,
+                "create_step": create_step,
+                "rollouts": rollouts,
+            },
+        )()
+
+    stale = make_group(0, 0, [object()])
+    fresh = make_group(1, 2, [object()])
+    shutdown = make_group(2, 0, [None])
+    pool.put(stale)
+    pool.put(fresh)
+    pool.put(shutdown)
+
+    assert pool.pop_expired(current_version=3, staleness_tolerance=2) == [stale]
+    assert pool.snapshot() == [fresh, shutdown]
 
 
 def test_trainable_frontier_uses_group_size_order_statistic():

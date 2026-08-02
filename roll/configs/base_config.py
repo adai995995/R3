@@ -559,6 +559,16 @@ class PPOConfig(BaseConfig):
             )
         },
     )
+    fixed_step_admission_trajectories: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional global number of trajectories admitted at each learner step when "
+                "trajectory_admission_policy=step. None preserves the original per-environment "
+                "ROLL admission behavior."
+            )
+        },
+    )
     max_outstanding_trajectories: Optional[int] = field(
         default=None,
         metadata={
@@ -627,6 +637,30 @@ class PPOConfig(BaseConfig):
         default=4,
         metadata={
             "help": "Minimum trajectory observations before a bucket replaces the global finish EWMA."
+        },
+    )
+    adaptive_admission_safe_forecast_enabled: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use a confidence-discounted completion forecast for unfinished "
+                "trajectories instead of crediting uncertain supply at its mean."
+            )
+        },
+    )
+    adaptive_admission_forecast_confidence_z: float = field(
+        default=1.0,
+        metadata={
+            "help": "Confidence multiplier used by the safe unfinished-supply forecast."
+        },
+    )
+    adaptive_admission_bootstrap_reserve_groups: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Temporary extra learner groups admitted while the safe supply "
+                "estimator has no usable completion history."
+            )
         },
     )
     dynamic_admission_reserve_enabled: bool = field(
@@ -702,12 +736,26 @@ class PPOConfig(BaseConfig):
         default=2,
         metadata={"help": "Consecutive same-direction signals required before changing reserve."},
     )
+    dynamic_admission_reserve_downscale_patience: int = field(
+        default=3,
+        metadata={
+            "help": (
+                "Consecutive low-starvation overload signals required before reducing "
+                "reserve. This may exceed increase patience because learner latency is "
+                "the primary objective."
+            )
+        },
+    )
     dynamic_admission_reserve_cooldown_versions: int = field(
         default=2,
         metadata={"help": "Version boundaries held after each dynamic reserve change."},
     )
     dynamic_admission_reserve_controller: Literal[
-        "closed_loop_aimd", "state_feedback", "threshold_aimd", "utility_hill_climb"
+        "closed_loop_aimd",
+        "state_feedback",
+        "threshold_aimd",
+        "utility_hill_climb",
+        "latency_hill_climb",
     ] = field(
         default="closed_loop_aimd",
         metadata={
@@ -716,7 +764,8 @@ class PPOConfig(BaseConfig):
                 "closed_loop_aimd separates estimator residuals from measured "
                 "learner under-supply and expired-work overload. state_feedback "
                 "jointly considers starvation, expiration, vLLM queue pressure, "
-                "and pool readiness."
+                "and pool readiness. latency_hill_climb minimizes end-to-end "
+                "policy-update interval and uses waste only as a tie-breaker."
             )
         },
     )

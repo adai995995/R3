@@ -328,6 +328,13 @@ class AgenticConfig(PPOConfig):
             self.train_env_manager.max_traj_per_env = traj_per_env
         logger.info(f"train_env_manager.max_traj_per_env: {self.train_env_manager.max_traj_per_env}")
         assert self.train_env_manager.max_traj_per_env >= traj_per_env, f"max_traj_per_env must be >= {traj_per_env}"
+        if self.fixed_step_admission_trajectories is not None:
+            assert self.trajectory_admission_policy == "step", (
+                "fixed_step_admission_trajectories requires trajectory_admission_policy=step"
+            )
+            assert self.fixed_step_admission_trajectories > 0, (
+                "fixed_step_admission_trajectories must be positive"
+            )
         if self.trajectory_admission_policy in ("outstanding_watermark", "version_adaptive"):
             assert self.rollout_batch_size > 0, (
                 f"{self.trajectory_admission_policy} admission requires a finite positive "
@@ -363,6 +370,12 @@ class AgenticConfig(PPOConfig):
             )
             assert 0 < self.adaptive_admission_ewma_alpha <= 1, (
                 "adaptive_admission_ewma_alpha must be in (0, 1]"
+            )
+            assert self.adaptive_admission_forecast_confidence_z >= 0, (
+                "adaptive_admission_forecast_confidence_z must be non-negative"
+            )
+            assert self.adaptive_admission_bootstrap_reserve_groups >= 0, (
+                "adaptive_admission_bootstrap_reserve_groups must be non-negative"
             )
             if self.dynamic_admission_reserve_enabled:
                 assert self.dynamic_admission_reserve_min >= 0, (
@@ -403,6 +416,9 @@ class AgenticConfig(PPOConfig):
                 )
                 assert self.dynamic_admission_reserve_signal_patience > 0, (
                     "dynamic_admission_reserve_signal_patience must be positive"
+                )
+                assert self.dynamic_admission_reserve_downscale_patience > 0, (
+                    "dynamic_admission_reserve_downscale_patience must be positive"
                 )
                 assert self.dynamic_admission_reserve_cooldown_versions >= 0, (
                     "dynamic_admission_reserve_cooldown_versions must be non-negative"
