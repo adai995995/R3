@@ -301,6 +301,19 @@ class AgenticConfig(PPOConfig):
         if self.router_args is None:
             self.router_args = RouterArguments(router_name="EnvAffinityRouter", router_config=dict())
             self.router_args.max_running_requests = self.max_running_requests
+        if self.router_args.router_config is None:
+            self.router_args.router_config = {}
+        self.router_args.router_config.setdefault(
+            "control_plane_profiler_enabled",
+            self.control_plane_profiler_enabled,
+        )
+        self.router_args.router_config.setdefault(
+            "control_plane_profiler_max_samples",
+            self.control_plane_profiler_max_samples,
+        )
+        assert self.control_plane_profiler_max_samples > 0, (
+            "control_plane_profiler_max_samples must be positive"
+        )
 
         self.train_env_manager.name = "train_env"
         self.val_env_manager.name = "val_env"

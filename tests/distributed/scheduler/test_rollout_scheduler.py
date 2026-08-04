@@ -23,6 +23,7 @@ from roll.distributed.scheduler.rollout_scheduler import (
     RuntimeEstimator,
     RuntimeCandidateEstimate,
     PolicyUpdateTrace,
+    ControlPlaneTrace,
     VersionRuntimeOutcome,
     compute_closed_loop_reserve,
     compute_state_feedback_reserve,
@@ -40,6 +41,7 @@ from roll.distributed.scheduler.rollout_scheduler import (
     build_learner_wait_record,
     summarize_version_boundary_records,
     summarize_rollout_goodput,
+    summarize_control_plane_traces,
 )
 
 
@@ -177,11 +179,16 @@ def test_learner_wait_record_attributes_stale_work_to_the_batch_step():
         "consumed_generate_mean_seconds": 0.0,
         "consumed_generate_p95_seconds": 0.0,
         "consumed_generate_max_seconds": 0.0,
+        "consumed_router_control_seconds": 0.0,
+        "consumed_router_control_mean_seconds": 0.0,
+        "consumed_router_control_p95_seconds": 0.0,
+        "consumed_router_control_max_seconds": 0.0,
         "batch_closing_trajectory_id": "",
         "batch_closing_completion_unix": 0.0,
         "batch_closing_queue_seconds": 0.0,
         "batch_closing_tool_seconds": 0.0,
         "batch_closing_generate_seconds": 0.0,
+        "batch_closing_router_control_seconds": 0.0,
         "recorded_at_unix": 123.0,
     }
 
@@ -212,6 +219,7 @@ def test_learner_wait_record_identifies_batch_closing_trajectory():
                 "request_queue_seconds": 1.0,
                 "tool_wall_seconds": 2.0,
                 "generate_seconds": 3.0,
+                "router_control_path_seconds": 0.01,
             },
             {
                 "consumed_at_step": 3,
@@ -221,6 +229,7 @@ def test_learner_wait_record_identifies_batch_closing_trajectory():
                 "request_queue_seconds": 4.0,
                 "tool_wall_seconds": 5.0,
                 "generate_seconds": 6.0,
+                "router_control_path_seconds": 0.03,
             },
         ],
         discard_records=[],
@@ -233,6 +242,28 @@ def test_learner_wait_record_identifies_batch_closing_trajectory():
     assert record["batch_closing_queue_seconds"] == 4.0
     assert record["batch_closing_tool_seconds"] == 5.0
     assert record["batch_closing_generate_seconds"] == 6.0
+    assert record["consumed_router_control_seconds"] == 0.04
+    assert record["consumed_router_control_p95_seconds"] == 0.03
+    assert record["batch_closing_router_control_seconds"] == 0.03
+
+
+def test_control_plane_trace_aggregates_wall_cpu_and_payload_without_samples():
+    first = ControlPlaneTrace(version=1)
+    first.observe("advance_step_total", 0.02, 0.01, 128)
+    first.observe("advance_step_total", 0.03, 0.02, 64)
+    second = ControlPlaneTrace(version=2)
+    second.observe("advance_step_total", 0.04, 0.025, 256)
+
+    summary = summarize_control_plane_traces({1: first, 2: second})
+    component = summary["components"]["advance_step_total"]
+
+    assert summary["versions"] == 2
+    assert component["calls"] == 3
+    assert component["wall_seconds"] == pytest.approx(0.09)
+    assert component["cpu_seconds"] == pytest.approx(0.055)
+    assert component["mean_wall_seconds"] == pytest.approx(0.03)
+    assert component["max_wall_seconds"] == pytest.approx(0.04)
+    assert component["payload_bytes"] == 448
 from roll.distributed.executor.worker import Worker
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.agentic_pipeline import GroupFilter

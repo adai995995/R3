@@ -932,6 +932,11 @@ class PolicyUpdateTrace:
     batch_closing_queue_seconds: float = 0.0
     batch_closing_tool_seconds: float = 0.0
     batch_closing_generate_seconds: float = 0.0
+    consumed_router_control_seconds: float = 0.0
+    consumed_router_control_mean_seconds: float = 0.0
+    consumed_router_control_p95_seconds: float = 0.0
+    consumed_router_control_max_seconds: float = 0.0
+    batch_closing_router_control_seconds: float = 0.0
 
     expired_tokens: int = 0
     expired_actions: int = 0
@@ -970,6 +975,107 @@ class PolicyUpdateTrace:
         result = dict(vars(self))
         result["decomposition_error_seconds"] = self.decomposition_error_seconds
         return result
+
+
+@dataclass
+class ControlPlaneComponentTrace:
+    """Low-overhead aggregate for one control-plane component."""
+
+    calls: int = 0
+    wall_seconds: float = 0.0
+    cpu_seconds: float = 0.0
+    max_wall_seconds: float = 0.0
+    payload_bytes: int = 0
+
+    def observe(
+        self,
+        wall_seconds: float,
+        cpu_seconds: float = 0.0,
+        payload_bytes: int = 0,
+    ) -> None:
+        wall = max(0.0, float(wall_seconds))
+        cpu = max(0.0, float(cpu_seconds))
+        self.calls += 1
+        self.wall_seconds += wall
+        self.cpu_seconds += cpu
+        self.max_wall_seconds = max(self.max_wall_seconds, wall)
+        self.payload_bytes += max(0, int(payload_bytes))
+
+    def merge(self, other: "ControlPlaneComponentTrace") -> None:
+        self.calls += max(0, int(other.calls))
+        self.wall_seconds += max(0.0, float(other.wall_seconds))
+        self.cpu_seconds += max(0.0, float(other.cpu_seconds))
+        self.max_wall_seconds = max(
+            self.max_wall_seconds, max(0.0, float(other.max_wall_seconds))
+        )
+        self.payload_bytes += max(0, int(other.payload_bytes))
+
+    def to_dict(self) -> Dict[str, Any]:
+        calls = max(0, int(self.calls))
+        return {
+            "calls": calls,
+            "wall_seconds": max(0.0, float(self.wall_seconds)),
+            "cpu_seconds": max(0.0, float(self.cpu_seconds)),
+            "mean_wall_seconds": (
+                max(0.0, float(self.wall_seconds)) / calls if calls else 0.0
+            ),
+            "mean_cpu_seconds": (
+                max(0.0, float(self.cpu_seconds)) / calls if calls else 0.0
+            ),
+            "max_wall_seconds": max(0.0, float(self.max_wall_seconds)),
+            "payload_bytes": max(0, int(self.payload_bytes)),
+        }
+
+
+@dataclass
+class ControlPlaneTrace:
+    """Per-policy-version control-plane costs without token-level tracing."""
+
+    version: int
+    components: Dict[str, ControlPlaneComponentTrace] = field(
+        default_factory=dict
+    )
+
+    def observe(
+        self,
+        component: str,
+        wall_seconds: float,
+        cpu_seconds: float = 0.0,
+        payload_bytes: int = 0,
+    ) -> None:
+        name = str(component)
+        self.components.setdefault(name, ControlPlaneComponentTrace()).observe(
+            wall_seconds,
+            cpu_seconds,
+            payload_bytes,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "version": int(self.version),
+            "components": {
+                name: self.components[name].to_dict()
+                for name in sorted(self.components)
+            },
+        }
+
+
+def summarize_control_plane_traces(
+    traces: Dict[int, ControlPlaneTrace],
+) -> Dict[str, Any]:
+    """Merge per-version traces while preserving non-overlapping components."""
+    merged: Dict[str, ControlPlaneComponentTrace] = {}
+    for trace in traces.values():
+        for name, component in trace.components.items():
+            merged.setdefault(name, ControlPlaneComponentTrace()).merge(
+                component
+            )
+    return {
+        "versions": len(traces),
+        "components": {
+            name: merged[name].to_dict() for name in sorted(merged)
+        },
+    }
 
 
 @dataclass(frozen=True)
@@ -2390,6 +2496,9 @@ def build_learner_wait_record(
     generate_mean, generate_p95, generate_max = distribution(
         valid, "generate_seconds"
     )
+    router_control_mean, router_control_p95, router_control_max = distribution(
+        valid, "router_control_path_seconds"
+    )
     batch_closer = max(
         valid,
         key=lambda record: float(record.get("trajectory_completed_at_unix", 0.0)),
@@ -2426,6 +2535,12 @@ def build_learner_wait_record(
         "consumed_generate_mean_seconds": generate_mean,
         "consumed_generate_p95_seconds": generate_p95,
         "consumed_generate_max_seconds": generate_max,
+        "consumed_router_control_seconds": total(
+            valid, "router_control_path_seconds"
+        ),
+        "consumed_router_control_mean_seconds": router_control_mean,
+        "consumed_router_control_p95_seconds": router_control_p95,
+        "consumed_router_control_max_seconds": router_control_max,
         "batch_closing_trajectory_id": str(
             batch_closer.get("trajectory_id", "")
         ),
@@ -2440,6 +2555,9 @@ def build_learner_wait_record(
         ),
         "batch_closing_generate_seconds": float(
             batch_closer.get("generate_seconds", 0.0)
+        ),
+        "batch_closing_router_control_seconds": float(
+            batch_closer.get("router_control_path_seconds", 0.0)
         ),
         "recorded_at_unix": (
             time.time() if recorded_at_unix is None else float(recorded_at_unix)
@@ -2861,6 +2979,12 @@ class GroupQueue:
             "/traj_router_scheduling_wait_seconds_total": (
                 "traj_router_scheduling_wait_seconds_total"
             ),
+            "/traj_router_control_path_seconds_total": (
+                "traj_router_control_path_seconds_total"
+            ),
+            "/traj_router_control_cpu_seconds_total": (
+                "traj_router_control_cpu_seconds_total"
+            ),
             "/traj_request_ttft_seconds_total": "traj_request_ttft_seconds_total",
             "/traj_request_prefill_seconds_total": (
                 "traj_request_prefill_seconds_total"
@@ -3051,6 +3175,20 @@ class GroupQueue:
                 metric(
                     rollout,
                     "/traj_router_scheduling_wait_seconds_total",
+                    0,
+                )
+            ),
+            "router_control_path_seconds": float(
+                metric(
+                    rollout,
+                    "/traj_router_control_path_seconds_total",
+                    0,
+                )
+            ),
+            "router_control_cpu_seconds": float(
+                metric(
+                    rollout,
+                    "/traj_router_control_cpu_seconds_total",
                     0,
                 )
             ),
@@ -4237,6 +4375,10 @@ class GroupQueueManager:
         self.learner_wait_events = 0
         self.learner_wait_records: List[Dict[str, Any]] = []
         self.policy_update_traces: Dict[int, PolicyUpdateTrace] = {}
+        self.control_plane_profiler_enabled = bool(
+            getattr(config, "control_plane_profiler_enabled", False)
+        )
+        self.control_plane_traces: Dict[int, ControlPlaneTrace] = {}
 
         # Initialize env activity monitor first (before creating GroupQueues)
         self.group_queue: Dict[int, GroupQueue] = {}
@@ -4687,6 +4829,49 @@ class GroupQueueManager:
         self.policy_update_traces[version] = trace
         return trace
 
+    def _observe_control_plane(
+        self,
+        version: int,
+        component: str,
+        wall_seconds: float,
+        cpu_seconds: float = 0.0,
+        payload_bytes: int = 0,
+    ) -> None:
+        if not self.control_plane_profiler_enabled:
+            return
+        version = int(version)
+        trace = self.control_plane_traces.setdefault(
+            version, ControlPlaneTrace(version=version)
+        )
+        trace.observe(
+            component,
+            wall_seconds,
+            cpu_seconds,
+            payload_bytes,
+        )
+
+    def _profile_control_call(
+        self,
+        version: int,
+        component: str,
+        function,
+        *args,
+        **kwargs,
+    ):
+        if not self.control_plane_profiler_enabled:
+            return function(*args, **kwargs)
+        wall_started = time.perf_counter()
+        cpu_started = time.thread_time()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            self._observe_control_plane(
+                version,
+                component,
+                time.perf_counter() - wall_started,
+                time.thread_time() - cpu_started,
+            )
+
     def record_policy_update_timing(
         self, version: int, timing: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -4754,6 +4939,18 @@ class GroupQueueManager:
             consumed_generate_max_seconds=wait_record[
                 "consumed_generate_max_seconds"
             ],
+            consumed_router_control_seconds=wait_record[
+                "consumed_router_control_seconds"
+            ],
+            consumed_router_control_mean_seconds=wait_record[
+                "consumed_router_control_mean_seconds"
+            ],
+            consumed_router_control_p95_seconds=wait_record[
+                "consumed_router_control_p95_seconds"
+            ],
+            consumed_router_control_max_seconds=wait_record[
+                "consumed_router_control_max_seconds"
+            ],
             batch_closing_trajectory_id=wait_record[
                 "batch_closing_trajectory_id"
             ],
@@ -4768,6 +4965,9 @@ class GroupQueueManager:
             ],
             batch_closing_generate_seconds=wait_record[
                 "batch_closing_generate_seconds"
+            ],
+            batch_closing_router_control_seconds=wait_record[
+                "batch_closing_router_control_seconds"
             ],
         )
 
@@ -5240,6 +5440,17 @@ class GroupQueueManager:
     def prepare_next_batch_supply(
         self, current_step: int, batch_size: int
     ) -> Optional[Dict[str, Any]]:
+        return self._profile_control_call(
+            current_step,
+            "next_batch_supply_total",
+            self._prepare_next_batch_supply_impl,
+            current_step,
+            batch_size,
+        )
+
+    def _prepare_next_batch_supply_impl(
+        self, current_step: int, batch_size: int
+    ) -> Optional[Dict[str, Any]]:
         """Refill predicted learner supply while the current batch trains.
 
         Unlike emergency reconciliation, this path runs immediately after a
@@ -5260,7 +5471,12 @@ class GroupQueueManager:
         )
         if target_supply <= 0:
             return None
-        supply = self._version_supply_snapshot(current_step)
+        supply = self._profile_control_call(
+            current_step,
+            "pool_snapshot",
+            self._version_supply_snapshot,
+            current_step,
+        )
         overlap_seconds = self._next_batch_overlap_seconds()
         expected_supply = self._predict_next_batch_supply(
             supply,
@@ -5380,6 +5596,23 @@ class GroupQueueManager:
         learner_wait_seconds: float,
         runtime_feedback: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
+        return self._profile_control_call(
+            current_step,
+            "reconcile_total",
+            self._reconcile_version_progress_impl,
+            current_step,
+            missing_trajectories,
+            learner_wait_seconds,
+            runtime_feedback,
+        )
+
+    def _reconcile_version_progress_impl(
+        self,
+        current_step: int,
+        missing_trajectories: int,
+        learner_wait_seconds: float,
+        runtime_feedback: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Revise the active plan when predicted carry-over fails to materialize."""
         if (
             not self.version_adaptive_progress_floor_enabled
@@ -5391,13 +5624,21 @@ class GroupQueueManager:
             return None
         if runtime_feedback is not None:
             self.latest_kv_feedback = dict(runtime_feedback)
-        supply = self._version_supply_snapshot(current_step)
+        supply = self._profile_control_call(
+            current_step,
+            "pool_snapshot",
+            self._version_supply_snapshot,
+            current_step,
+        )
         timely_ready_supply = compute_timely_ready_supply(
             supply["ready_age_counts"],
             self.rollout_batch_size,
             self.staleness_tolerance,
         )
-        forecast = self.runtime_estimator.build_forecast(
+        forecast = self._profile_control_call(
+            current_step,
+            "supply_forecast",
+            self.runtime_estimator.build_forecast,
             current_step,
             ready_valid_slots=supply["valid_ready"],
             salvageable_inflight=supply["salvageable_inflight"],
@@ -5578,7 +5819,10 @@ class GroupQueueManager:
                 1,
                 math.ceil(control_step / max(1, self.group_size)),
             )
-        revised_plan = self.version_runtime_controller.decide(
+        revised_plan = self._profile_control_call(
+            current_step,
+            "controller_decide",
+            self.version_runtime_controller.decide,
             state,
             active_plan=self.version_runtime_plan,
             missing_trajectories=missing_trajectories,
@@ -5697,7 +5941,10 @@ class GroupQueueManager:
         width = next(iter(self.group_queue.values())).admission_width
         forecast = self.version_runtime_forecast
         if forecast is None or forecast.version != int(create_step):
-            forecast = self.runtime_estimator.build_forecast(
+            forecast = self._profile_control_call(
+                create_step,
+                "supply_forecast",
+                self.runtime_estimator.build_forecast,
                 create_step,
                 ready_valid_slots=supply["valid_ready"],
                 salvageable_inflight=supply["salvageable_inflight"],
@@ -5774,7 +6021,12 @@ class GroupQueueManager:
                 supply.get("inference_ready_trajectories", 0)
             ),
         )
-        plan = self.version_runtime_controller.decide(state)
+        plan = self._profile_control_call(
+            create_step,
+            "controller_decide",
+            self.version_runtime_controller.decide,
+            state,
+        )
         assert plan is not None
         return plan
 
@@ -5782,7 +6034,12 @@ class GroupQueueManager:
         """Publish scheduling/KV decisions even when admission is an ablation."""
         if self.mode != "train" or not self.group_queue:
             return
-        supply = self._version_supply_snapshot(create_step)
+        supply = self._profile_control_call(
+            create_step,
+            "pool_snapshot",
+            self._version_supply_snapshot,
+            create_step,
+        )
         expected_inflight, _, _ = self._predict_unfinished_supply(supply)
         self.version_runtime_plan = self._build_version_runtime_plan(
             create_step,
@@ -5870,7 +6127,12 @@ class GroupQueueManager:
         now = time.monotonic()
         now_unix = time.time()
         if boundary_supply is None:
-            boundary_supply = self._version_supply_snapshot(next_version)
+            boundary_supply = self._profile_control_call(
+                next_version,
+                "pool_snapshot",
+                self._version_supply_snapshot,
+                next_version,
+            )
         interval_seconds = (
             max(0.0, now - self.version_runtime_boundary_started_at)
             if self.version_runtime_boundary_started_at is not None
@@ -6133,7 +6395,12 @@ class GroupQueueManager:
             if self.version_runtime_plan is not None
             else None
         )
-        supply = self._version_supply_snapshot(create_step)
+        supply = self._profile_control_call(
+            create_step,
+            "pool_snapshot",
+            self._version_supply_snapshot,
+            create_step,
+        )
         self._finalize_version_runtime_outcome(create_step, supply)
         self.version_runtime_reserve_before = self.adaptive_reserve
         self._update_dynamic_reserve(create_step)
@@ -6202,7 +6469,10 @@ class GroupQueueManager:
             "unfinished_progress_frontier_actions_sum"
         ]
         self.version_progress_max_actions = supply["unfinished_progress_max_actions"]
-        self.version_runtime_forecast = self.runtime_estimator.build_forecast(
+        self.version_runtime_forecast = self._profile_control_call(
+            create_step,
+            "supply_forecast",
+            self.runtime_estimator.build_forecast,
             create_step,
             ready_valid_slots=self.version_valid_ready_at_boundary,
             salvageable_inflight=self.version_salvageable_inflight_at_boundary,
@@ -7080,6 +7350,20 @@ class GroupQueueManager:
                     0,
                 )
             ),
+            "router_control_path_seconds": float(
+                metric(
+                    rollout,
+                    "/traj_router_control_path_seconds_total",
+                    0,
+                )
+            ),
+            "router_control_cpu_seconds": float(
+                metric(
+                    rollout,
+                    "/traj_router_control_cpu_seconds_total",
+                    0,
+                )
+            ),
             "request_ttft_seconds": float(
                 metric(rollout, "/traj_request_ttft_seconds_total", 0)
             ),
@@ -7576,6 +7860,22 @@ class GroupQueueManager:
                 ),
             }
         )
+        control_plane_summary = summarize_control_plane_traces(
+            self.control_plane_traces
+        )
+        for component_name, component in control_plane_summary[
+            "components"
+        ].items():
+            prefix = f"control_plane/queue/{component_name}"
+            metrics[f"{prefix}/calls"] = component["calls"]
+            metrics[f"{prefix}/wall_seconds"] = component["wall_seconds"]
+            metrics[f"{prefix}/cpu_seconds"] = component["cpu_seconds"]
+            metrics[f"{prefix}/mean_wall_seconds"] = component[
+                "mean_wall_seconds"
+            ]
+            metrics[f"{prefix}/max_wall_seconds"] = component[
+                "max_wall_seconds"
+            ]
         return {
             "metrics": metrics,
             "histograms": {
@@ -7603,6 +7903,14 @@ class GroupQueueManager:
                 "events": self.version_boundary_events,
             },
             "version_runtime": runtime_state,
+            "control_plane": {
+                "enabled": self.control_plane_profiler_enabled,
+                "queue_summary": control_plane_summary,
+                "queue_traces": [
+                    self.control_plane_traces[version].to_dict()
+                    for version in sorted(self.control_plane_traces)
+                ],
+            },
         }
 
     def clear(self):
@@ -7618,6 +7926,7 @@ class GroupQueueManager:
         self.learner_wait_events = 0
         self.learner_wait_records.clear()
         self.policy_update_traces.clear()
+        self.control_plane_traces.clear()
         self.dynamic_stale_record_tokens_seen.clear()
         self.dynamic_stale_record_ids_seen.clear()
         self.version_runtime_outcomes.clear()
@@ -7660,6 +7969,17 @@ class GroupQueueManager:
             group_queue.stop_admission()
 
     def advance_step(self, step, kv_feedback: Optional[Dict[str, Any]] = None):
+        return self._profile_control_call(
+            int(step),
+            "advance_step_total",
+            self._advance_step_impl,
+            step,
+            kv_feedback,
+        )
+
+    def _advance_step_impl(
+        self, step, kv_feedback: Optional[Dict[str, Any]] = None
+    ):
         if self.rollout_started_at is None:
             self.rollout_started_at = time.monotonic()
         if kv_feedback is not None:
@@ -7938,6 +8258,10 @@ class RolloutScheduler(RolloutMockMixin):
         )
 
         self.rollout_task = None
+        self.control_plane_profiler_enabled = bool(
+            getattr(config, "control_plane_profiler_enabled", False)
+        )
+        self.control_plane_traces: Dict[int, ControlPlaneTrace] = {}
 
         # Initialize rollout mock mechanism from mixin
         self._init_rollout_mock()
@@ -7952,6 +8276,55 @@ class RolloutScheduler(RolloutMockMixin):
             mode=self.mode,
             blocking=False,
         ))
+
+    def _observe_control_plane(
+        self,
+        version: int,
+        component: str,
+        wall_seconds: float,
+        payload_bytes: int = 0,
+    ) -> None:
+        if not self.control_plane_profiler_enabled:
+            return
+        version = int(version)
+        trace = self.control_plane_traces.setdefault(
+            version, ControlPlaneTrace(version=version)
+        )
+        trace.observe(
+            component,
+            wall_seconds,
+            payload_bytes=payload_bytes,
+        )
+
+    async def _profile_control_awaitable(
+        self,
+        version: int,
+        component: str,
+        awaitable,
+        payload_bytes: int = 0,
+    ):
+        if not self.control_plane_profiler_enabled:
+            return await awaitable
+        started = time.perf_counter()
+        try:
+            return await awaitable
+        finally:
+            self._observe_control_plane(
+                version,
+                component,
+                time.perf_counter() - started,
+                payload_bytes,
+            )
+
+    @staticmethod
+    def _control_payload_bytes(payload: Optional[Dict[str, Any]]) -> int:
+        if payload is None:
+            return 0
+        return len(
+            json.dumps(payload, separators=(",", ":"), default=str).encode(
+                "utf-8"
+            )
+        )
 
     async def shutdown(self):
         if self.rollout_task is None:
@@ -8027,9 +8400,14 @@ class RolloutScheduler(RolloutMockMixin):
             for record in worker_records
         ]
         shutdown_report = await self.env_output_queue.collect_shutdown_waste.remote(inflight_records)
-        boundary_recovery, router_lifetime_metrics = await asyncio.gather(
+        (
+            boundary_recovery,
+            router_lifetime_metrics,
+            router_control_plane,
+        ) = await asyncio.gather(
             self.router_manager.collect_version_boundary_profile.remote(),
             self.router_manager.collect_lifetime_request_metrics.remote(),
+            self.router_manager.collect_control_plane_profile.remote(),
         )
         shutdown_report["version_boundary_recovery"] = boundary_recovery
         for name, value in boundary_recovery.get("metrics", {}).items():
@@ -8039,6 +8417,41 @@ class RolloutScheduler(RolloutMockMixin):
         }
         for name, value in router_lifetime_metrics.items():
             shutdown_report["metrics"][f"router_lifetime/{name}"] = value
+        control_plane = shutdown_report.setdefault("control_plane", {})
+        control_plane["router"] = router_control_plane
+        router_summary = router_control_plane.get("summary", {})
+        shutdown_report["metrics"]["control_plane/router/requests"] = int(
+            router_summary.get("requests", 0)
+        )
+        for metric_name, component in router_summary.get(
+            "metrics", {}
+        ).items():
+            short_name = metric_name.removeprefix("router/")
+            prefix = f"control_plane/router/{short_name}"
+            for field_name, value in component.items():
+                shutdown_report["metrics"][f"{prefix}/{field_name}"] = (
+                    value
+                )
+        control_plane["orchestrator_summary"] = (
+            summarize_control_plane_traces(self.control_plane_traces)
+        )
+        control_plane["orchestrator_traces"] = [
+            self.control_plane_traces[version].to_dict()
+            for version in sorted(self.control_plane_traces)
+        ]
+        for component_name, component in control_plane[
+            "orchestrator_summary"
+        ]["components"].items():
+            prefix = f"control_plane/orchestrator/{component_name}"
+            shutdown_report["metrics"][f"{prefix}/calls"] = component[
+                "calls"
+            ]
+            shutdown_report["metrics"][f"{prefix}/wall_seconds"] = (
+                component["wall_seconds"]
+            )
+            shutdown_report["metrics"][f"{prefix}/payload_bytes"] = (
+                component["payload_bytes"]
+            )
         await self.env_output_queue.shutdown.remote()
 
         shutdown_report["shutdown"] = {
@@ -8112,18 +8525,47 @@ class RolloutScheduler(RolloutMockMixin):
                 seed = self.config.seed
             self.rollout_task = asyncio.create_task(self._run_rollout_loop(seed))
 
-        await self._snapshot_trajectory_progress()
-        await asyncio.gather(*self.es_manager.update_step(global_step, inject_trace_context({}), blocking=False))
-        kv_feedback = await self.router_manager.collect_runtime_feedback.remote()
-        runtime_plan = await self.env_output_queue.advance_step.remote(
-            global_step, kv_feedback
+        await self._profile_control_awaitable(
+            global_step,
+            "progress_snapshot_rpc",
+            self._snapshot_trajectory_progress(),
         )
-        await self.router_manager.resume.remote(runtime_plan)
+        await self._profile_control_awaitable(
+            global_step,
+            "environment_version_update_rpc",
+            asyncio.gather(
+                *self.es_manager.update_step(
+                    global_step,
+                    inject_trace_context({}),
+                    blocking=False,
+                )
+            ),
+        )
+        kv_feedback = await self._profile_control_awaitable(
+            global_step,
+            "runtime_feedback_rpc",
+            self.router_manager.collect_runtime_feedback.remote(),
+        )
+        runtime_plan = await self._profile_control_awaitable(
+            global_step,
+            "advance_step_rpc",
+            self.env_output_queue.advance_step.remote(
+                global_step, kv_feedback
+            ),
+        )
+        await self._profile_control_awaitable(
+            global_step,
+            "runtime_plan_publish_rpc",
+            self.router_manager.resume.remote(runtime_plan),
+            self._control_payload_bytes(runtime_plan),
+        )
 
         learner_wait_start = time.time()
         get_task = asyncio.create_task(self._get_batch(batch_size, global_step))
-        reconcile_timing = (
-            await self.env_output_queue.get_runtime_reconcile_timing.remote()
+        reconcile_timing = await self._profile_control_awaitable(
+            global_step,
+            "reconcile_timing_rpc",
+            self.env_output_queue.get_runtime_reconcile_timing.remote(),
         )
         reconcile_interval = max(
             0.1, float(reconcile_timing["poll_seconds"])
@@ -8139,34 +8581,56 @@ class RolloutScheduler(RolloutMockMixin):
             if get_task.done():
                 break
             if self.mode == "train":
-                runtime_feedback = (
-                    await self.router_manager.collect_runtime_feedback.remote()
+                runtime_feedback = await self._profile_control_awaitable(
+                    global_step,
+                    "runtime_feedback_rpc",
+                    self.router_manager.collect_runtime_feedback.remote(),
                 )
-                revised_plan = (
-                    await self.env_output_queue.reconcile_version_progress.remote(
+                revised_plan = await self._profile_control_awaitable(
+                    global_step,
+                    "reconcile_rpc",
+                    self.env_output_queue.reconcile_version_progress.remote(
                         global_step,
                         batch_size,
                         time.time() - learner_wait_start,
                         runtime_feedback,
-                    )
+                    ),
                 )
                 if revised_plan is not None:
-                    await self.router_manager.update_runtime_plan.remote(revised_plan)
+                    await self._profile_control_awaitable(
+                        global_step,
+                        "runtime_plan_publish_rpc",
+                        self.router_manager.update_runtime_plan.remote(
+                            revised_plan
+                        ),
+                        self._control_payload_bytes(revised_plan),
+                    )
         data_batch = await get_task
         if self.mode == "train":
-            next_supply_plan = (
-                await self.env_output_queue.prepare_next_batch_supply.remote(
+            next_supply_plan = await self._profile_control_awaitable(
+                global_step,
+                "next_batch_supply_rpc",
+                self.env_output_queue.prepare_next_batch_supply.remote(
                     global_step, batch_size
-                )
+                ),
             )
             if next_supply_plan is not None:
-                await self.router_manager.update_runtime_plan.remote(
-                    next_supply_plan
+                await self._profile_control_awaitable(
+                    global_step,
+                    "runtime_plan_publish_rpc",
+                    self.router_manager.update_runtime_plan.remote(
+                        next_supply_plan
+                    ),
+                    self._control_payload_bytes(next_supply_plan),
                 )
-            await self.env_output_queue.record_learner_wait.remote(
-                time.time() - learner_wait_start,
+            await self._profile_control_awaitable(
                 global_step,
-                batch_size,
+                "trace_record_rpc",
+                self.env_output_queue.record_learner_wait.remote(
+                    time.time() - learner_wait_start,
+                    global_step,
+                    batch_size,
+                ),
             )
         if batch_size <= 0:
             await self.rollout_task

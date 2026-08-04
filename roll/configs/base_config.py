@@ -549,6 +549,24 @@ class PPOConfig(BaseConfig):
             )
         },
     )
+    control_plane_profiler_enabled: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Record per-version control-plane wall time, thread CPU time, "
+                "request latency percentiles, and plan payload sizes."
+            )
+        },
+    )
+    control_plane_profiler_max_samples: int = field(
+        default=65536,
+        metadata={
+            "help": (
+                "Maximum Router request-latency samples retained for control-plane "
+                "percentiles; exact totals are retained for all requests."
+            )
+        },
+    )
     trajectory_admission_policy: Literal["step", "outstanding_watermark", "version_adaptive"] = field(
         default="step",
         metadata={

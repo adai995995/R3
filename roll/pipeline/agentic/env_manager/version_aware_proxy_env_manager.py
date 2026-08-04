@@ -257,6 +257,12 @@ class VersionAwareProxyEnvManager(ProxyEnvManager):
             "router_scheduling_wait_seconds": self._request_metric_total(
                 "router/scheduling_wait_seconds"
             ),
+            "router_control_path_seconds": self._request_metric_total(
+                "router/control_path_seconds"
+            ),
+            "router_control_cpu_seconds": self._request_metric_total(
+                "router/control_cpu_seconds"
+            ),
             "request_ttft_seconds": self._request_metric_total(
                 "vllm/request_ttft_seconds"
             ),
@@ -351,6 +357,12 @@ class VersionAwareProxyEnvManager(ProxyEnvManager):
             "traj_router_scheduling_wait_seconds_total": float(
                 snapshot.get("router_scheduling_wait_seconds", 0.0)
             ),
+            "traj_router_control_path_seconds_total": float(
+                snapshot.get("router_control_path_seconds", 0.0)
+            ),
+            "traj_router_control_cpu_seconds_total": float(
+                snapshot.get("router_control_cpu_seconds", 0.0)
+            ),
             "traj_request_ttft_seconds_total": float(
                 snapshot.get("request_ttft_seconds", 0.0)
             ),
@@ -439,6 +451,12 @@ class VersionAwareProxyEnvManager(ProxyEnvManager):
             ),
             "traj_router_scheduling_wait_seconds_total": float(
                 snapshot.get("router_scheduling_wait_seconds", 0.0)
+            ),
+            "traj_router_control_path_seconds_total": float(
+                snapshot.get("router_control_path_seconds", 0.0)
+            ),
+            "traj_router_control_cpu_seconds_total": float(
+                snapshot.get("router_control_cpu_seconds", 0.0)
             ),
             "traj_request_ttft_seconds_total": float(
                 snapshot.get("request_ttft_seconds", 0.0)

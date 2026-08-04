@@ -7,6 +7,7 @@ from roll.distributed.scheduler.router import (
     completion_eta_observation,
     EnvAffinityRouter,
     RouterManager,
+    summarize_control_plane_request_profile,
     summarize_request_metric_totals,
     TrajectoryRuntimeState,
     select_completion_eta_worker,
@@ -15,6 +16,32 @@ from roll.distributed.scheduler.router import (
 
 class RouterManagerStub:
     pass
+
+
+def test_control_plane_request_profile_reports_per_request_tail_latency():
+    summary = summarize_control_plane_request_profile(
+        {
+            "requests": 4,
+            "router/control_path_seconds": 0.10,
+            "router/control_cpu_seconds": 0.04,
+        },
+        {
+            "router/control_path_seconds": [0.01, 0.02, 0.03, 0.04],
+            "router/control_cpu_seconds": [0.005, 0.01, 0.01, 0.015],
+        },
+    )
+
+    path = summary["metrics"]["router/control_path_seconds"]
+    cpu = summary["metrics"]["router/control_cpu_seconds"]
+    assert summary["requests"] == 4
+    assert path["total_seconds"] == 0.10
+    assert path["mean_seconds"] == 0.025
+    assert path["p50_seconds"] == 0.02
+    assert path["p95_seconds"] == 0.04
+    assert path["p99_seconds"] == 0.04
+    assert path["max_seconds"] == 0.04
+    assert path["sample_count"] == 4
+    assert cpu["mean_seconds"] == 0.01
 
 
 def test_engine_priority_queue_metrics_are_aggregated_separately_from_router_gate():
@@ -148,7 +175,10 @@ def test_env_affinity_router_serves_oldest_version_when_saturated():
             router_manager=RouterManagerStub(),
             workers=[object()],
             model_path=None,
-            router_args=SimpleNamespace(max_running_requests=1),
+            router_args=SimpleNamespace(
+                max_running_requests=1,
+                router_config={"router_priority_gate_enabled": True},
+            ),
         )
         await router.initialize()
 
@@ -182,13 +212,13 @@ def test_env_affinity_router_serves_oldest_version_when_saturated():
     asyncio.run(run_test())
 
 
-def test_env_affinity_router_bypasses_priority_queue_when_disabled():
+def test_env_affinity_router_bypasses_priority_queue_by_default():
     async def run_test():
         router = EnvAffinityRouter(
             RouterManagerStub(), [object()], None, SimpleNamespace(max_running_requests=1)
         )
         await router.initialize()
-        assert await router._acquire_priority_slot(0, None, "request") == (
+        assert await router._acquire_priority_slot(0, 1, "request") == (
             False,
             0,
             False,
@@ -209,6 +239,7 @@ def test_env_affinity_router_delegates_queueing_to_engine_priority_scheduler():
                 max_running_requests=1,
                 router_config={
                     "engine_priority_scheduling_enabled": True,
+                    "router_priority_gate_enabled": True,
                     "priority_max_running_requests": 1,
                 },
             ),
@@ -479,6 +510,7 @@ def test_priority_coalesce_compares_arrivals_before_dispatch():
             SimpleNamespace(
                 max_running_requests=8,
                 router_config={
+                    "router_priority_gate_enabled": True,
                     "priority_max_running_requests": 1,
                     "priority_coalesce_seconds": 0.02,
                 },
@@ -530,6 +562,7 @@ def test_priority_coalesce_is_work_conserving_when_capacity_is_available():
             SimpleNamespace(
                 max_running_requests=8,
                 router_config={
+                    "router_priority_gate_enabled": True,
                     "priority_max_running_requests": 1,
                     "priority_coalesce_seconds": 10.0,
                 },
@@ -609,6 +642,7 @@ def test_rebuild_capacity_can_burst_without_relaxing_normal_priority_limit():
             SimpleNamespace(
                 max_running_requests=8,
                 router_config={
+                    "router_priority_gate_enabled": True,
                     "priority_max_running_requests": 1,
                     "priority_rebuild_max_running_requests": 2,
                 },

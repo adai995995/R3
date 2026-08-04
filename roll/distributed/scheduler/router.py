@@ -39,6 +39,7 @@ def update_request_metric_totals(
             "vllm/request_kv_hit_ratio",
             "vllm/request_scheduler_batch_id",
             "vllm/request_decode_tokens_per_second",
+            "router/control_plane_version",
         ):
             continue
         if isinstance(value, (int, float)):
@@ -132,6 +133,38 @@ def summarize_request_metric_totals(
             (
                 "router/scheduling_decision_seconds",
                 "router/scheduling_decision_seconds_mean",
+            ),
+            (
+                "router/control_path_seconds",
+                "router/control_path_seconds_mean",
+            ),
+            (
+                "router/control_cpu_seconds",
+                "router/control_cpu_seconds_mean",
+            ),
+            (
+                "router/pre_dispatch_control_seconds",
+                "router/pre_dispatch_control_seconds_mean",
+            ),
+            (
+                "router/post_response_control_seconds",
+                "router/post_response_control_seconds_mean",
+            ),
+            (
+                "router/routing_prepare_seconds",
+                "router/routing_prepare_seconds_mean",
+            ),
+            (
+                "router/routing_lock_wait_seconds",
+                "router/routing_lock_wait_seconds_mean",
+            ),
+            (
+                "router/routing_compute_cpu_seconds",
+                "router/routing_compute_cpu_seconds_mean",
+            ),
+            (
+                "router/priority_build_seconds",
+                "router/priority_build_seconds_mean",
             ),
             ("router/selected_worker_pressure", "router/selected_worker_pressure_mean"),
             ("router/affinity_selected", "router/affinity_selected_ratio"),
@@ -242,6 +275,53 @@ def summarize_request_metric_totals(
             / batch_reported
         )
     return metrics
+
+
+CONTROL_PLANE_REQUEST_METRICS = (
+    "router/control_path_seconds",
+    "router/control_cpu_seconds",
+    "router/pre_dispatch_control_seconds",
+    "router/post_response_control_seconds",
+    "router/scheduling_decision_seconds",
+    "router/routing_prepare_seconds",
+    "router/routing_lock_wait_seconds",
+    "router/routing_compute_cpu_seconds",
+    "router/priority_build_seconds",
+    "router/scheduling_wait_seconds",
+)
+
+
+def control_plane_percentile(values: Sequence[float], quantile: float) -> float:
+    ordered = sorted(max(0.0, float(value)) for value in values)
+    if not ordered:
+        return 0.0
+    rank = min(
+        len(ordered) - 1,
+        max(0, math.ceil(float(quantile) * len(ordered)) - 1),
+    )
+    return ordered[rank]
+
+
+def summarize_control_plane_request_profile(
+    totals: Dict[str, float],
+    samples: Optional[Dict[str, Sequence[float]]] = None,
+) -> Dict[str, Any]:
+    requests = max(0, int(totals.get("requests", 0)))
+    metrics = {}
+    samples = samples or {}
+    for name in CONTROL_PLANE_REQUEST_METRICS:
+        total = max(0.0, float(totals.get(name, 0.0)))
+        values = samples.get(name, ())
+        metrics[name] = {
+            "total_seconds": total,
+            "mean_seconds": total / requests if requests else 0.0,
+            "p50_seconds": control_plane_percentile(values, 0.50),
+            "p95_seconds": control_plane_percentile(values, 0.95),
+            "p99_seconds": control_plane_percentile(values, 0.99),
+            "max_seconds": max(values, default=0.0),
+            "sample_count": len(values),
+        }
+    return {"requests": requests, "metrics": metrics}
 
 
 @dataclass(frozen=True)
@@ -1033,6 +1113,22 @@ class RouterManager:
         self.partial_gpu_manager = PartialGPUManager(actor_cluster=actor_cluster, router=self.router, num_gpus_per_node=num_gpus_per_node)
         self.request_metric_totals = defaultdict(float)
         self.request_metric_lifetime_totals = defaultdict(float)
+        router_config = getattr(router_args, "router_config", {}) or {}
+        self.control_plane_profiler_enabled = bool(
+            router_config.get("control_plane_profiler_enabled", False)
+        )
+        self.control_plane_profiler_max_samples = max(
+            1,
+            int(
+                router_config.get(
+                    "control_plane_profiler_max_samples", 65536
+                )
+            ),
+        )
+        self.control_plane_version_totals = defaultdict(
+            lambda: defaultdict(float)
+        )
+        self.control_plane_samples = defaultdict(list)
 
     async def initialize(self):
         await self.router.initialize()
@@ -1092,7 +1188,21 @@ class RouterManager:
         update_request_metric_totals(
             self.request_metric_lifetime_totals, request_metrics
         )
+        self._observe_control_plane_request(request_metrics)
         return response
+
+    def _observe_control_plane_request(self, request_metrics):
+        if not self.control_plane_profiler_enabled:
+            return
+        version = int(request_metrics.get("router/control_plane_version", -1))
+        totals = self.control_plane_version_totals[version]
+        totals["requests"] += 1
+        for name in CONTROL_PLANE_REQUEST_METRICS:
+            value = max(0.0, float(request_metrics.get(name, 0.0)))
+            totals[name] += value
+            samples = self.control_plane_samples[name]
+            if len(samples) < self.control_plane_profiler_max_samples:
+                samples.append(value)
 
     def collect_request_metrics(self):
         metrics = summarize_request_metric_totals(
@@ -1105,6 +1215,28 @@ class RouterManager:
         return summarize_request_metric_totals(
             dict(self.request_metric_lifetime_totals), scope="lifetime"
         )
+
+    def collect_control_plane_profile(self):
+        aggregate = defaultdict(float)
+        for totals in self.control_plane_version_totals.values():
+            for name, value in totals.items():
+                aggregate[name] += float(value)
+        return {
+            "enabled": self.control_plane_profiler_enabled,
+            "sample_limit": self.control_plane_profiler_max_samples,
+            "summary": summarize_control_plane_request_profile(
+                dict(aggregate), dict(self.control_plane_samples)
+            ),
+            "versions": [
+                {
+                    "version": version,
+                    **summarize_control_plane_request_profile(dict(totals)),
+                }
+                for version, totals in sorted(
+                    self.control_plane_version_totals.items()
+                )
+            ],
+        }
 
     def collect_version_boundary_profile(self):
         return self.router.collect_version_boundary_profile()
@@ -1969,6 +2101,16 @@ class EnvAffinityRouter(Router):
         self.engine_priority_scheduling_enabled = bool(
             config.get("engine_priority_scheduling_enabled", False)
         )
+        self.control_plane_profiler_enabled = bool(
+            config.get("control_plane_profiler_enabled", False)
+        )
+        # Keep the Router-side request gate as an explicit legacy fallback.
+        # Normal version-priority requests should carry their priority into the
+        # inference engine; post-refresh seed/follower ordering is handled by
+        # the bounded rebuild wave below.
+        self.router_priority_gate_enabled = bool(
+            config.get("router_priority_gate_enabled", False)
+        )
         self.priority_max_running_requests = int(
             config.get("priority_max_running_requests", self.max_running_requests)
         )
@@ -2604,6 +2746,9 @@ class EnvAffinityRouter(Router):
         )
 
     async def generate_request(self, payload, request_id, uid, priority=None):
+        profile_control = self.control_plane_profiler_enabled
+        control_path_started = time.perf_counter() if profile_control else 0.0
+        control_cpu_started = time.thread_time() if profile_control else 0.0
         src_rank = uid
         runtime_state = TrajectoryRuntimeState.from_priority(priority, src_rank)
         track_trajectory = not isinstance(priority, dict) or bool(
@@ -2650,6 +2795,14 @@ class EnvAffinityRouter(Router):
         predicted_queue_eta_seconds = 0.0
         predicted_prefill_tokens = 0
         completion_eta_model_ready = False
+        control_cpu_seconds = (
+            max(0.0, time.thread_time() - control_cpu_started)
+            if profile_control
+            else 0.0
+        )
+        routing_prepare_started = (
+            time.perf_counter() if profile_control else 0.0
+        )
         if track_trajectory:
             first_epoch_request, rebuild_assignment = (
                 await self._prepare_first_epoch_request(
@@ -2660,6 +2813,11 @@ class EnvAffinityRouter(Router):
             )
         else:
             first_epoch_request, rebuild_assignment = False, None
+        routing_prepare_seconds = (
+            max(0.0, time.perf_counter() - routing_prepare_started)
+            if profile_control
+            else 0.0
+        )
         rebuild_wave_size = 0
         rebuild_cluster_key = None
         rebuild_role = "none"
@@ -2667,7 +2825,18 @@ class EnvAffinityRouter(Router):
         rebuild_follower_wait_seconds = 0.0
         rebuild_seed_resolved = False
         # Atomic routing assignment under lock to prevent TOCTOU race with shrink/expand
+        routing_lock_wait_started = (
+            time.perf_counter() if profile_control else 0.0
+        )
         async with self.routing_lock:
+            routing_lock_wait_seconds = (
+                max(0.0, time.perf_counter() - routing_lock_wait_started)
+                if profile_control
+                else 0.0
+            )
+            routing_compute_cpu_started = (
+                time.thread_time() if profile_control else 0.0
+            )
             affinity_rank = self.src_rank2_dp_rank.get(routing_key)
             affinity_candidate = affinity_rank is not None
             affinity_cache_valid = (
@@ -2814,16 +2983,23 @@ class EnvAffinityRouter(Router):
                 route_reason = "affinity"
             selected_pressure = worker_pressure.get(dp_rank, 0)
 
+        routing_compute_cpu_seconds = (
+            max(0.0, time.thread_time() - routing_compute_cpu_started)
+            if profile_control
+            else 0.0
+        )
+        control_cpu_seconds += routing_compute_cpu_seconds
+
         routing_decision_seconds = time.perf_counter() - decision_started
         wait_started = time.perf_counter()
-        (
-            has_priority_slot,
-            priority_queue_depth,
-            priority_was_queued,
-            priority_was_coalesced,
-            priority_was_reordered,
-        ) = (
-            await self._acquire_priority_slot(
+        if self.router_priority_gate_enabled:
+            (
+                has_priority_slot,
+                priority_queue_depth,
+                priority_was_queued,
+                priority_was_coalesced,
+                priority_was_reordered,
+            ) = await self._acquire_priority_slot(
                 dp_rank,
                 priority,
                 request_id,
@@ -2833,13 +3009,26 @@ class EnvAffinityRouter(Router):
                     else None
                 ),
             )
-        )
+        else:
+            (
+                has_priority_slot,
+                priority_queue_depth,
+                priority_was_queued,
+                priority_was_coalesced,
+                priority_was_reordered,
+            ) = (False, 0, False, False, False)
         scheduling_wait_seconds = time.perf_counter() - wait_started
 
         self.request_id_2_src_rank[request_id] = src_rank
         self.running_requests[dp_rank].add(request_id)
 
         try:
+            priority_build_started = (
+                time.perf_counter() if profile_control else 0.0
+            )
+            priority_build_cpu_started = (
+                time.thread_time() if profile_control else 0.0
+            )
             engine_request_priority = None
             worker_payload = payload
             if rebuild_request or (
@@ -2858,11 +3047,32 @@ class EnvAffinityRouter(Router):
             request_boundary_resumed_at = self.boundary_resumed_at.get(
                 request_cache_epoch
             )
+            priority_build_seconds = (
+                max(0.0, time.perf_counter() - priority_build_started)
+                if profile_control
+                else 0.0
+            )
+            if profile_control:
+                control_cpu_seconds += max(
+                    0.0, time.thread_time() - priority_build_cpu_started
+                )
+            pre_dispatch_control_seconds = (
+                max(0.0, time.perf_counter() - control_path_started)
+                if profile_control
+                else 0.0
+            )
             request_dispatched_at = time.monotonic()
             response = await self.workers[dp_rank].generate_request.remote(
                 worker_payload
             )
             request_completed_at = time.monotonic()
+            post_response_control_started = (
+                time.perf_counter() if profile_control else 0.0
+            )
+            post_response_cpu_started = (
+                time.thread_time() if profile_control else 0.0
+            )
+            post_response_cpu_seconds = 0.0
             request_service_seconds = max(
                 0.0, request_completed_at - request_dispatched_at
             )
@@ -2983,6 +3193,11 @@ class EnvAffinityRouter(Router):
                     if len(cached_prompts) > max_prompts:
                         del cached_prompts[:-max_prompts]
             if rebuild_role == "seed" and rebuild_cluster_key is not None:
+                if profile_control:
+                    post_response_cpu_seconds += max(
+                        0.0,
+                        time.thread_time() - post_response_cpu_started,
+                    )
                 await self._complete_rebuild_seed(
                     cache_epoch=rebuild_assignment_epoch,
                     cluster_key=rebuild_cluster_key,
@@ -2990,10 +3205,46 @@ class EnvAffinityRouter(Router):
                     prompt_tokens=prompt_tokens,
                     success=request_succeeded,
                 )
+                post_response_cpu_started = (
+                    time.thread_time() if profile_control else 0.0
+                )
                 rebuild_seed_resolved = True
+            post_response_control_seconds = (
+                max(
+                    0.0,
+                    time.perf_counter() - post_response_control_started,
+                )
+                if profile_control
+                else 0.0
+            )
+            if profile_control:
+                post_response_cpu_seconds += max(
+                    0.0,
+                    time.thread_time() - post_response_cpu_started,
+                )
+            control_path_seconds = (
+                pre_dispatch_control_seconds
+                + post_response_control_seconds
+            )
+            control_cpu_seconds += post_response_cpu_seconds
             response_metrics.update({
                 "router/scheduling_decisions": 1,
+                "router/control_plane_version": runtime_state.current_version,
+                "router/control_path_seconds": control_path_seconds,
+                "router/control_cpu_seconds": control_cpu_seconds,
+                "router/pre_dispatch_control_seconds": (
+                    pre_dispatch_control_seconds
+                ),
+                "router/post_response_control_seconds": (
+                    post_response_control_seconds
+                ),
                 "router/scheduling_decision_seconds": routing_decision_seconds,
+                "router/routing_prepare_seconds": routing_prepare_seconds,
+                "router/routing_lock_wait_seconds": routing_lock_wait_seconds,
+                "router/routing_compute_cpu_seconds": (
+                    routing_compute_cpu_seconds
+                ),
+                "router/priority_build_seconds": priority_build_seconds,
                 "router/scheduling_wait_seconds": scheduling_wait_seconds,
                 "router/scheduling_version_age": runtime_state.version_age,
                 "router/scheduling_actions_completed": runtime_state.actions_completed,
@@ -3048,7 +3299,10 @@ class EnvAffinityRouter(Router):
                 "router/priority_queue_depth": priority_queue_depth,
                 "router/priority_slot_capacity": (
                     0
-                    if self.engine_priority_scheduling_enabled
+                    if (
+                        self.engine_priority_scheduling_enabled
+                        or not self.router_priority_gate_enabled
+                    )
                     else (
                         self.priority_rebuild_max_running_requests
                         if rebuild_request
@@ -3057,6 +3311,9 @@ class EnvAffinityRouter(Router):
                 ),
                 "router/engine_priority_scheduling_enabled": int(
                     self.engine_priority_scheduling_enabled
+                ),
+                "router/router_priority_gate_enabled": int(
+                    self.router_priority_gate_enabled
                 ),
                 "router/engine_priority_request": int(
                     engine_request_priority is not None
@@ -3067,6 +3324,7 @@ class EnvAffinityRouter(Router):
                 "router/router_priority_gate_used": int(has_priority_slot),
                 "router/rebuild_burst_request": int(
                     rebuild_request
+                    and self.router_priority_gate_enabled
                     and not self.engine_priority_scheduling_enabled
                     and self.priority_rebuild_max_running_requests
                     > self.priority_max_running_requests
@@ -3313,7 +3571,8 @@ class EnvAffinityRouter(Router):
         max_running_requests: Optional[int] = None,
     ):
         if (
-            self.engine_priority_scheduling_enabled
+            not self.router_priority_gate_enabled
+            or self.engine_priority_scheduling_enabled
             or priority is None
             or self.priority_max_running_requests <= 0
             or (
